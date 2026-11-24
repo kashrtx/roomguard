@@ -1,0 +1,281 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<style>
+@font-face { font-family: Inter; src: url(../../assets/fonts/Inter-Regular.otf); font-weight: 400; }
+@font-face { font-family: Inter; src: url(../../assets/fonts/Inter-SemiBold.otf); font-weight: 600; }
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { width: 1440px; height: 900px; background: #151719; font-family: Inter; color: #E8E6E1; font-size: 14px; overflow: hidden; position: relative; }
+.abs { position: absolute; }
+#top { left: 0; top: 0; width: 1440px; height: 56px; padding: 0 16px; display: flex; align-items: center; gap: 10px; background: #151719; }
+#left { left: 0; top: 56px; width: 424px; height: 844px; background: #1C1F22; padding: 12px; }
+#right { left: 1068px; top: 56px; width: 372px; height: 844px; background: #1C1F22; padding: 12px; }
+#center { left: 424px; top: 56px; width: 644px; height: 844px; }
+.card { background: #23272B; border: 1px solid #34393F; border-radius: 10px; padding: 12px; }
+.h { font-weight: 600; font-size: 15px; }
+.muted { color: #9A9FA5; font-size: 12.5px; line-height: 1.35; }
+.faint { color: #696F76; }
+.row { display: flex; align-items: center; gap: 8px; }
+.sp { flex: 1; }
+.btn { background: #2E3339; border: 1px solid #34393F; border-radius: 6px; padding: 4px 10px; font-size: 14px; color: #E8E6E1; white-space: nowrap; }
+.btn.small { font-size: 13px; padding: 2px 7px; }
+.sel { background: #2C5A44; border-radius: 6px; padding: 4px 8px; }
+.tab { padding: 4px 8px; border-radius: 6px; }
+.chip { border-radius: 9px; padding: 1px 7px; font-size: 11.5px; }
+.accent { border: none; color: white; font-weight: 600; font-size: 13.5px; border-radius: 6px; padding: 5px 12px; }
+.bubble { border-radius: 10px; padding: 7px 10px; max-width: 85%; line-height: 1.4; }
+.sys { text-align: center; font-size: 11.5px; color: #696F76; margin: 6px 0; }
+</style></head>
+<body>
+<div id="top" class="abs"></div>
+<div id="left" class="abs"></div>
+<div id="center" class="abs"><canvas id="wall" width="644" height="844"></canvas></div>
+<div id="right" class="abs"></div>
+<script>
+const FONT = [[0, 0, 0, 0, 0], [0, 0, 95, 0, 0], [0, 7, 0, 7, 0], [20, 127, 20, 127, 20], [36, 42, 127, 42, 18], [35, 19, 8, 100, 98], [54, 73, 85, 34, 80], [0, 5, 3, 0, 0], [0, 28, 34, 65, 0], [0, 65, 34, 28, 0], [20, 8, 62, 8, 20], [8, 8, 62, 8, 8], [0, 80, 48, 0, 0], [8, 8, 8, 8, 8], [0, 96, 96, 0, 0], [32, 16, 8, 4, 2], [62, 81, 73, 69, 62], [0, 66, 127, 64, 0], [66, 97, 81, 73, 70], [33, 65, 69, 75, 49], [24, 20, 18, 127, 16], [39, 69, 69, 69, 57], [60, 74, 73, 73, 48], [1, 113, 9, 5, 3], [54, 73, 73, 73, 54], [6, 73, 73, 41, 30], [0, 54, 54, 0, 0], [0, 86, 54, 0, 0], [8, 20, 34, 65, 0], [20, 20, 20, 20, 20], [0, 65, 34, 20, 8], [2, 1, 81, 9, 6], [50, 73, 121, 65, 62], [126, 17, 17, 17, 126], [127, 73, 73, 73, 54], [62, 65, 65, 65, 34], [127, 65, 65, 34, 28], [127, 73, 73, 73, 65], [127, 9, 9, 9, 1], [62, 65, 73, 73, 122], [127, 8, 8, 8, 127], [0, 65, 127, 65, 0], [32, 64, 65, 63, 1], [127, 8, 20, 34, 65], [127, 64, 64, 64, 64], [127, 2, 12, 2, 127], [127, 4, 8, 16, 127], [62, 65, 65, 65, 62], [127, 9, 9, 9, 6], [62, 65, 81, 33, 94], [127, 9, 25, 41, 70], [70, 73, 73, 73, 49], [1, 1, 127, 1, 1], [63, 64, 64, 64, 63], [31, 32, 64, 32, 31], [63, 64, 56, 64, 63], [99, 20, 8, 20, 99], [7, 8, 112, 8, 7], [97, 81, 73, 69, 67], [0, 127, 65, 65, 0], [2, 4, 8, 16, 32], [0, 65, 65, 127, 0], [4, 2, 1, 2, 4], [64, 64, 64, 64, 64], [0, 1, 2, 4, 0], [32, 84, 84, 84, 120], [127, 72, 68, 68, 56], [56, 68, 68, 68, 32], [56, 68, 68, 72, 127], [56, 84, 84, 84, 24], [8, 126, 9, 1, 2], [12, 82, 82, 82, 62], [127, 8, 4, 4, 120], [0, 68, 125, 64, 0], [32, 64, 68, 61, 0], [127, 16, 40, 68, 0], [0, 65, 127, 64, 0], [124, 4, 24, 4, 120], [124, 8, 4, 4, 120], [56, 68, 68, 68, 56], [124, 20, 20, 20, 8], [8, 20, 20, 24, 124], [124, 8, 4, 4, 8], [72, 84, 84, 84, 32], [4, 63, 68, 64, 32], [60, 64, 64, 32, 124], [28, 32, 64, 32, 28], [60, 64, 48, 64, 60], [68, 40, 16, 40, 68], [12, 80, 80, 80, 60], [68, 100, 84, 76, 68], [0, 8, 54, 65, 0], [0, 0, 127, 0, 0], [0, 65, 54, 8, 0], [8, 4, 8, 16, 8]];
+const C = { BG:'#151719', PANEL:'#1C1F22', CARD:'#23272B', CARD_HI:'#2B3035', LINE:'#34393F', TEXT:'#E8E6E1', MUTED:'#9A9FA5', FAINT:'#696F76', GREEN:'#3DB272', RED:'#E05046', AMBER:'#E6A23C', BLUE:'#5C9CD4' };
+const SC = location.hash.slice(1) || 'lcd';
+const scenes = {
+  lcd:   { model:'lcd', status:['Ready to arm','All zones closed',C.GREEN], walker:null, lcd:['System is     <>','Ready to Arm'], lcdLeds:[1,0,0,1], open:[], right:'chat', cam:'live' },
+  led:   { model:'led', status:['Not ready','Zone 2 Room Motion is open',C.AMBER], walker:7.0, leds:[0,0,0,0,0, 0,1,0,0,0,0], open:[2], right:'chat', cam:'live', track:true },
+  map:   { model:'lcd', status:['Ready to arm','All zones closed',C.GREEN], walker:null, lcd:['System is     <>','Ready to Arm'], lcdLeds:[1,0,0,1], open:[], right:'history', cam:'map' },
+  alarm: { model:'lcd', status:['Burglary alarm','Zone 2 Room Motion',C.RED], walker:10.0, lcd:['In Alarm','Room Motion'], lcdLeds:[0,1,0,1], open:[2], alarm:[2], right:'alarm', cam:'live', track:true, bell:true, armed:true },
+};
+const st = scenes[SC];
+
+function hexA(hex, a) { const n = parseInt(hex.slice(1), 16); return `rgba(${n>>16},${(n>>8)&255},${n&255},${a})`; }
+function mix(a, b, t) { const x = parseInt(a.slice(1),16), y = parseInt(b.slice(1),16); const c = (s) => Math.round(((x>>s)&255) + (((y>>s)&255) - ((x>>s)&255)) * t); return `rgb(${c(16)},${c(8)},${c(0)})`; }
+function rr(ctx, x, y, w, h, r) { ctx.beginPath(); ctx.roundRect(x, y, w, h, Math.max(0, r)); }
+function gradRR(ctx, x, y, w, h, r, top, bot, stroke, lw) { const g = ctx.createLinearGradient(0, y, 0, y + h); g.addColorStop(0, top); g.addColorStop(1, bot); rr(ctx, x, y, w, h, r); ctx.fillStyle = g; ctx.fill(); if (stroke) { ctx.strokeStyle = stroke; ctx.lineWidth = lw; ctx.stroke(); } }
+function softShadow(ctx, x, y, w, h, r, oy, blur, a) { ctx.save(); ctx.shadowColor = `rgba(0,0,0,${a})`; ctx.shadowBlur = blur; ctx.shadowOffsetY = oy; rr(ctx, x, y, w, h, r); ctx.fillStyle = 'rgba(0,0,0,1)'; ctx.fill(); ctx.restore(); }
+function glow(ctx, cx, cy, r, color, a) { const g = ctx.createRadialGradient(cx, cy, 0, cx, cy, r); g.addColorStop(0, hexA(color, a)); g.addColorStop(1, hexA(color, 0)); ctx.fillStyle = g; ctx.beginPath(); ctx.arc(cx, cy, r, 0, 7); ctx.fill(); }
+function circle(ctx, cx, cy, r, fill) { ctx.beginPath(); ctx.arc(cx, cy, r, 0, 7); ctx.fillStyle = fill; ctx.fill(); }
+function led(ctx, cx, cy, r, color, lit) {
+  circle(ctx, cx, cy, r + 1.2 * r / 4.4, 'rgba(0,0,0,0.35)');
+  if (lit) { glow(ctx, cx, cy, r * 4.2, color, 0.45); circle(ctx, cx, cy, r, color); circle(ctx, cx - r * 0.3, cy - r * 0.35, r * 0.38, 'rgba(255,255,255,0.55)'); }
+  else { circle(ctx, cx, cy, r, mix('#282624', color, 0.18)); circle(ctx, cx - r * 0.3, cy - r * 0.35, r * 0.3, 'rgba(255,255,255,0.12)'); }
+}
+function text(ctx, s, x, y, size, color, weight, align) { ctx.font = `${weight || 600} ${size}px Inter`; ctx.fillStyle = color; ctx.textAlign = align || 'center'; ctx.textBaseline = 'middle'; ctx.fillText(s, x, y); }
+function fit(area, w, h, m) { const s = Math.min((area.w - 2*m) / w, (area.h - 2*m) / h); return { s, ox: area.x + area.w/2 - w*s/2, oy: area.y + area.h/2 - h*s/2 }; }
+function poly(ctx, pts, fill, stroke, lw, close) { ctx.beginPath(); pts.forEach((p, i) => i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1])); if (close) ctx.closePath(); if (fill) { ctx.fillStyle = fill; ctx.fill(); } if (stroke) { ctx.strokeStyle = stroke; ctx.lineWidth = lw; ctx.lineJoin = 'round'; ctx.stroke(); } }
+
+// ----- camera demo scene (same drawing as src/vision/demo.rs) -----
+function walker(t) { const s = ((t % 22) + 22) % 22, door = 125, floor = 432; if (s < 3) return null; if (s < 9) return [door + (s-3)/6*355, floor]; if (s < 12) return [480, floor]; if (s < 18) return [480 - (s-12)/6*355, floor]; if (s < 19) return [door, floor]; return null; }
+function demoScene(t) {
+  const c = document.createElement('canvas'); c.width = 640; c.height = 480; const x = c.getContext('2d');
+  const g = x.createLinearGradient(0, 0, 0, 480); g.addColorStop(0, 'rgb(204,197,184)'); g.addColorStop(1, 'rgb(178,171,158)'); x.fillStyle = g; x.fillRect(0, 0, 640, 480);
+  const R = (a, b, c2, d, col) => { x.fillStyle = col; x.fillRect(a, b, c2 - a, d - b); };
+  R(0,404,640,480,'rgb(122,104,86)'); R(0,396,640,404,'rgb(232,229,221)');
+  R(78,146,172,404,'rgb(214,209,199)'); R(88,156,162,404,'rgb(62,58,54)');
+  R(468,106,604,252,'rgb(222,219,212)'); R(476,114,596,244,'rgb(168,197,222)');
+  R(300,326,446,340,'rgb(112,82,60)'); R(306,340,314,398,'rgb(92,68,50)'); R(432,340,440,398,'rgb(92,68,50)');
+  const w = walker(t);
+  if (w) { const [px, f] = w, sw = Math.sin(t*7)*9;
+    R(px-15+sw/2, f-92, px-3+sw, f, 'rgb(48,52,70)'); R(px+3-sw, f-92, px+15-sw/2, f, 'rgb(48,52,70)');
+    R(px-22, f-182, px+22, f-88, 'rgb(72,98,140)'); R(px-30, f-172, px-22, f-110, 'rgb(72,98,140)'); R(px+22, f-172, px+30, f-110, 'rgb(72,98,140)');
+    x.fillStyle = 'rgb(206,170,138)'; x.beginPath(); x.arc(px, f-204, 20, 0, 7); x.fill();
+    x.fillStyle = 'rgb(52,40,34)'; x.beginPath(); x.arc(px, f-214, 17, Math.PI, 2*Math.PI); x.fill(); }
+  const img = x.getImageData(0, 0, 640, 480); for (let i = 0; i < img.data.length; i += 4) { const n = ((i * 2654435761) >>> 0) % 7 - 3; img.data[i] += n; img.data[i+1] += n; img.data[i+2] += n; } x.putImageData(img, 0, 0);
+  return c;
+}
+
+// ----- the two keypads (same geometry as src/keypads) -----
+function drawClassic(ctx, area) {
+  const xf = fit(area, 300, 396, 28), S = v => v * xf.s, P = (a, b) => [xf.ox + a * xf.s, xf.oy + b * xf.s];
+  softShadow(ctx, ...P(0, 0), S(300), S(396), S(18), S(7), S(28), 0.47);
+  gradRR(ctx, ...P(0, 0), S(300), S(396), S(18), '#EEE9DC', '#D9D2C2', '#A9A190', S(1));
+  rr(ctx, ...P(5, 5), S(290), S(386), S(14)); ctx.strokeStyle = 'rgba(255,255,255,0.5)'; ctx.lineWidth = S(0.8); ctx.stroke();
+  gradRR(ctx, ...P(22, 20), S(256), S(100), S(8), '#312C28', '#191614', '#100E0C', S(1.2));
+  gradRR(ctx, ...P(25, 23), S(250), S(39), S(6), 'rgba(255,255,255,0.09)', 'rgba(255,255,255,0)');
+  const names = ['READY','ARMED','MEMORY','BYPASS','TROUBLE'], cols = ['#3DE06E','#FF3D2E','#FFB026','#FFB026','#FFB026'];
+  const leds = st.leds || [1,0,0,0,0,0,0,0,0,0,0];
+  for (let i = 0; i < 5; i++) { const cx = 22 + 256 * (i + 0.5) / 5; led(ctx, ...P(cx, 44), S(4.6), cols[i], leds[i]); text(ctx, names[i], ...P(cx, 61), S(7.4), '#C9C1B2'); }
+  ctx.strokeStyle = 'rgba(201,193,178,0.25)'; ctx.lineWidth = S(0.6); ctx.beginPath(); ctx.moveTo(...P(34, 72)); ctx.lineTo(...P(266, 72)); ctx.stroke();
+  for (let z = 0; z < 6; z++) { const cx = 22 + 256 * (z + 0.5) / 6; led(ctx, ...P(cx, 88), S(4.2), '#FF3D2E', leds[5 + z]); text(ctx, String(z + 1), ...P(cx, 104), S(8.6), '#C9C1B2'); }
+  const rows = [[['1',''],['2',''],['3','']],[['4',''],['5',''],['6','']],[['7',''],['8',''],['9','']],[['*',''],['0',''],['#','']],[['F','FIRE'],['A','AUX'],['P','PANIC']]];
+  rows.forEach((line, row) => line.forEach(([label, sub], col) => {
+    const [x, y] = P(30 + col * 86, 140 + row * 49.5), w = S(68), h = S(38), r = S(9);
+    rr(ctx, x - S(1.8), y - S(1.8), w + S(3.6), h + S(3.6), r + S(1.8)); ctx.fillStyle = '#BEB6A5'; ctx.fill();
+    softShadow(ctx, x, y + S(2.4), w, h, r, 0, S(4), 0.27);
+    gradRR(ctx, x, y, w, h, r, '#F7F3EA', '#DAD3C5', '#A69E8E', S(0.8));
+    const ink = row === 4 ? '#9C2C22' : '#3A3732';
+    text(ctx, label, x + w/2, y + h/2 - (sub ? S(4.5) : 0), S(label === '*' ? 21 : 17), ink);
+    if (sub) text(ctx, sub, x + w/2, y + h/2 + S(10.5), S(6.6), ink);
+  }));
+}
+function dot(ch, gx, gy) { const i = ch.charCodeAt(0) - 32; const g = (i >= 0 && i < FONT.length) ? FONT[i] : [0x7F,0x41,0x41,0x41,0x7F]; return ((g[gx] >> gy) & 1) === 1; }
+function icon(ctx, kind, cx, cy, s, color) {
+  const Pt = (a, b) => [cx + a * s, cy + b * s];
+  if (kind === 'check') poly(ctx, [Pt(-0.45,0.02), Pt(-0.12,0.34), Pt(0.48,-0.32)], null, color, s * 0.16);
+  if (kind === 'house') { poly(ctx, [Pt(-0.5,-0.02), Pt(0,-0.46), Pt(0.5,-0.02)], null, color, s * 0.12); ctx.strokeStyle = color; ctx.lineWidth = s * 0.12; ctx.strokeRect(...Pt(-0.34,-0.08), 0.68 * s, 0.52 * s); }
+  if (kind === 'warn') { poly(ctx, [Pt(0,-0.48), Pt(0.52,0.42), Pt(-0.52,0.42)], null, color, s * 0.11, true); poly(ctx, [Pt(0,-0.16), Pt(0,0.14)], null, color, s * 0.11); circle(ctx, ...Pt(0,0.27), s * 0.06, color); }
+  if (kind === 'plug') { ctx.strokeStyle = color; ctx.lineWidth = s * 0.11; rr(ctx, ...Pt(-0.3,-0.18), 0.6 * s, 0.38 * s, s * 0.08); ctx.stroke(); poly(ctx, [Pt(-0.14,-0.18), Pt(-0.14,-0.46)], null, color, s * 0.11); poly(ctx, [Pt(0.14,-0.18), Pt(0.14,-0.46)], null, color, s * 0.11); poly(ctx, [Pt(0,0.2), Pt(0,0.5)], null, color, s * 0.11); }
+  if (kind === 'flame') { const drop = (k, dy) => { const pts = []; for (let i = 0; i < 32; i++) { const t = 2 * Math.PI * i / 32; pts.push(Pt(0.40 * Math.sin(t) * Math.sin(t / 2) * k, -0.50 * Math.cos(t) * k + dy)); } return pts; }; poly(ctx, drop(1, 0), color, null, 0, true); poly(ctx, drop(0.48, 0.2), '#E19D96', null, 0, true); }
+  if (kind === 'cross') { ctx.fillStyle = color; ctx.fillRect(...Pt(-0.14,-0.4), 0.28 * s, 0.8 * s); ctx.fillRect(...Pt(-0.4,-0.14), 0.8 * s, 0.28 * s); }
+  if (kind === 'shield') poly(ctx, [Pt(0,-0.48), Pt(0.42,-0.32), Pt(0.36,0.12), Pt(0,0.5), Pt(-0.36,0.12), Pt(-0.42,-0.32)], color, null, 0, true);
+}
+function drawLcdKeypad(ctx, area) {
+  const xf = fit(area, 330, 424, 28), S = v => v * xf.s, P = (a, b) => [xf.ox + a * xf.s, xf.oy + b * xf.s];
+  softShadow(ctx, ...P(0, 0), S(330), S(424), S(22), S(7), S(28), 0.47);
+  gradRR(ctx, ...P(0, 0), S(330), S(424), S(22), '#F4F5F3', '#DFE1DE', '#B9BDB8', S(1));
+  rr(ctx, ...P(5, 5), S(320), S(414), S(18)); ctx.strokeStyle = 'rgba(255,255,255,0.55)'; ctx.lineWidth = S(0.8); ctx.stroke();
+  gradRR(ctx, ...P(22, 22), S(236), S(82), S(7), '#3D4144', '#282B2E', '#1E2022', S(1));
+  const [gx, gy] = P(28.5, 28.5), gw = S(223), gh = S(69), lit = mix('#707E4E', '#B4D95B', 7 / 9);
+  gradRR(ctx, gx, gy, gw, gh, S(3), lit, mix(lit.replace(/rgb\((\d+),(\d+),(\d+)\)/, (m, r, g, b) => '#' + [r,g,b].map(v => (+v).toString(16).padStart(2,'0')).join('')), '#556630', 0.25), '#2B331C', S(1));
+  const pitch = (gw - S(12)) / 95, d = pitch * 0.82, x0 = gx + S(6), y0 = gy + gh / 2 - 19 * pitch / 2, k = 5 / 9;
+  const on = mix('#4A5828', '#121A08', 0.45 + 0.55 * k), ghost = `rgba(26,36,12,${(4 + 7 * k) / 255})`;
+  st.lcd.forEach((line, row) => { for (let col = 0; col < 16; col++) { const ch = line[col] || ' '; for (let a = 0; a < 5; a++) for (let b = 0; b < 8; b++) { ctx.fillStyle = dot(ch, a, b) ? on : ghost; rr(ctx, x0 + (col * 6 + a) * pitch, y0 + (row * 11 + b) * pitch, d, d, d * 0.18); ctx.fill(); } } });
+  const leds = [['#3DE06E','READY','check'],['#FF3D2E','ARMED','house'],['#FFB026','TROUBLE','warn'],['#3DE06E','AC','plug']];
+  leds.forEach(([col, name, ic], i) => { const y = 31 + i * 21; led(ctx, ...P(274, y), S(4.2), col, st.lcdLeds[i]); icon(ctx, ic, ...P(292, y), S(12), '#55595E'); text(ctx, name, ...P(306, y), S(5.6), 'rgba(85,89,94,0.9)', 600, 'left'); });
+  const keys = [];
+  keys.push(['chev-l', 24, 124, 24, 30], ['chev-r', 52, 124, 24, 30], ['flame', 24, 168, 52, 42], ['cross', 24, 220, 52, 42], ['shield', 24, 272, 52, 42]);
+  [['1','2','3'],['4','5','6'],['7','8','9'],['*','0','#']].forEach((line, row) => line.forEach((l, col) => keys.push(['t:' + l, 92 + col * 52, 124 + row * 55, 42, 45])));
+  ['Stay','Away','Chime','Reset','Exit'].forEach((l, i) => keys.push(['s:' + l, 254, 124 + i * 44, 52, 34]));
+  keys.forEach(([face, a, b, w0, h0]) => {
+    const [x, y] = P(a, b), w = S(w0), h = S(h0), r = S(9);
+    rr(ctx, x - S(1.6), y - S(1.6), w + S(3.2), h + S(3.2), r + S(1.6)); ctx.fillStyle = '#C6CAC5'; ctx.fill();
+    softShadow(ctx, x, y + S(2), w, h, r, 0, S(3.5), 0.235);
+    gradRR(ctx, x, y, w, h, r, '#FCFCFB', '#E3E5E2', '#AEB2AD', S(0.8));
+    const cx = x + w / 2, cy = y + h / 2, ink = '#2F3337';
+    if (face.startsWith('t:')) text(ctx, face.slice(2), cx, cy, S(face === 't:*' ? 20 : 16.5), ink);
+    else if (face.startsWith('s:')) text(ctx, face.slice(2), cx, cy, S(9.6), ink);
+    else if (face.startsWith('chev')) { const dd = face === 'chev-r' ? 1 : -1; poly(ctx, [[cx - 3 * dd * xf.s, cy - 5 * xf.s], [cx + 3 * dd * xf.s, cy], [cx - 3 * dd * xf.s, cy + 5 * xf.s]], null, ink, S(1.8)); }
+    else icon(ctx, face, cx, cy, S(face === 'flame' ? 20 : face === 'cross' ? 17 : 19), face === 'flame' ? '#C23B2C' : face === 'cross' ? '#2E6FA8' : '#3A3E43');
+  });
+  text(ctx, '(*) select     (#) exit     < > scroll', ...P(165, 356), S(8.2), '#7D8287', 400);
+  text(ctx, 'Hold F, A, P or a function key for 2 seconds', ...P(165, 372), S(7.6), 'rgba(125,130,135,0.85)', 400);
+  for (let i = 0; i < 5; i++) { rr(ctx, ...P(132 + i * 14, 394), S(8), S(3), S(1.5)); ctx.fillStyle = '#B3B7B2'; ctx.fill(); }
+}
+function drawWall() {
+  const cv = document.getElementById('wall'), ctx = cv.getContext('2d'), W = 644, H = 844;
+  const g = ctx.createLinearGradient(0, 0, 0, H); g.addColorStop(0, '#D6D0C3'); g.addColorStop(1, '#C3BCAD'); ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  glow(ctx, W / 2, -60, W * 0.85, '#FFFFFF', 0.10);
+  const b = ctx.createLinearGradient(0, H - 22, 0, H); b.addColorStop(0, '#E9E6DF'); b.addColorStop(1, '#BDB8AE'); ctx.fillStyle = b; ctx.fillRect(0, H - 22, W, 22);
+  const area = { x: 16, y: 8, w: W - 32, h: H - 8 - 62 };
+  if (st.model === 'led') drawClassic(ctx, area); else drawLcdKeypad(ctx, area);
+  text(ctx, st.model === 'led' ? 'LED keypad  \u00b7  behaves like a DSC PC1550' : 'LCD keypad  \u00b7  behaves like a DSC PC1832', W / 2, H - 48, 12.5, '#6A6459');
+  text(ctx, st.model === 'led' ? 'Type digits, * and # on your keyboard. Hold F, A or P for the emergency keys.' : 'Type digits, * and # on your keyboard. Arrows scroll, F1 to F5 are the function keys.', W / 2, H - 32, 11.5, 'rgba(106,100,89,0.85)', 400);
+  if (st.bell) { ctx.strokeStyle = 'rgba(224,80,70,0.62)'; ctx.lineWidth = 8; ctx.strokeRect(4, 4, W - 8, H - 8); }
+}
+
+// ----- panels -----
+function topBar() {
+  const [t, d, col] = st.status;
+  document.getElementById('top').innerHTML = `
+    <canvas id="brand" width="28" height="28"></canvas><div style="font-weight:600;font-size:17px;margin-left:2px">RoomGuard</div>
+    <div style="width:16px"></div>
+    <div class="row" style="background:${hexA(col, 0.14)};border-radius:16px;padding:6px 12px;gap:7px">
+      <div style="width:9px;height:9px;border-radius:5px;background:${col}"></div>
+      <div style="font-weight:600;font-size:14.5px;color:${col}">${t}</div>
+      <div class="muted" style="font-size:13px">${d}</div></div>
+    <div class="sp"></div>
+    <div class="${st.model === 'led' ? 'sel' : 'tab'}" style="opacity:${st.armed ? 0.5 : 1}">LED keypad</div>
+    <div class="${st.model === 'lcd' ? 'sel' : 'tab'}" style="opacity:${st.armed ? 0.5 : 1}">LCD keypad</div>
+    <div style="width:8px"></div><canvas id="sun" width="34" height="34"></canvas><canvas id="gear" width="34" height="34"></canvas>`;
+  const b = document.getElementById('brand').getContext('2d');
+  gradRR(b, 0, 0, 28, 28, 7, '#EEE9DC', '#CFC8B8');
+  [C.GREEN, C.RED, C.AMBER].forEach((c, i) => circle(b, 8 + i * 6, 8.5, 2, c));
+  for (let r = 0; r < 2; r++) for (let c = 0; c < 3; c++) { b.fillStyle = '#8A8375'; rr(b, 6 + c * 6, 14 + r * 5.5, 4, 3.5, 1); b.fill(); }
+  const s = document.getElementById('sun').getContext('2d'); circle(s, 17, 17, 4, C.AMBER);
+  for (let i = 0; i < 8; i++) { const a = i * Math.PI / 4; poly(s, [[17 + Math.cos(a) * 6.4, 17 + Math.sin(a) * 6.4], [17 + Math.cos(a) * 9.2, 17 + Math.sin(a) * 9.2]], null, C.AMBER, 1.6); }
+  const g = document.getElementById('gear').getContext('2d');
+  for (let i = 0; i < 8; i++) { const a = i * Math.PI / 4; poly(g, [[17 + Math.cos(a) * 5.2, 17 + Math.sin(a) * 5.2], [17 + Math.cos(a) * 9.2, 17 + Math.sin(a) * 9.2]], null, C.MUTED, 3.2); }
+  circle(g, 17, 17, 6, C.MUTED); circle(g, 17, 17, 2.6, '#1C1F22');
+}
+function camOverlay(x, W, H) {
+  const to = (u, v) => [u * W, v * H];
+  const dash = (r, col, lw, d) => { x.save(); x.setLineDash([d, d * 0.8]); x.strokeStyle = col; x.lineWidth = lw; x.strokeRect(...to(r[0], r[1]), r[2] * W, r[3] * H); x.restore(); };
+  const door = [0.10, 0.29, 0.19, 0.66];
+  if (st.cam === 'map') return;
+  const w = st.walker !== null ? walker(st.walker) : null;
+  if (w && st.track) {
+    const bx0 = (w[0] - 32) / 640, bx1 = (w[0] + 32) / 640, by0 = (w[1] - 234) / 480, by1 = w[1] / 480;
+    for (let gy = Math.floor(by0 * 24); gy <= Math.floor(by1 * 24); gy++) for (let gx = Math.floor(bx0 * 32); gx <= Math.floor(bx1 * 32); gx++) { const edge = (gx === Math.floor(bx0 * 32) || gx === Math.floor(bx1 * 32)); x.fillStyle = `rgba(255,90,60,${edge ? 0.18 : 0.32})`; x.fillRect(gx / 32 * W, gy / 24 * H, W / 32, H / 24); }
+  }
+  dash(door, st.alarm ? C.GREEN : C.GREEN, 2, 7); x.font = '600 12px Inter'; x.fillStyle = C.GREEN; x.textAlign = 'left'; x.textBaseline = 'bottom'; x.fillText('Doorway', door[0] * W + 4, (door[1] + door[3]) * H - 3);
+  if (w && st.track) {
+    const bx0 = (w[0] - 34) / 640 * W, bx1 = (w[0] + 34) / 640 * W, by0 = (w[1] - 236) / 480 * H, by1 = (w[1] + 2) / 480 * H, c = Math.min(bx1 - bx0, by1 - by0) * 0.22, col = '#F4F1EA';
+    x.strokeStyle = col; x.lineWidth = 2;
+    [[bx0, by0, 1, 1], [bx1, by0, -1, 1], [bx0, by1, 1, -1], [bx1, by1, -1, -1]].forEach(([px, py, dx, dy]) => { x.beginPath(); x.moveTo(px, py); x.lineTo(px + c * dx, py); x.moveTo(px, py); x.lineTo(px, py + c * dy); x.stroke(); });
+    x.strokeStyle = 'rgba(244,241,234,0.5)'; x.lineWidth = 1.5; x.beginPath(); x.moveTo(0.2 * W, 0.9 * H); x.lineTo(w[0] / 640 * W, 0.9 * H); x.stroke();
+    const cx = (bx0 + bx1) / 2, cy = (by0 + by1) / 2;
+    if (st.walker < 9) { x.save(); x.setLineDash([6, 4]); x.strokeStyle = C.BLUE; x.lineWidth = 1.8; x.beginPath(); x.moveTo(cx, cy); x.lineTo(cx + 0.066 * W, cy); x.stroke(); x.restore(); x.strokeStyle = C.BLUE; x.lineWidth = 1.5; x.beginPath(); x.arc(cx + 0.066 * W, cy, 5, 0, 7); x.stroke(); }
+    x.font = '600 11.5px Inter'; x.fillStyle = col; x.textBaseline = 'bottom'; x.fillText('Person 1', bx0, by0 - 3);
+  }
+}
+function cameraCard() {
+  const map = st.cam === 'map';
+  return `<div class="card" style="width:400px">
+    <div class="row"><div class="h">Camera</div><div class="sp"></div><div class="${map ? 'tab' : 'sel'}">Live</div><div class="${map ? 'sel' : 'tab'}">Room map</div></div>
+    <canvas id="cam" width="376" height="282" style="display:block;margin-top:8px;border-radius:8px;background:#0D0F10"></canvas>
+    ${map ? `
+      <div class="muted" style="margin-top:8px">Learned from 9 walks through the room. Orange is where things move, blue dots are where people walk.</div>
+      <div class="row" style="margin-top:8px"><span style="color:${C.BLUE};font-weight:600">1.</span><span>Looks like a doorway (18 trips)</span><div class="sp"></div><span class="btn small">Use as doorway</span><span class="btn small">Dismiss</span></div>
+      <div class="row" style="margin-top:6px"><span style="color:${C.BLUE};font-weight:600">2.</span><span>People leave the view on the right here (4 trips)</span></div>
+      <div class="row" style="margin-top:10px;flex-wrap:wrap"><span class="btn">Relearn the closed door</span><span class="btn">Forget what it learned</span></div>`
+    : `
+      <div class="row" style="margin-top:8px;flex-wrap:wrap;gap:6px"><span class="tab" style="background:#2E3339">Redraw doorway</span><span class="tab" style="background:#2E3339">Ignore an area</span><span class="btn">Remove doorway</span></div>
+      <div class="muted" style="margin-top:6px">Demo camera  \u00b7  15 fps</div>`}
+  </div>`;
+}
+function zonesCard() {
+  const z = [['Room Doorway','Delay, camera'],['Room Motion','Stay/Away, camera'],['Window','Instant'],['Front Door','Delay'],['Hall Motion','Stay/Away'],['Smoke Detector','Fire'],['Garage Door','Delay 2'],['Basement','Interior']];
+  const n = st.model === 'led' ? 6 : 8;
+  const kinds6 = [['Room Doorway','Delay, camera'],['Room Motion','Stay/Away, camera'],['Window','Instant'],['Front Door','Delay'],['Hall Motion','Stay/Away'],['Smoke Detector','Fire']];
+  const list = st.model === 'led' ? kinds6 : z;
+  return `<div class="card" style="width:400px;margin-top:10px"><div class="h" style="margin-bottom:6px">Zones</div>` + list.slice(0, n).map(([name, kind], i) => {
+    const num = i + 1, open = st.open.includes(num), alarm = (st.alarm || []).includes(num), camera = num <= 2;
+    const [label, col] = open ? ['Open', st.armed ? C.RED : C.AMBER] : ['Closed', C.GREEN];
+    return `<div class="row" style="padding:3px 0"><div style="color:${C.MUTED};font-weight:600;font-size:13px;width:20px">${String(num).padStart(2, '0')}</div>
+      <div><div style="font-weight:600;font-size:13.5px">${name}</div><div class="muted">${kind}</div></div><div class="sp"></div>
+      ${alarm ? `<span class="chip" style="background:${hexA(C.RED,0.18)};color:${C.RED}">Alarm</span>` : ''}
+      <span class="chip" style="background:${hexA(col,0.18)};color:${col}">${label}</span>
+      ${camera ? '' : '<span class="btn small">Open it</span>'}</div>`;
+  }).join('') + `</div>`;
+}
+function bubble(text, me, time, photo) {
+  return `<div class="row" style="justify-content:${me ? 'flex-end' : 'flex-start'};margin:4px 0"><div class="bubble" style="background:${me ? '#2B4D3F' : C.CARD_HI}">
+    <div>${text}</div>${photo ? '<canvas id="snap" width="230" height="172" style="display:block;border-radius:6px;margin-top:6px"></canvas>' : ''}<div style="font-size:10.5px;color:${C.FAINT};margin-top:3px">${time}</div></div></div>`;
+}
+function rightPanel() {
+  const hist = st.right === 'history', alarm = st.right === 'alarm';
+  let body = '';
+  if (hist) {
+    const ev = [[C.BLUE.replace('5C9CD4','6FB7C9'),'Door closed (seen by the camera)','Nov 24, 1:13:20 PM'],['#6FB7C9','Door opened (seen by the camera)','Nov 24, 1:13:10 PM'],[C.GREEN,'Trouble restored: AC failure','Nov 23, 2:28:02 PM'],[C.AMBER,'Trouble: AC failure','Nov 23, 2:13:02 PM'],[C.GREEN,'Disarmed by master code (Kaushal)','Nov 22, 1:43:02 PM'],[C.BLUE,'Armed away by master code (Kaushal)','Nov 22, 12:43:02 PM'],[C.FAINT,'Door chime on','Nov 21, 6:02:44 PM'],[C.BLUE,'Armed stay, interior zones bypassed','Nov 20, 11:31:09 PM']];
+    body = `<div class="h">History</div><div class="row" style="margin:6px 0 8px;gap:4px"><span class="sel">All</span><span class="tab">Alarms</span><span class="tab">Arming</span><span class="tab">Troubles</span><span class="tab">Camera</span></div>` +
+      ev.map(([c, t, d]) => `<div class="row" style="align-items:flex-start;margin-bottom:7px"><div style="width:3px;height:30px;border-radius:2px;background:${c}"></div><div><div>${t}</div><div style="font-size:11px;color:${C.FAINT}">${d}</div></div></div>`).join('') +
+      `<div style="position:absolute;bottom:14px"><span class="btn small">Clear history</span></div>`;
+  } else {
+    body = `<div class="row"><div class="h">Monitoring center</div><div class="sp"></div><span class="chip" style="background:${hexA(C.GREEN,0.18)};color:${C.GREEN}">Phone alerts on</span></div>`;
+    if (alarm) body += `<div class="card" style="background:#1D3128;margin:8px 0"><div style="font-weight:600;font-size:15px">RoomGuard Central is calling</div><div class="muted" style="margin:2px 0 8px">They're calling about the alarm. Answer to talk to them.</div><div class="row"><span class="accent" style="background:${hexA(C.GREEN,0.85)}">Answer</span><span class="accent" style="background:${hexA(C.RED,0.85)}">Decline</span></div></div>`;
+    body += `<div style="margin-top:8px">` +
+      `<div class="sys">Nov 23, 2:13 PM   Signal received: E301 AC Loss</div>` +
+      bubble("Hi Kaushal, your panel just reported a trouble: ac failure. Nothing is in alarm, but you'll want to take a look.", false, 'Nov 23, 2:13 PM') +
+      `<div class="sys">Nov 23, 2:28 PM   Signal received: R301 AC Loss</div>`;
+    if (alarm) body += `<div class="sys">1:47 PM   Signal received: E130 Burglary, zone 002</div>` + bubble("Hi Kaushal, this is Dana at RoomGuard Central. We just got a burglary alarm from zone 2, Room Motion. I'm calling you now.", false, '1:47 PM', true);
+    body += `</div><div style="position:absolute;bottom:14px;left:12px;right:12px" class="row"><span class="muted">${alarm ? 'Last alert delivered' : ''}</span><div class="sp"></div><span class="btn small">Clear</span></div>`;
+  }
+  document.getElementById('right').innerHTML = `<div class="row" style="gap:4px"><span class="${hist ? 'tab' : 'sel'}">Monitoring${alarm ? '  \u2022' : ''}</span><span class="${hist ? 'sel' : 'tab'}">History</span></div>
+    <div class="card" style="position:relative;margin-top:6px;height:772px;overflow:hidden">${body}</div>`;
+}
+function render() {
+  topBar();
+  document.getElementById('left').innerHTML = cameraCard() + zonesCard();
+  rightPanel();
+  const cam = document.getElementById('cam').getContext('2d');
+  const scene = demoScene(st.walker === null ? 1.0 : st.walker);
+  if (st.cam === 'map') {
+    cam.globalAlpha = 1; cam.drawImage(scene, 0, 0, 376, 282); cam.fillStyle = 'rgba(13,15,16,0.55)'; cam.fillRect(0, 0, 376, 282);
+    for (let gy = 0; gy < 24; gy++) for (let gx = 0; gx < 32; gx++) { const u = (gx + 0.5) / 32, v = (gy + 0.5) / 24; let h = Math.exp(-Math.pow((v - 0.62) / 0.2, 2)) * Math.exp(-Math.pow((u - 0.47) / 0.3, 2)); if (u < 0.28 && u > 0.12 && v > 0.3) h = Math.max(h, 0.8); if (h < 0.12) continue; cam.fillStyle = `rgba(${Math.round(242 - 13 * h)},${Math.round(177 - 102 * h)},${Math.round(60)},${h * 0.55})`; cam.fillRect(gx / 32 * 376, gy / 24 * 282, 376 / 32 + 0.5, 282 / 24 + 0.5); }
+    for (let gx = 6; gx < 27; gx++) { const v = 0.3 + 0.7 * Math.sin((gx - 6) / 21 * Math.PI); cam.fillStyle = `rgba(127,200,255,${0.25 + 0.55 * v})`; cam.beginPath(); cam.arc((gx + 0.5) / 32 * 376, 0.9 * 282, 1.5 + 2.5 * v, 0, 7); cam.fill(); }
+    cam.save(); cam.setLineDash([5, 4]); cam.strokeStyle = C.BLUE; cam.lineWidth = 1.5; cam.strokeRect(0.11 * 376, 0.32 * 282, 0.17 * 376, 0.62 * 282); cam.restore();
+    cam.font = '600 12px Inter'; cam.fillStyle = C.BLUE; cam.textBaseline = 'top'; cam.fillText('1', 0.11 * 376 + 4, 0.32 * 282 + 3);
+    cam.save(); cam.setLineDash([7, 5.6]); cam.strokeStyle = C.GREEN; cam.lineWidth = 2; cam.strokeRect(0.10 * 376, 0.29 * 282, 0.19 * 376, 0.66 * 282); cam.restore();
+    cam.fillStyle = C.GREEN; cam.textBaseline = 'bottom'; cam.fillText('Doorway', 0.10 * 376 + 4, 0.95 * 282 - 3);
+  } else {
+    cam.drawImage(scene, 0, 0, 376, 282); camOverlay(cam, 376, 282);
+  }
+  const snap = document.getElementById('snap'); if (snap) { const s = snap.getContext('2d'); s.drawImage(scene, 0, 0, 230, 172); }
+  drawWall();
+}
+document.fonts.load('600 14px Inter').then(() => document.fonts.load('400 14px Inter')).then(() => { render(); document.body.dataset.ready = '1'; });
+</script></body></html>

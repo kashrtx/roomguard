@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=RoomGuard
+Comment=Camera based room alarm
+Exec=roomguard
+Icon=roomguard
+Terminal=false
+Categories=Utility;Security;

@@ -1,0 +1,26 @@
+RoomGuard
+Copyright 2026 Kaushal Bhingaradia
+
+Licensed under the Apache License, Version 2.0. See LICENSE.
+
+RoomGuard emulates the behaviour of the DSC PC1550 and DSC PowerSeries
+PC1832 alarm panels. It is not made by, endorsed by or affiliated with DSC
+or any manufacturer named in it. Product names are used only to describe
+what is being emulated. The keypads drawn by the app are original designs.
+
+Third party material included in this repository:
+
+Inter typeface (assets/fonts/Inter-Regular.otf, assets/fonts/Inter-SemiBold.otf)
+  Copyright 2016 The Inter Project Authors (https://github.com/rsms/inter)
+  Licensed under the SIL Open Font License, Version 1.1.
+  See assets/fonts/LICENSE-Inter.txt.
+
+Face detection cascade (assets/cascade/lbp_frontalface.bin)
+  Converted by tools/convert_cascade.py from lbpcascade_frontalface.xml,
+  part of the OpenCV project (https://github.com/opencv/opencv), as
+  redistributed in scikit-image's data folder. OpenCV is distributed under
+  the Apache License 2.0 (releases 4.5 and later) and the 3-clause BSD
+  license (earlier releases).
+
+Rust crates used at build time are listed in Cargo.toml and keep their own
+licenses (MIT, Apache 2.0 or similar).

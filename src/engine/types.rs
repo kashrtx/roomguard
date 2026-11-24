@@ -1,0 +1,395 @@
+//! Types shared by the panel engine and the interface.
+
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum Model {
+    Pc1550,
+    #[default]
+    Pc1832,
+}
+
+impl Model {
+    pub fn zone_count(self) -> usize {
+        match self {
+            Model::Pc1550 => 6,
+            Model::Pc1832 => 8,
+        }
+    }
+    pub fn panel_name(self) -> &'static str {
+        match self {
+            Model::Pc1550 => "PC1550",
+            Model::Pc1832 => "PC1832",
+        }
+    }
+    pub fn keypad_name(self) -> &'static str {
+        match self {
+            Model::Pc1550 => "PC1500RK",
+            Model::Pc1832 => "PK5500",
+        }
+    }
+    pub fn era(self) -> &'static str {
+        match self {
+            Model::Pc1550 => "Classic LED keypad, 1990s",
+            Model::Pc1832 => "PowerSeries LCD keypad, 2000s",
+        }
+    }
+    pub fn file_key(self) -> &'static str {
+        match self {
+            Model::Pc1550 => "pc1550",
+            Model::Pc1832 => "pc1832",
+        }
+    }
+    /// How long the emergency and function keys must be held, in ms.
+    pub fn hold_ms(self) -> u128 {
+        match self {
+            Model::Pc1550 => 1000,
+            Model::Pc1832 => 2000,
+        }
+    }
+    pub fn installer_default(self) -> &'static str {
+        match self {
+            Model::Pc1550 => "1500",
+            Model::Pc1832 => "5555",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum SirenModel {
+    #[default]
+    Wave2F,
+    MasterBlaster,
+    Rx7c,
+    MotorBell,
+}
+
+impl SirenModel {
+    pub const ALL: [SirenModel; 4] = [SirenModel::Wave2F, SirenModel::MasterBlaster, SirenModel::Rx7c, SirenModel::MotorBell];
+    pub fn label(self) -> &'static str {
+        match self {
+            SirenModel::Wave2F => "Ademco WAVE-2F",
+            SirenModel::MasterBlaster => "Klaxon Master Blaster",
+            SirenModel::Rx7c => "ADT RX-7C sounder",
+            SirenModel::MotorBell => "10 inch motor bell",
+        }
+    }
+    pub fn blurb(self) -> &'static str {
+        match self {
+            SirenModel::Wave2F => "Square flush mount two tone siren, 106 dB",
+            SirenModel::MasterBlaster => "Motor driven siren, 1600 Hz, spins up and coasts down",
+            SirenModel::Rx7c => "Small chirping indoor piezo sounder, about 90 dB",
+            SirenModel::MotorBell => "Classic striker bell from 90s installs",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Key {
+    Digit(u8),
+    Star,
+    Hash,
+    Fire,
+    Aux,
+    Panic,
+    Left,
+    Right,
+    Stay,
+    Away,
+    Chime,
+    Reset,
+    Exit,
+}
+
+impl Key {
+    pub fn is_emergency(self) -> bool {
+        matches!(self, Key::Fire | Key::Aux | Key::Panic)
+    }
+    pub fn is_function(self) -> bool {
+        matches!(self, Key::Stay | Key::Away | Key::Chime | Key::Reset | Key::Exit)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ArmMode {
+    Away,
+    Stay,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Led {
+    Off,
+    On,
+    Flash,
+    Fast,
+}
+
+impl Led {
+    pub fn lit(self, t: f64) -> bool {
+        match self {
+            Led::Off => false,
+            Led::On => true,
+            Led::Flash => t.rem_euclid(1.0) < 0.5,
+            Led::Fast => t.rem_euclid(0.4) < 0.2,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum H24 {
+    Burglary,
+    BellBuzzer,
+    Buzzer,
+    Panic,
+    Medical,
+    Holdup,
+    Emergency,
+    Gas,
+    Heat,
+    Water,
+    Freeze,
+    Sprinkler,
+    Supervisory,
+    SupervisoryBuzzer,
+    Tamper,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ZoneKind {
+    Null,
+    Delay1,
+    Delay2,
+    Instant,
+    Interior,
+    StayAway,
+    DelayStayAway,
+    Fire,
+    FireDelayed,
+    H24(H24),
+}
+
+impl ZoneKind {
+    pub fn is_delay(self) -> bool {
+        matches!(self, ZoneKind::Delay1 | ZoneKind::Delay2 | ZoneKind::DelayStayAway)
+    }
+    pub fn is_fire(self) -> bool {
+        matches!(self, ZoneKind::Fire | ZoneKind::FireDelayed)
+    }
+    pub fn is_24h(self) -> bool {
+        matches!(self, ZoneKind::Fire | ZoneKind::FireDelayed | ZoneKind::H24(_))
+    }
+    pub fn is_stay_away(self) -> bool {
+        matches!(self, ZoneKind::StayAway | ZoneKind::DelayStayAway)
+    }
+    pub fn short(self) -> &'static str {
+        match self {
+            ZoneKind::Null => "Not used",
+            ZoneKind::Delay1 => "Delay",
+            ZoneKind::Delay2 => "Delay 2",
+            ZoneKind::Instant => "Instant",
+            ZoneKind::Interior => "Interior",
+            ZoneKind::StayAway => "Stay/Away",
+            ZoneKind::DelayStayAway => "Delay Stay/Away",
+            ZoneKind::Fire => "Fire",
+            ZoneKind::FireDelayed => "Delayed fire",
+            ZoneKind::H24(h) => match h {
+                H24::Burglary => "24 hr burglary",
+                H24::BellBuzzer => "24 hr bell/buzzer",
+                H24::Buzzer => "24 hr buzzer",
+                H24::Panic => "24 hr panic",
+                H24::Medical => "24 hr medical",
+                H24::Holdup => "24 hr holdup",
+                H24::Emergency => "24 hr emergency",
+                H24::Gas => "24 hr gas",
+                H24::Heat => "24 hr heat",
+                H24::Water => "24 hr water",
+                H24::Freeze => "24 hr freeze",
+                H24::Sprinkler => "24 hr sprinkler",
+                H24::Supervisory => "24 hr supervisory",
+                H24::SupervisoryBuzzer => "24 hr supv buzzer",
+                H24::Tamper => "24 hr tamper",
+            },
+        }
+    }
+    pub fn alarm_kind(self) -> AlarmKind {
+        match self {
+            ZoneKind::Fire | ZoneKind::FireDelayed => AlarmKind::Fire,
+            ZoneKind::H24(h) => match h {
+                H24::Panic => AlarmKind::Panic,
+                H24::Medical => AlarmKind::Medical,
+                H24::Holdup => AlarmKind::Holdup,
+                H24::Emergency => AlarmKind::Emergency,
+                H24::Gas => AlarmKind::Gas,
+                H24::Heat => AlarmKind::Heat,
+                H24::Water | H24::Sprinkler => AlarmKind::Water,
+                H24::Freeze => AlarmKind::Freeze,
+                H24::Supervisory | H24::SupervisoryBuzzer => AlarmKind::Supervisory,
+                H24::Tamper => AlarmKind::Tamper,
+                H24::Burglary | H24::BellBuzzer | H24::Buzzer => AlarmKind::Burglary,
+            },
+            _ => AlarmKind::Burglary,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AlarmKind {
+    Burglary,
+    Fire,
+    Panic,
+    Medical,
+    Duress,
+    Tamper,
+    Holdup,
+    Emergency,
+    Gas,
+    Heat,
+    Water,
+    Freeze,
+    Supervisory,
+}
+
+impl AlarmKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            AlarmKind::Burglary => "Burglary",
+            AlarmKind::Fire => "Fire",
+            AlarmKind::Panic => "Panic",
+            AlarmKind::Medical => "Medical",
+            AlarmKind::Duress => "Duress",
+            AlarmKind::Tamper => "Tamper",
+            AlarmKind::Holdup => "Holdup",
+            AlarmKind::Emergency => "Emergency",
+            AlarmKind::Gas => "Gas",
+            AlarmKind::Heat => "Heat",
+            AlarmKind::Water => "Water",
+            AlarmKind::Freeze => "Freeze",
+            AlarmKind::Supervisory => "Supervisory",
+        }
+    }
+    /// Contact ID event code.
+    pub fn cid(self) -> u16 {
+        match self {
+            AlarmKind::Burglary => 130,
+            AlarmKind::Fire => 110,
+            AlarmKind::Panic => 120,
+            AlarmKind::Medical => 100,
+            AlarmKind::Duress => 121,
+            AlarmKind::Tamper => 144,
+            AlarmKind::Holdup => 122,
+            AlarmKind::Emergency => 101,
+            AlarmKind::Gas => 151,
+            AlarmKind::Heat => 114,
+            AlarmKind::Water => 154,
+            AlarmKind::Freeze => 159,
+            AlarmKind::Supervisory => 200,
+        }
+    }
+    /// Fire style alarms pulse the bell; everything else sounds steady.
+    pub fn pulsed(self) -> bool {
+        matches!(self, AlarmKind::Fire | AlarmKind::Heat)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StatusKind {
+    Ready,
+    NotReady,
+    Exit,
+    Armed,
+    Entry,
+    Alarm,
+    Program,
+    Lockout,
+}
+
+#[derive(Clone, Debug)]
+pub struct ZoneView {
+    pub num: u8,
+    pub label: String,
+    pub kind: ZoneKind,
+    pub open: bool,
+    pub bypassed: bool,
+    pub alarm: bool,
+    pub tamper: bool,
+    pub fault: bool,
+    pub camera: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EvKind {
+    Alarm,
+    Arm,
+    Disarm,
+    Trouble,
+    Restore,
+    Program,
+    Info,
+    Camera,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EventRow {
+    pub ts: i64,
+    pub kind: EvKind,
+    pub text: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChatFrom {
+    Operator,
+    System,
+    Me,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ChatMsg {
+    pub from: ChatFrom,
+    pub text: String,
+    pub ts: i64,
+    #[serde(default)]
+    pub photo: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CallState {
+    Ringing,
+    Talking,
+}
+
+#[derive(Clone, Debug)]
+pub struct CallView {
+    pub state: CallState,
+    pub since_ms: i64,
+    pub caller: String,
+    pub ask_passcode: bool,
+    pub ask_dispatch: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReportKind {
+    Alarm(AlarmKind),
+    Cancel,
+    Opening,
+    Closing,
+    Trouble,
+    Restore,
+    Shutdown,
+    PowerUp,
+    Lockout,
+    EntryStarted,
+    Stranger,
+}
+
+#[derive(Clone, Debug)]
+pub struct Report {
+    pub id: u64,
+    pub kind: ReportKind,
+    pub cid: u16,
+    pub qualifier: char,
+    pub zone_or_user: u16,
+    pub zone_label: String,
+    pub text: String,
+    pub delay_s: u32,
+    pub ts: i64,
+}

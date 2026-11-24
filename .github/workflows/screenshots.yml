@@ -1,0 +1,41 @@
+name: Screenshots
+
+# Runs the real app with its demo camera on a virtual screen, saves README
+# screenshots to docs/screenshots and commits them. Start it from the Actions
+# tab whenever the interface changes.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  capture:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config clang libasound2-dev libudev-dev libv4l-dev \
+            libxkbcommon-dev libxkbcommon-x11-0 libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libgl1-mesa-dev libgl1-mesa-dri xvfb
+      - name: Build
+        run: cargo build --release
+      - name: Capture
+        env:
+          LIBGL_ALWAYS_SOFTWARE: "1"
+        run: xvfb-run -a -s "-screen 0 1440x900x24" ./target/release/roomguard --screenshots docs/screenshots
+      - name: Shrink the images
+        run: |
+          python3 -m pip install --quiet pillow
+          python3 tools/shrink_png.py docs/screenshots
+      - name: Commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/screenshots
+          git diff --cached --quiet || git commit -m "Update screenshots from the real app"
+          git push

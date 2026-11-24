@@ -1,0 +1,734 @@
+//! The main window: status bar on top, camera and zones on the left, the
+//! keypad on its wall in the middle, the monitoring center on the right.
+
+use std::path::PathBuf;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
+
+use eframe::egui::{self, Align2, Color32, Pos2, Rect, RichText, Sense, Stroke, Vec2};
+
+use crate::audio::{self, AudioHandle};
+use crate::autostart;
+use crate::config::{AppConfig, NRect};
+use crate::engine::panel::PanelSave;
+use crate::engine::types::{ChatFrom, ChatMsg, EvKind, EventRow, Key, Model, StatusKind};
+use crate::engine::{self, EngineHandle, EngineMsg, View};
+use crate::keypads::{self, KeyInput};
+use crate::notify;
+use crate::paint;
+use crate::png;
+use crate::theme;
+use crate::update::{self, UpdateState, Updater};
+use crate::util;
+use crate::views;
+use crate::views::camera::CameraView;
+use crate::views::events::EventsView;
+use crate::views::operator::OperatorView;
+use crate::views::settings::SettingsView;
+use crate::views::setup::SetupView;
+use crate::vision::{self, CameraHandle};
+
+pub fn window_icon() -> egui::IconData {
+    egui::IconData { rgba: include_bytes!("../assets/icon/icon-128.rgba").to_vec(), width: 128, height: 128 }
+}
+
+/// Screenshot mode runs in a throwaway data folder with the demo camera and
+/// a little history, so the README pictures look like a lived in install.
+pub fn prepare_demo_data() {
+    let dir = std::env::temp_dir().join(format!("roomguard-demo-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::create_dir_all(&dir);
+    std::env::set_var("ROOMGUARD_DATA_DIR", &dir);
+    let mut cfg = AppConfig::default();
+    cfg.setup_done = true;
+    cfg.admin_name = "Kaushal".to_string();
+    cfg.model = Model::Pc1832;
+    cfg.camera.device = vision::DEMO_DEVICE;
+    cfg.camera.mirror = false;
+    cfg.camera.faces = false;
+    cfg.camera.doorway = Some(NRect::new(0.10, 0.29, 0.19, 0.66));
+    cfg.check_updates = false;
+    cfg.keep_awake = false;
+    cfg.sound.master = 0.0;
+    cfg.operator.set_passcode("blue");
+    cfg.save();
+    let now = util::now_ms();
+    let day = 86_400_000i64;
+    let mut panel = PanelSave::fresh(Model::Pc1832);
+    panel.ee.sections.insert("005.01".to_string(), "005045012".to_string());
+    for (ago, kind, text) in [
+        (day * 2, EvKind::Arm, "Armed away by master code (Kaushal)"),
+        (day * 2 - 3_600_000, EvKind::Disarm, "Disarmed by master code (Kaushal)"),
+        (day, EvKind::Trouble, "Trouble: AC failure"),
+        (day - 900_000, EvKind::Restore, "Trouble restored: AC failure"),
+        (5_400_000, EvKind::Camera, "Door opened (seen by the camera)"),
+        (5_390_000, EvKind::Camera, "Door closed (seen by the camera)"),
+    ] {
+        panel.events.push(EventRow { ts: now - ago, kind, text: text.to_string() });
+    }
+    util::save_json(&dir.join("panel-pc1832.json"), &panel);
+    let chat = vec![
+        ChatMsg { from: ChatFrom::System, text: "Signal received: E301 AC Loss".to_string(), ts: now - day, photo: None },
+        ChatMsg {
+            from: ChatFrom::Operator,
+            text: "Hi Kaushal, your panel just reported a trouble: ac failure. Nothing is in alarm, but you'll want to take a look.".to_string(),
+            ts: now - day + 4_000,
+            photo: None,
+        },
+        ChatMsg { from: ChatFrom::System, text: "Signal received: R301 AC Loss".to_string(), ts: now - day + 900_000, photo: None },
+    ];
+    util::save_json(&dir.join("operator.json"), &serde_json::json!({ "chat": chat }));
+}
+
+struct Shots {
+    dir: PathBuf,
+    stage: u8,
+    start: Option<f64>,
+    mark: f64,
+    awaiting: Option<&'static str>,
+}
+
+enum ShotAct {
+    Nothing,
+    Shoot,
+    Model(Model, u8),
+    Arm,
+    Settings,
+    Quit,
+}
+
+#[derive(Clone, Copy)]
+enum Icon {
+    Gear,
+    Sun,
+    Moon,
+}
+
+pub struct RoomGuardApp {
+    cfg: AppConfig,
+    engine: EngineHandle,
+    audio: AudioHandle,
+    cam: CameraHandle,
+    updater: Updater,
+    input: KeyInput,
+    camera_view: CameraView,
+    operator_view: OperatorView,
+    events_view: EventsView,
+    settings: SettingsView,
+    setup: Option<SetupView>,
+    lights: f32,
+    save_at: Option<Instant>,
+    applied_autostart: bool,
+    close_dialog: bool,
+    close_code: String,
+    close_error: String,
+    close_focus: bool,
+    closing: bool,
+    shut: bool,
+    right_tab: u8,
+    saw_call: bool,
+    update_dismissed: bool,
+    want_restart: bool,
+    start_minimized: bool,
+    shots: Option<Shots>,
+}
+
+fn clip(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        format!("{}...", s.chars().take(n.saturating_sub(3)).collect::<String>())
+    }
+}
+
+fn icon_button(ui: &mut egui::Ui, icon: Icon, tip: &str) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(34.0), Sense::click());
+    let resp = resp.on_hover_text(tip);
+    let hovered = resp.hovered();
+    let p = ui.painter();
+    let bg = if hovered { theme::CARD_HI } else { theme::BG };
+    if hovered {
+        p.rect_filled(rect, 8.0, bg);
+    }
+    let c = rect.center();
+    let col = if hovered { theme::TEXT } else { theme::MUTED };
+    match icon {
+        Icon::Gear => paint::icon_gear(p, c, 20.0, col),
+        Icon::Sun => paint::icon_sun(p, c, 20.0, theme::AMBER),
+        Icon::Moon => paint::icon_moon(p, c, 20.0, col, bg),
+    }
+    resp
+}
+
+fn brand(ui: &mut egui::Ui) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(28.0, 28.0), Sense::hover());
+    let p = ui.painter();
+    paint::grad_rrect(p, rect, 7.0, Color32::from_rgb(0xEE, 0xE9, 0xDC), Color32::from_rgb(0xCF, 0xC8, 0xB8), None);
+    let lights = [theme::GREEN, theme::RED, theme::AMBER];
+    for (i, c) in lights.iter().enumerate() {
+        p.circle_filled(Pos2::new(rect.left() + 8.0 + i as f32 * 6.0, rect.top() + 8.5), 2.0, *c);
+    }
+    for row in 0..2 {
+        for col in 0..3 {
+            let min = Pos2::new(rect.left() + 6.0 + col as f32 * 6.0, rect.top() + 14.0 + row as f32 * 5.5);
+            p.rect_filled(Rect::from_min_size(min, Vec2::new(4.0, 3.5)), 1.0, Color32::from_rgb(0x8A, 0x83, 0x75));
+        }
+    }
+    ui.label(RichText::new("RoomGuard").font(theme::semi(17.0)).color(theme::TEXT));
+}
+
+impl RoomGuardApp {
+    pub fn new(cc: &eframe::CreationContext<'_>, shots: Option<PathBuf>, minimized: bool) -> Self {
+        theme::install(&cc.egui_ctx);
+        let cfg = AppConfig::load();
+        let ctx = cc.egui_ctx.clone();
+        let audio = audio::start();
+        let (tx, rx) = mpsc::channel();
+        let notify = notify::start(tx.clone());
+        let cam = vision::start(cfg.camera.clone(), tx.clone(), ctx.clone());
+        let engine = engine::start(cfg.clone(), tx, rx, audio.clone(), cam.clone(), notify, ctx.clone());
+        let updater = Updater::new();
+        if cfg.check_updates && cfg.setup_done && shots.is_none() {
+            updater.check(&ctx);
+        }
+        let setup = if cfg.setup_done { None } else { Some(SetupView::new(&cfg)) };
+        let lights = if cfg.ui.lights_on { 1.0 } else { 0.0 };
+        let right_tab = cfg.ui.right_tab.min(1);
+        let applied_autostart = autostart::is_enabled();
+        RoomGuardApp {
+            cfg,
+            engine,
+            audio,
+            cam,
+            updater,
+            input: KeyInput::default(),
+            camera_view: CameraView::default(),
+            operator_view: OperatorView::default(),
+            events_view: EventsView::default(),
+            settings: SettingsView::default(),
+            setup,
+            lights,
+            save_at: None,
+            applied_autostart,
+            close_dialog: false,
+            close_code: String::new(),
+            close_error: String::new(),
+            close_focus: false,
+            closing: false,
+            shut: false,
+            right_tab,
+            saw_call: false,
+            update_dismissed: false,
+            want_restart: false,
+            start_minimized: minimized,
+            shots: shots.map(|dir| Shots { dir, stage: 0, start: None, mark: 0.0, awaiting: None }),
+        }
+    }
+
+    fn push_cfg(&mut self) {
+        self.engine.send(EngineMsg::Config(Box::new(self.cfg.clone())));
+        self.save_at = Some(Instant::now() + Duration::from_millis(700));
+        if self.shots.is_none() && self.cfg.autostart != self.applied_autostart {
+            match autostart::set(self.cfg.autostart) {
+                Ok(()) => self.applied_autostart = self.cfg.autostart,
+                Err(e) => {
+                    util::log(&format!("couldn't change the open at sign in setting: {}", e));
+                    self.applied_autostart = self.cfg.autostart;
+                }
+            }
+        }
+    }
+
+    fn shutdown(&mut self) {
+        if self.shut {
+            return;
+        }
+        self.shut = true;
+        self.cfg.ui.right_tab = self.right_tab;
+        if self.shots.is_none() {
+            self.cfg.save();
+        }
+        self.engine.shutdown();
+    }
+
+    fn verify_code(&mut self) -> bool {
+        let code = std::mem::take(&mut self.close_code);
+        let (tx, rx) = mpsc::channel();
+        self.engine.send(EngineMsg::VerifyCode { code, reply: tx });
+        rx.recv_timeout(Duration::from_millis(800)).unwrap_or(false)
+    }
+
+    fn top_bar(&mut self, ctx: &egui::Context, view: &View, changed: &mut bool) {
+        egui::TopBottomPanel::top("top-bar")
+            .exact_height(56.0)
+            .frame(egui::Frame::none().fill(theme::BG).inner_margin(egui::Margin::symmetric(16.0, 0.0)))
+            .show(ctx, |ui| {
+                ui.horizontal_centered(|ui| {
+                    brand(ui);
+                    ui.add_space(16.0);
+                    let col = views::status_color(view.status);
+                    let max_w = (ui.available_width() - 380.0).max(180.0);
+                    egui::Frame::none()
+                        .fill(col.gamma_multiply(0.14))
+                        .rounding(16.0)
+                        .inner_margin(egui::Margin::symmetric(12.0, 6.0))
+                        .show(ui, |ui| {
+                            ui.set_max_width(max_w);
+                            ui.horizontal(|ui| {
+                                let (r, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
+                                ui.painter().circle_filled(r.center(), 4.5, col);
+                                ui.label(RichText::new(&view.status_title).font(theme::semi(14.5)).color(col));
+                                let room = ((max_w - 160.0) / 7.2).max(10.0) as usize;
+                                ui.label(RichText::new(clip(&view.status_detail, room)).color(theme::MUTED).size(13.0));
+                            });
+                        });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if icon_button(ui, Icon::Gear, "Settings").clicked() {
+                            self.settings.open = !self.settings.open;
+                        }
+                        let on = self.cfg.ui.lights_on;
+                        let tip = if on { "Turn the room lights off" } else { "Turn the room lights on" };
+                        if icon_button(ui, if on { Icon::Sun } else { Icon::Moon }, tip).clicked() {
+                            self.cfg.ui.lights_on = !on;
+                            *changed = true;
+                        }
+                        ui.add_space(8.0);
+                        let armed = view.armed;
+                        let resp = ui
+                            .add_enabled_ui(!armed, |ui| {
+                                if ui.selectable_label(self.cfg.model == Model::Pc1832, "LCD keypad").clicked() && self.cfg.model != Model::Pc1832 {
+                                    self.cfg.model = Model::Pc1832;
+                                    *changed = true;
+                                }
+                                if ui.selectable_label(self.cfg.model == Model::Pc1550, "LED keypad").clicked() && self.cfg.model != Model::Pc1550 {
+                                    self.cfg.model = Model::Pc1550;
+                                    *changed = true;
+                                }
+                            })
+                            .response;
+                        if armed {
+                            resp.on_disabled_hover_text("Disarm first to switch panels");
+                        }
+                    });
+                });
+            });
+    }
+
+    fn left_panel(&mut self, ctx: &egui::Context, view: &View, changed: &mut bool) {
+        egui::SidePanel::left("left-panel")
+            .exact_width(424.0)
+            .resizable(false)
+            .frame(egui::Frame::none().fill(theme::PANEL).inner_margin(egui::Margin::same(12.0)))
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical().id_salt("left-scroll").auto_shrink([false, false]).show(ui, |ui| {
+                    theme::card().show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        self.camera_view.ui(ui, &self.cam, &mut self.cfg.camera, changed, self.cfg.ui.show_motion, self.cfg.ui.show_tracks);
+                    });
+                    ui.add_space(10.0);
+                    theme::card().show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        views::sensors::ui(ui, view, &self.engine);
+                    });
+                });
+            });
+    }
+
+    fn right_panel(&mut self, ctx: &egui::Context, view: &View) {
+        egui::SidePanel::right("right-panel")
+            .exact_width(372.0)
+            .resizable(false)
+            .frame(egui::Frame::none().fill(theme::PANEL).inner_margin(egui::Margin::same(12.0)))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    for (i, name) in ["Monitoring", "History"].iter().enumerate() {
+                        let label = if i == 0 && view.call.is_some() { format!("{}  \u{2022}", name) } else { name.to_string() };
+                        if ui.selectable_label(self.right_tab == i as u8, label).clicked() {
+                            self.right_tab = i as u8;
+                        }
+                    }
+                });
+                ui.add_space(6.0);
+                let h = ui.available_height();
+                theme::card().show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.set_height((h - 28.0).max(200.0));
+                    if self.right_tab == 0 {
+                        self.operator_view.ui(ui, view, &self.engine, &self.cfg.operator.operator_name, self.cfg.operator.phone_alerts);
+                    } else {
+                        self.events_view.ui(ui, view, &self.engine);
+                    }
+                });
+            });
+    }
+
+    /// The update banner along the top of the wall. Returns the height it uses.
+    fn update_banner(&mut self, ctx: &egui::Context, rect: Rect) -> f32 {
+        if self.update_dismissed || self.shots.is_some() {
+            return 0.0;
+        }
+        let state = self.updater.state();
+        let (text, kind) = match &state {
+            UpdateState::Available(rel) if rel.version != self.cfg.skipped_version => (format!("RoomGuard {} is available", rel.version), 1),
+            UpdateState::Downloading { got, total } => {
+                let pct = if *total > 0 { format!(", {}%", got * 100 / total) } else { String::new() };
+                (format!("Downloading the update{}", pct), 0)
+            }
+            UpdateState::Ready(msg) => (msg.clone(), 2),
+            _ => return 0.0,
+        };
+        let width = rect.width() - 32.0;
+        egui::Area::new(egui::Id::new("update-banner")).fixed_pos(rect.min + Vec2::new(16.0, 12.0)).show(ctx, |ui| {
+            egui::Frame::none()
+                .fill(theme::CARD)
+                .rounding(8.0)
+                .stroke(Stroke::new(1.0, theme::LINE))
+                .inner_margin(egui::Margin::symmetric(12.0, 8.0))
+                .show(ui, |ui| {
+                    ui.set_width(width - 24.0);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(clip(&text, 70)).color(theme::TEXT));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| match (kind, &state) {
+                            (1, UpdateState::Available(rel)) => {
+                                if ui.button("Later").clicked() {
+                                    self.update_dismissed = true;
+                                }
+                                if ui.button("Skip this version").clicked() {
+                                    self.cfg.skipped_version = rel.version.clone();
+                                    self.update_dismissed = true;
+                                    self.save_at = Some(Instant::now());
+                                }
+                                if views::accent_button(ui, "Update now", theme::GREEN).clicked() {
+                                    self.updater.install(rel.clone(), ui.ctx());
+                                }
+                            }
+                            (2, _) => {
+                                if ui.button("Later").clicked() {
+                                    self.update_dismissed = true;
+                                }
+                                if !cfg!(target_os = "macos") && views::accent_button(ui, "Restart now", theme::GREEN).clicked() {
+                                    self.want_restart = true;
+                                }
+                            }
+                            _ => {}
+                        });
+                    });
+                });
+        });
+        56.0
+    }
+
+    fn wall(&mut self, ui: &mut egui::Ui, view: &View, t: f64) {
+        let rect = ui.max_rect();
+        let p = ui.painter().clone();
+        let l = self.lights;
+        paint::grad_rrect(
+            &p,
+            rect,
+            0.0,
+            paint::dim(Color32::from_rgb(0xD6, 0xD0, 0xC3), l),
+            paint::dim(Color32::from_rgb(0xC3, 0xBC, 0xAD), l),
+            Some(Stroke::NONE),
+        );
+        if l > 0.02 {
+            paint::glow(&p, Pos2::new(rect.center().x, rect.top() - 60.0), rect.width() * 0.85, paint::alpha(Color32::WHITE, 0.10 * l));
+        }
+        let base = Rect::from_min_max(Pos2::new(rect.left(), rect.bottom() - 22.0), rect.right_bottom());
+        paint::grad_rrect(&p, base, 0.0, paint::dim(Color32::from_rgb(0xE9, 0xE6, 0xDF), l), paint::dim(Color32::from_rgb(0xBD, 0xB8, 0xAE), l), Some(Stroke::NONE));
+        let banner = self.update_banner(ui.ctx(), rect);
+        let area = Rect::from_min_max(Pos2::new(rect.left() + 16.0, rect.top() + banner + 8.0), Pos2::new(rect.right() - 16.0, rect.bottom() - 62.0));
+        match view.model {
+            Model::Pc1550 => keypads::classic::draw(ui, area, view, &mut self.input, &self.engine, &self.audio, l, t),
+            Model::Pc1832 => keypads::lcd::draw(ui, area, view, &mut self.input, &self.engine, &self.audio, l, t),
+        }
+        let caption = match view.model {
+            Model::Pc1550 => "LED keypad  \u{00b7}  behaves like a DSC PC1550",
+            Model::Pc1832 => "LCD keypad  \u{00b7}  behaves like a DSC PC1832",
+        };
+        let ink = paint::dim(Color32::from_rgb(0x6A, 0x64, 0x59), l.max(0.75));
+        p.text(Pos2::new(rect.center().x, rect.bottom() - 48.0), Align2::CENTER_CENTER, caption, theme::semi(12.5), ink);
+        let hint = match view.model {
+            Model::Pc1550 => "Type digits, * and # on your keyboard. Hold F, A or P for the emergency keys.",
+            Model::Pc1832 => "Type digits, * and # on your keyboard. Arrows scroll, F1 to F5 are the function keys.",
+        };
+        p.text(Pos2::new(rect.center().x, rect.bottom() - 32.0), Align2::CENTER_CENTER, hint, theme::regular(11.5), paint::alpha(ink, 0.85));
+        if view.bell {
+            let a = ((t * 3.5).sin() * 0.5 + 0.5) as f32;
+            p.rect_stroke(rect.shrink(4.0), 0.0, Stroke::new(8.0, paint::alpha(theme::RED, 0.25 + 0.45 * a)));
+        }
+    }
+
+    fn close_prompt(&mut self, ctx: &egui::Context) {
+        if !self.close_dialog {
+            return;
+        }
+        let screen = ctx.screen_rect();
+        egui::Area::new(egui::Id::new("close-dim")).fixed_pos(screen.min).order(egui::Order::Middle).show(ctx, |ui| {
+            ui.painter().rect_filled(screen, 0.0, Color32::from_black_alpha(160));
+            ui.allocate_rect(screen, Sense::click());
+        });
+        let needs_code = self.cfg.close_needs_code;
+        egui::Window::new("close-armed")
+            .title_bar(false)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(440.0)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                ui.set_width(440.0);
+                ui.label(RichText::new("RoomGuard is armed").font(theme::semi(19.0)));
+                ui.add_space(4.0);
+                let why = if needs_code {
+                    "Type your code to close it. While it's closed nothing watches the room, so you'll get a phone alert, and it comes back armed the next time it opens."
+                } else {
+                    "While it's closed nothing watches the room, so you'll get a phone alert, and it comes back armed the next time it opens."
+                };
+                ui.label(why);
+                ui.add_space(8.0);
+                let mut submit = false;
+                if needs_code {
+                    let r = ui.add(egui::TextEdit::singleline(&mut self.close_code).password(true).hint_text("Your code").desired_width(150.0));
+                    if self.close_focus {
+                        r.request_focus();
+                        self.close_focus = false;
+                    }
+                    submit = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if !self.close_error.is_empty() {
+                        ui.label(RichText::new(&self.close_error).color(theme::AMBER));
+                    }
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if views::accent_button(ui, "Close RoomGuard", theme::RED).clicked() {
+                        submit = true;
+                    }
+                    if ui.button("Minimize instead").clicked() {
+                        self.close_dialog = false;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                    }
+                    if ui.button("Keep it open").clicked() {
+                        self.close_dialog = false;
+                    }
+                });
+                if submit {
+                    let ok = if needs_code { !self.close_code.is_empty() && self.verify_code() } else { true };
+                    if ok {
+                        self.close_dialog = false;
+                        self.closing = true;
+                        self.shutdown();
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    } else {
+                        self.close_code.clear();
+                        self.close_error = "That code isn't right. Wrong codes count toward the keypad lockout.".to_string();
+                        self.close_focus = true;
+                    }
+                }
+            });
+    }
+
+    fn drive_shots(&mut self, ctx: &egui::Context, view: &View) {
+        let act = {
+            let Some(sh) = self.shots.as_mut() else {
+                return;
+            };
+            ctx.request_repaint();
+            let t = ctx.input(|i| i.time);
+            let start = *sh.start.get_or_insert(t);
+            let el = t - start;
+            if let Some(name) = sh.awaiting {
+                let img = ctx.input(|i| {
+                    i.events.iter().find_map(|e| match e {
+                        egui::Event::Screenshot { image, .. } => Some(image.clone()),
+                        _ => None,
+                    })
+                });
+                if let Some(img) = img {
+                    let mut rgba = Vec::with_capacity(img.pixels.len() * 4);
+                    for px in &img.pixels {
+                        rgba.extend_from_slice(&px.to_array());
+                    }
+                    let path = sh.dir.join(format!("{}.png", name));
+                    match png::write(&path, img.size[0] as u32, img.size[1] as u32, &rgba) {
+                        Ok(()) => util::log(&format!("saved {}", path.display())),
+                        Err(e) => util::log(&format!("couldn't save {}: {}", path.display(), e)),
+                    }
+                    sh.awaiting = None;
+                    sh.stage += 1;
+                    sh.mark = el;
+                } else if el - sh.mark > 15.0 {
+                    util::log("a screenshot never arrived, skipping it");
+                    sh.awaiting = None;
+                    sh.stage += 1;
+                    sh.mark = el;
+                }
+                ShotAct::Nothing
+            } else {
+                let since = el - sh.mark;
+                let mut act = ShotAct::Nothing;
+                let mut shoot = None;
+                match sh.stage {
+                    0 if el > 9.0 => shoot = Some("app-lcd"),
+                    1 => {
+                        act = ShotAct::Model(Model::Pc1550, 0);
+                        sh.stage = 2;
+                        sh.mark = el;
+                    }
+                    2 if since > 3.0 => shoot = Some("app-led"),
+                    3 => {
+                        act = ShotAct::Model(Model::Pc1832, 1);
+                        sh.stage = 4;
+                        sh.mark = el;
+                    }
+                    4 if el > 72.0 => shoot = Some("room-map"),
+                    5 => {
+                        act = ShotAct::Model(Model::Pc1832, 0);
+                        sh.stage = 6;
+                        sh.mark = el;
+                    }
+                    6 if since > 2.0 && view.status == StatusKind::Ready => {
+                        act = ShotAct::Arm;
+                        sh.stage = 7;
+                        sh.mark = el;
+                    }
+                    7 if view.call.is_some() || since > 110.0 => {
+                        sh.stage = 8;
+                        sh.mark = el;
+                    }
+                    8 if since > 2.0 => shoot = Some("alarm"),
+                    9 => {
+                        act = ShotAct::Settings;
+                        sh.stage = 10;
+                        sh.mark = el;
+                    }
+                    10 if since > 1.5 => shoot = Some("settings"),
+                    11 => act = ShotAct::Quit,
+                    _ => {}
+                }
+                if let Some(name) = shoot {
+                    sh.awaiting = Some(name);
+                    sh.mark = el;
+                    act = ShotAct::Shoot;
+                }
+                act
+            }
+        };
+        match act {
+            ShotAct::Nothing => {}
+            ShotAct::Shoot => ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot),
+            ShotAct::Model(m, tab) => {
+                self.camera_view.tab = tab;
+                if self.cfg.model != m {
+                    self.cfg.model = m;
+                    self.push_cfg();
+                }
+            }
+            ShotAct::Arm => {
+                for d in [1u8, 2, 3, 4] {
+                    self.engine.send(EngineMsg::Key { key: Key::Digit(d), down: true });
+                    self.engine.send(EngineMsg::Key { key: Key::Digit(d), down: false });
+                }
+            }
+            ShotAct::Settings => {
+                self.settings.open = true;
+                self.settings.tab = 3;
+            }
+            ShotAct::Quit => {
+                self.closing = true;
+                self.shutdown();
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+    }
+}
+
+impl Drop for RoomGuardApp {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+impl eframe::App for RoomGuardApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let view = self.engine.view();
+        let t = ctx.input(|i| i.time);
+        if self.start_minimized {
+            self.start_minimized = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        }
+        if ctx.input(|i| i.viewport().close_requested()) && !self.closing {
+            if view.armed && self.shots.is_none() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                self.close_dialog = true;
+                self.close_focus = true;
+                self.close_error.clear();
+            } else {
+                self.closing = true;
+                self.shutdown();
+            }
+        }
+        if view.call.is_some() && !self.saw_call {
+            self.saw_call = true;
+            self.right_tab = 0;
+        } else if view.call.is_none() {
+            self.saw_call = false;
+        }
+        let target = if self.cfg.ui.lights_on { 1.0 } else { 0.0 };
+        if (self.lights - target).abs() > 0.002 {
+            self.lights += (target - self.lights) * 0.18;
+            ctx.request_repaint();
+        } else {
+            self.lights = target;
+        }
+
+        let mut changed = false;
+        self.top_bar(ctx, &view, &mut changed);
+        self.left_panel(ctx, &view, &mut changed);
+        self.right_panel(ctx, &view);
+        egui::CentralPanel::default().frame(egui::Frame::none().fill(theme::BG)).show(ctx, |ui| {
+            self.wall(ui, &view, t);
+        });
+
+        let modal = self.setup.is_some() || self.settings.open || self.close_dialog;
+        if !modal {
+            self.input.keyboard(ctx, &self.engine, view.model);
+        }
+        self.settings.window(ctx, &mut self.cfg, &mut changed, &view, &self.engine, &self.cam, &self.audio, &self.updater);
+        if self.settings.restart {
+            self.settings.restart = false;
+            self.want_restart = true;
+        }
+        let mut setup_done = false;
+        if let Some(setup) = self.setup.as_mut() {
+            setup_done = setup.ui(ctx, &mut self.cfg, &mut changed, &self.engine, &self.cam);
+        }
+        if setup_done {
+            self.setup = None;
+            if self.cfg.check_updates {
+                self.updater.check(ctx);
+            }
+        }
+        self.close_prompt(ctx);
+        if changed {
+            self.push_cfg();
+        }
+        if self.save_at.map_or(false, |at| Instant::now() >= at) {
+            self.save_at = None;
+            if self.shots.is_none() {
+                self.cfg.save();
+            }
+        }
+        if self.want_restart {
+            self.want_restart = false;
+            self.shutdown();
+            update::relaunch();
+            self.closing = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        self.drive_shots(ctx, &view);
+        let ms = if view.bell || view.status == StatusKind::Alarm { 50 } else { 100 };
+        ctx.request_repaint_after(Duration::from_millis(ms));
+    }
+}

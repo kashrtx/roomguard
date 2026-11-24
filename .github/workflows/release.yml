@@ -1,0 +1,93 @@
+name: Release
+
+# Push a tag like v2.0.0 to build every platform and publish a release with
+# the notes for that version taken from CHANGELOG.md.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows
+            os: windows-latest
+            asset: roomguard-windows-x86_64.exe
+          - name: Linux
+            os: ubuntu-22.04
+            asset: roomguard-linux-x86_64
+          - name: macOS
+            os: macos-14
+            asset: roomguard-macos-universal.dmg
+    runs-on: ${{ matrix.os }}
+    env:
+      ROOMGUARD_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ runner.os == 'macOS' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Linux build packages
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config clang libasound2-dev libudev-dev libv4l-dev \
+            libxkbcommon-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libgl1-mesa-dev
+      - name: Test
+        run: cargo test --release
+      - name: Build Windows
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          cargo build --release
+          mkdir -p dist
+          cp target/release/roomguard.exe "dist/${{ matrix.asset }}"
+      - name: Build Linux
+        if: runner.os == 'Linux'
+        run: |
+          cargo build --release
+          mkdir -p dist
+          cp target/release/roomguard "dist/${{ matrix.asset }}"
+          chmod +x "dist/${{ matrix.asset }}"
+      - name: Build macOS app and disk image
+        if: runner.os == 'macOS'
+        run: |
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+          VERSION=$(grep -m1 '^version' Cargo.toml | cut -d '"' -f 2)
+          APP=RoomGuard.app
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" dist
+          lipo -create -output "$APP/Contents/MacOS/roomguard" \
+            target/aarch64-apple-darwin/release/roomguard target/x86_64-apple-darwin/release/roomguard
+          sed "s/__VERSION__/$VERSION/g" assets/macos/Info.plist > "$APP/Contents/Info.plist"
+          cp assets/icon/icon.icns "$APP/Contents/Resources/RoomGuard.icns"
+          codesign --force --deep --sign - "$APP"
+          hdiutil create -volname RoomGuard -srcfolder "$APP" -ov -format UDZO "dist/${{ matrix.asset }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/*
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Release notes from CHANGELOG.md
+        run: python3 tools/release_notes.py "${GITHUB_REF_NAME#v}" > notes.md
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: RoomGuard ${{ github.ref_name }}
+          body_path: notes.md
+          files: dist/*
