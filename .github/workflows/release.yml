@@ -23,13 +23,13 @@ jobs:
             os: ubuntu-22.04
             asset: roomguard-linux-x86_64
           - name: macOS
-            os: macos-14
+            os: macos-15
             asset: roomguard-macos-universal.dmg
     runs-on: ${{ matrix.os }}
     env:
       ROOMGUARD_REPO: ${{ github.repository }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ runner.os == 'macOS' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
@@ -79,7 +79,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: actions/download-artifact@v4
         with:
           path: dist

@@ -24,7 +24,7 @@ ureq = "2.10"
 open = "5"
 qrcode = { version = "0.14", default-features = false }
 starship-battery = "0.10"
-self_replace = "1"
+self-replace = "1"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"
