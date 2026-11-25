@@ -1,6 +1,6 @@
 [package]
 name = "roomguard"
-version = "2.1.0"
+version = "2.1.0-beta.1"
 edition = "2021"
 rust-version = "1.80"
 authors = ["Kaushal Bhingaradia"]
@@ -10,7 +10,7 @@ readme = "README.md"
 build = "build.rs"
 
 [dependencies]
-eframe = "0.29"
+eframe = { version = "0.29", features = ["wgpu"] }
 cpal = "0.15"
 nokhwa = { version = "0.10", default-features = false, features = ["input-native"] }
 jpeg-decoder = { version = "0.3", default-features = false }

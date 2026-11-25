@@ -12,7 +12,7 @@ use crate::update::{UpdateState, Updater};
 use crate::util;
 use crate::vision::{CamCmd, CameraHandle};
 
-const TABS: [&str; 6] = ["General", "Camera", "Sound", "Monitoring", "Updates", "About"];
+const TABS: [&str; 7] = ["General", "Panel", "Camera", "Sound", "Monitoring", "Updates", "About"];
 
 #[derive(Default)]
 pub struct SettingsView {
@@ -24,11 +24,10 @@ pub struct SettingsView {
     enroll_name: String,
     face_tex: Option<egui::TextureHandle>,
     face_seq: u64,
-    version_taps: u8,
     confirm_wipe: bool,
     /// Set once you confirm erasing everything; the app does the erasing.
     pub wipe: bool,
-    inst_filter: String,
+    panel_ui: super::installer::InstallerState,
 }
 
 /// Draws a QR code for `data`.
@@ -66,24 +65,22 @@ impl SettingsView {
             return;
         }
         let mut open = self.open;
-        let show_installer = cfg.ui.installer_view;
-        if !show_installer && self.tab > 5 {
+        if self.tab as usize >= TABS.len() {
             self.tab = 0;
         }
         egui::Window::new("Settings")
             .open(&mut open)
             .collapsible(false)
             .resizable(true)
-            .default_size([780.0, 560.0])
-            .min_size([660.0, 460.0])
+            .default_size([800.0, 580.0])
+            .min_size([680.0, 460.0])
             .show(ctx, |ui| {
                 let avail_w = ui.available_width();
                 let body_w = (avail_w - 166.0).max(360.0);
                 ui.horizontal_top(|ui| {
                     ui.vertical(|ui| {
                         ui.set_width(136.0);
-                        let names: Vec<&str> = TABS.iter().copied().chain(if show_installer { Some("Installer") } else { None }).collect();
-                        for (i, name) in names.iter().enumerate() {
+                        for (i, name) in TABS.iter().enumerate() {
                             let selected = self.tab == i as u8;
                             let btn = egui::Button::new(
                                 RichText::new(*name)
@@ -106,12 +103,12 @@ impl SettingsView {
                             ui.set_max_width((body_w - 14.0).max(320.0));
                             match self.tab {
                                 0 => self.general(ui, cfg, changed, view),
-                                1 => self.camera(ui, cfg, changed, cam),
-                                2 => self.sound(ui, cfg, changed, audio),
-                                3 => self.monitoring(ui, cfg, changed, view, engine),
-                                4 => self.updates(ui, cfg, changed, updater),
-                                6 if show_installer => self.installer(ui, cfg, changed, view),
-                                _ => self.about(ui, cfg, changed),
+                                1 => super::installer::ui(ui, &view.prog, view.armed, engine, &mut self.panel_ui),
+                                2 => self.camera(ui, cfg, changed, cam),
+                                3 => self.sound(ui, cfg, changed, audio),
+                                4 => self.monitoring(ui, cfg, changed, view, engine),
+                                5 => self.updates(ui, cfg, changed, updater),
+                                _ => self.about(ui),
                             }
                         });
                     });
@@ -164,6 +161,14 @@ impl SettingsView {
             }
         });
         ui.label(theme::muted("The LCD keypad displays the first 14 characters of each zone name."));
+
+        section(ui, "Graphics");
+        if ui.checkbox(&mut cfg.ui.opengl, "Use OpenGL instead of Direct3D, Vulkan or Metal").changed() {
+            *changed = true;
+        }
+        ui.label(theme::muted(
+            "RoomGuard draws on your graphics card. Only turn this on if the window looks wrong or won't draw. It takes effect the next time RoomGuard starts.",
+        ));
 
         section(ui, "Camera view");
         if ui.checkbox(&mut cfg.ui.show_motion, "Show motion").changed() {
@@ -620,30 +625,9 @@ impl SettingsView {
         }
     }
 
-    fn installer(&mut self, ui: &mut egui::Ui, cfg: &mut AppConfig, changed: &mut bool, view: &View) {
-        super::installer::ui(ui, &view.prog, &mut self.inst_filter);
-        ui.add_space(10.0);
-        if ui.button("Hide this tab").clicked() {
-            cfg.ui.installer_view = false;
-            *changed = true;
-            self.tab = 5;
-        }
-    }
-
-    fn about(&mut self, ui: &mut egui::Ui, cfg: &mut AppConfig, changed: &mut bool) {
+    fn about(&mut self, ui: &mut egui::Ui) {
         section(ui, "RoomGuard");
-        // Tapping the version five times shows the installer tab, like a
-        // hidden service menu.
-        let r = ui.add(egui::Label::new(format!("Version {}", env!("CARGO_PKG_VERSION"))).sense(Sense::click()));
-        if r.clicked() && !cfg.ui.installer_view {
-            self.version_taps += 1;
-            if self.version_taps >= 5 {
-                self.version_taps = 0;
-                cfg.ui.installer_view = true;
-                *changed = true;
-                self.tab = 6;
-            }
-        }
+        ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
         ui.label("Copyright 2026 Kaushal Bhingaradia. Licensed under the Apache License 2.0.");
         ui.add_space(6.0);
         ui.label(theme::muted(
@@ -652,6 +636,7 @@ impl SettingsView {
         section(ui, "Built with");
         for line in [
             "Inter typeface, SIL Open Font License 1.1",
+            "OpenMMLab RTMDet-Nano and RTMPose-Tiny (Apache 2.0) via tract-onnx",
             "OpenCV's LBP frontal face cascade, see NOTICE",
             "egui and eframe, MIT or Apache 2.0",
             "nokhwa, cpal, ureq and other Rust crates, see Cargo.toml",
@@ -661,13 +646,6 @@ impl SettingsView {
         ui.add_space(6.0);
         if ui.button("Open the log file").clicked() {
             let _ = open::that(util::data_dir().join("roomguard.log"));
-        }
-        if cfg.ui.installer_view {
-            ui.add_space(6.0);
-            if ui.button("Hide the installer tab").clicked() {
-                cfg.ui.installer_view = false;
-                *changed = true;
-            }
         }
     }
 }

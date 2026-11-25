@@ -1,15 +1,29 @@
-//! The installer view: every programming section of the panel in use, what
-//! it's set to right now, what it was from the factory and what it means, so
-//! nobody has to dig through the installation manual to see how the panel is
-//! programmed. It only shows things; changes are made at the keypad, the same
-//! way as on the real panel, and each section says which keys to press.
+//! Panel & Installer programming view in Settings.
+//!
+//! Lets you configure every real panel setting (delays, bell cut-off, zone
+//! definitions and attributes, chime sounds, keypad levels, codes, and every
+//! raw EEPROM installer section) directly with plain-English controls — no
+//! need to memorize [*][8] keypad sequences unless you want to. Every change
+//! writes straight to the same EEPROM sections the keypad reads and writes.
+
+use std::collections::BTreeMap;
 
 use eframe::egui::{self, RichText};
 
 use crate::engine::eeprom::{self, Kind, Spec};
 use crate::engine::types::Model;
-use crate::engine::ProgView;
+use crate::engine::{EngineHandle, EngineMsg, PanelEdit, ProgView};
 use crate::theme;
+
+#[derive(Default)]
+pub struct InstallerState {
+    pub filter: String,
+    pub master_code: String,
+    pub installer_code: String,
+    pub extra_code: String,
+    pub raw_drafts: BTreeMap<String, String>,
+    pub confirm_default: bool,
+}
 
 const FUTURE: &str = "For future use";
 
@@ -584,56 +598,574 @@ fn how_to(m: Model, key: &str, code: &str) -> String {
     }
 }
 
-/// Draws the installer view for the panel in use.
-pub fn ui(ui: &mut egui::Ui, prog: &ProgView, filter: &mut String) {
-    let m = prog.model;
+fn section_hdr(ui: &mut egui::Ui, title: &str) {
     ui.add_space(8.0);
-    ui.label(theme::heading(match m {
-        Model::Pc1550 => "RmG Classic PC1550, version 4.1",
-        Model::Pc1832 => "GuardSeries PC1832, version 4.6",
-    }));
-    ui.label(theme::muted(
-        "Everything the panel is programmed with, in plain English. Change things at the keypad the same way you would on the real panel: each section shows the keys.",
-    ));
-    ui.add_space(6.0);
-    let code = installer_code(m);
-    let inst = if prog.installer_default { format!("still the factory {}", code) } else { "changed (codes are stored scrambled, so it can't be shown)".to_string() };
-    let master = if prog.master_default { "still the factory 1234".to_string() } else { "changed".to_string() };
-    let mut lines = vec![format!("Installer's code: {}", inst), format!("Master code: {}", master)];
-    let mut users: Vec<String> = prog
-        .codes
-        .iter()
-        .filter(|s| s.as_str() != "inst" && s.as_str() != "m2" && s.as_str() != "maint")
+    ui.label(theme::heading(title));
+    ui.add_space(3.0);
+}
+
+fn raw_val(prog: &ProgView, key: &str) -> String {
+    prog.sections
+        .get(key)
         .cloned()
-        .collect();
-    users.sort();
-    lines.push(format!("Access codes programmed: {}", if users.is_empty() { "none".to_string() } else { users.join(", ") }));
-    lines.push(format!("Door chime: {}", if prog.chime { "on" } else { "off" }));
-    if m == Model::Pc1550 {
-        lines.push(format!("Quick arm ([*][6] then 4): {}", if prog.quick_arm { "on" } else { "off" }));
+        .unwrap_or_else(|| eeprom::spec(prog.model, key).map(|s| s.default.to_string()).unwrap_or_default())
+}
+
+fn toggle_on(prog: &ProgView, key: &str, opt: u8) -> bool {
+    let raw = raw_val(prog, key);
+    std::char::from_digit(opt as u32, 10).map_or(false, |c| raw.contains(c))
+}
+
+fn read_entry(raw: &str, idx: usize, width: usize, fallback: u32) -> u32 {
+    raw.get(idx * width..idx * width + width)
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(fallback)
+}
+
+fn replace_entry(raw: &str, entries: usize, width: usize, idx: usize, val: u32) -> String {
+    let need = entries * width;
+    let mut padded = raw.to_string();
+    while padded.len() < need {
+        padded.push('0');
     }
-    let auto = match (prog.auto_arm, prog.auto_arm_hm) {
-        (true, Some((h, mi))) => format!("on at {:02}:{:02}", h, mi),
-        (true, None) => "on, no time set".to_string(),
-        (false, _) => "off".to_string(),
-    };
-    lines.push(format!("Auto-arm: {}", auto));
-    if prog.installer_lockout {
-        lines.push("Installer's lockout: on".to_string());
+    let mut out = String::with_capacity(need);
+    for i in 0..entries {
+        if i == idx {
+            let max = 10u32.pow(width as u32) - 1;
+            out.push_str(&format!("{:0width$}", val.min(max), width = width));
+        } else {
+            out.push_str(padded.get(i * width..i * width + width).unwrap_or("0"));
+        }
     }
-    for l in lines {
-        ui.label(RichText::new(l).size(13.0));
+    out
+}
+
+fn replace_entry_str(raw: &str, entries: usize, width: usize, idx: usize, val: &str) -> String {
+    let need = entries * width;
+    let mut padded = raw.to_string();
+    while padded.len() < need {
+        padded.push('0');
     }
-    ui.add_space(8.0);
+    let mut out = String::with_capacity(need);
+    for i in 0..entries {
+        if i == idx {
+            let mut s: String = val.chars().take(width).collect();
+            while s.len() < width {
+                s.push('0');
+            }
+            out.push_str(&s);
+        } else {
+            out.push_str(padded.get(i * width..i * width + width).unwrap_or("0"));
+        }
+    }
+    out
+}
+
+const ZONE_CHOICES_1832: &[(&str, &str)] = &[
+    ("00", "Null (not used)"),
+    ("01", "Delay 1 (Entry/Exit)"),
+    ("02", "Delay 2 (Secondary Entry)"),
+    ("03", "Instant (Perimeter)"),
+    ("04", "Interior"),
+    ("05", "Interior Stay/Away"),
+    ("06", "Delay Stay/Away"),
+    ("08", "24h Standard Fire"),
+    ("11", "24h Burglary"),
+    ("16", "24h Panic"),
+    ("25", "Interior Delay"),
+    ("26", "24h Non-Alarm"),
+    ("31", "Day Zone"),
+    ("32", "Instant Stay/Away"),
+    ("37", "Night Zone"),
+    ("41", "24h Carbon Monoxide"),
+];
+
+const ZONE_CHOICES_1550: &[(char, &str)] = &[
+    ('0', "Standard Delay"),
+    ('1', "Instant"),
+    ('2', "Interior"),
+    ('3', "Interior Home-Away"),
+    ('4', "24h Bell"),
+    ('5', "24h Bell/Buzzer"),
+    ('6', "24h Buzzer"),
+    ('7', "Auxiliary Delay"),
+    ('8', "24h Fire"),
+];
+
+/// Draws the live-editable Panel & Installer Programming tab.
+pub fn ui(ui: &mut egui::Ui, prog: &ProgView, armed: bool, engine: &EngineHandle, st: &mut InstallerState) {
+    let m = prog.model;
+    let code = installer_code(m);
+
+    section_hdr(
+        ui,
+        match m {
+            Model::Pc1550 => "RmG Classic PC1550  (v4.1)",
+            Model::Pc1832 => "GuardSeries PC1832  (v4.6)",
+        },
+    );
+    ui.label(theme::muted(
+        "Change installer and keypad programming directly here — no keypad codes required. Everything writes to the same panel EEPROM as [*][8] programming.",
+    ));
+    if armed {
+        ui.add_space(4.0);
+        ui.label(RichText::new("Panel is armed. Disarm first to change programming.").color(theme::AMBER));
+    }
+
+    // --- 1. Timings (Entry / Exit / Bell Cut-off) ---
+    section_hdr(ui, "Delays & bell cut-off");
+    ui.add_enabled_ui(!armed, |ui| {
+        egui::Grid::new("panel-timings").num_columns(3).spacing([12.0, 6.0]).show(ui, |ui| {
+            if m == Model::Pc1832 {
+                let raw05 = raw_val(prog, "005.01");
+                let mut e1 = read_entry(&raw05, 0, 3, 30);
+                let mut e2 = read_entry(&raw05, 1, 3, 45);
+                let mut ex = read_entry(&raw05, 2, 3, 120);
+                let raw09 = raw_val(prog, "005.09");
+                let mut bell = read_entry(&raw09, 0, 3, 4);
+
+                ui.label("Entry delay 1");
+                if ui.add(egui::DragValue::new(&mut e1).range(0..=255).suffix(" s")).changed() {
+                    let v = replace_entry(&raw05, 3, 3, 0, e1);
+                    engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: "005.01".into(), value: v }));
+                }
+                ui.label(theme::muted("Section [005][01] — primary doorway"));
+                ui.end_row();
+
+                ui.label("Entry delay 2");
+                if ui.add(egui::DragValue::new(&mut e2).range(0..=255).suffix(" s")).changed() {
+                    let v = replace_entry(&raw05, 3, 3, 1, e2);
+                    engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: "005.01".into(), value: v }));
+                }
+                ui.label(theme::muted("Section [005][01] — secondary entry"));
+                ui.end_row();
+
+                ui.label("Exit delay");
+                if ui.add(egui::DragValue::new(&mut ex).range(0..=255).suffix(" s")).changed() {
+                    let v = replace_entry(&raw05, 3, 3, 2, ex);
+                    engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: "005.01".into(), value: v }));
+                }
+                ui.label(theme::muted("Section [005][01] — time to leave"));
+                ui.end_row();
+
+                ui.label("Bell cut-off");
+                if ui.add(egui::DragValue::new(&mut bell).range(1..=99).suffix(" min")).changed() {
+                    let v = format!("{:03}", bell);
+                    engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: "005.09".into(), value: v }));
+                }
+                ui.label(theme::muted("Section [005][09] — siren auto-silence"));
+                ui.end_row();
+            } else {
+                let raw17 = raw_val(prog, "17");
+                let raw18 = raw_val(prog, "18");
+                let mut e1 = read_entry(&raw17, 0, 3, 30);
+                let mut ex = read_entry(&raw17, 1, 3, 120);
+                let mut bell = read_entry(&raw17, 2, 3, 4);
+                let mut aux_e = read_entry(&raw18, 0, 3, 45);
+
+                ui.label("Entry delay");
+                if ui.add(egui::DragValue::new(&mut e1).range(0..=255).suffix(" s")).changed() {
+                    let v = replace_entry(&raw17, 6, 3, 0, e1);
+                    engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: "17".into(), value: v }));
+                }
+                ui.label(theme::muted("Section [17] — standard delay"));
+                ui.end_row();
+
+                ui.label("Auxiliary entry delay");
+                if ui.add(egui::DragValue::new(&mut aux_e).range(0..=255).suffix(" s")).changed() {
+                    let v = replace_entry(&raw18, 2, 3, 0, aux_e);
+                    engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: "18".into(), value: v }));
+                }
+                ui.label(theme::muted("Section [18] — auxiliary delay zones"));
+                ui.end_row();
+
+                ui.label("Exit delay");
+                if ui.add(egui::DragValue::new(&mut ex).range(0..=255).suffix(" s")).changed() {
+                    let v = replace_entry(&raw17, 6, 3, 1, ex);
+                    engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: "17".into(), value: v }));
+                }
+                ui.label(theme::muted("Section [17] — time to leave"));
+                ui.end_row();
+
+                ui.label("Bell cut-off");
+                if ui.add(egui::DragValue::new(&mut bell).range(1..=99).suffix(" min")).changed() {
+                    let v = replace_entry(&raw17, 6, 3, 2, bell);
+                    engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: "17".into(), value: v }));
+                }
+                ui.label(theme::muted("Section [17] — siren auto-silence"));
+                ui.end_row();
+            }
+        });
+    });
+
+    // --- 2. Common Behavior & Options ---
+    section_hdr(ui, "Keypad & alarm behavior");
+    let mut chime = prog.chime;
+    if ui.checkbox(&mut chime, "Door chime enabled  ([*][4])").changed() {
+        engine.send(EngineMsg::EditPanel(PanelEdit::SetChime(chime)));
+    }
+    ui.add_enabled_ui(!armed, |ui| {
+        if m == Model::Pc1832 {
+            let mut audible_exit = toggle_on(prog, "014", 6);
+            if ui.checkbox(&mut audible_exit, "Audible exit delay with urgency beeps  ([014] opt 6)").changed() {
+                engine.send(EngineMsg::EditPanel(PanelEdit::SetToggle { key: "014".into(), opt: 6, on: audible_exit }));
+            }
+            let mut stay_audible = toggle_on(prog, "022", 8);
+            if ui.checkbox(&mut stay_audible, "Audible exit delay when arming Stay  ([022] opt 8)").changed() {
+                engine.send(EngineMsg::EditPanel(PanelEdit::SetToggle { key: "022".into(), opt: 8, on: stay_audible }));
+            }
+            let mut quick_arm = toggle_on(prog, "015", 4);
+            if ui.checkbox(&mut quick_arm, "Quick arming — arm with Stay, Away or [*][0] without a code  ([015] opt 4)").changed() {
+                engine.send(EngineMsg::EditPanel(PanelEdit::SetQuickArm(quick_arm)));
+            }
+            let mut quick_exit = toggle_on(prog, "015", 3);
+            if ui.checkbox(&mut quick_exit, "Quick exit with [*][0] while armed  ([015] opt 3)").changed() {
+                engine.send(EngineMsg::EditPanel(PanelEdit::SetToggle { key: "015".into(), opt: 3, on: quick_exit }));
+            }
+            let mut panic_aud = toggle_on(prog, "015", 2);
+            if ui.checkbox(&mut panic_aud, "Panic key sounds the siren and keypad  ([015] opt 2)").changed() {
+                engine.send(EngineMsg::EditPanel(PanelEdit::SetToggle { key: "015".into(), opt: 2, on: panic_aud }));
+            }
+            let mut squawk = toggle_on(prog, "014", 1);
+            if ui.checkbox(&mut squawk, "Bell squawk on arming and disarming  ([014] opt 1)").changed() {
+                engine.send(EngineMsg::EditPanel(PanelEdit::SetToggle { key: "014".into(), opt: 1, on: squawk }));
+            }
+            let mut t3 = toggle_on(prog, "013", 8);
+            if ui.checkbox(&mut t3, "Temporal Three fire bell pattern (off: standard pulsed)  ([013] opt 8)").changed() {
+                engine.send(EngineMsg::EditPanel(PanelEdit::SetToggle { key: "013".into(), opt: 8, on: t3 }));
+            }
+            let mut scroll_clock = toggle_on(prog, "kp076", 2);
+            if ui.checkbox(&mut scroll_clock, "Display clock on LCD while idle  ([kp076] opt 2)").changed() {
+                engine.send(EngineMsg::EditPanel(PanelEdit::SetToggle { key: "kp076".into(), opt: 2, on: scroll_clock }));
+            }
+            let mut scroll_open = toggle_on(prog, "kp076", 3);
+            if ui.checkbox(&mut scroll_open, "Auto-scroll open zones on LCD  ([kp076] opt 3)").changed() {
+                engine.send(EngineMsg::EditPanel(PanelEdit::SetToggle { key: "kp076".into(), opt: 3, on: scroll_open }));
+            }
+        } else {
+            let mut audible_exit = toggle_on(prog, "34", 1);
+            if ui.checkbox(&mut audible_exit, "Audible exit delay with urgency beeps  ([34] opt 1)").changed() {
+                engine.send(EngineMsg::EditPanel(PanelEdit::SetToggle { key: "34".into(), opt: 1, on: audible_exit }));
+            }
+            let mut quick_arm = prog.quick_arm;
+            if ui.checkbox(&mut quick_arm, "Quick arming with [*][0]  ([*][6] opt 4)").changed() {
+                engine.send(EngineMsg::EditPanel(PanelEdit::SetQuickArm(quick_arm)));
+            }
+            let mut quick_exit = toggle_on(prog, "32", 4);
+            if ui.checkbox(&mut quick_exit, "Quick exit with [*][0] while armed  ([32] opt 4)").changed() {
+                engine.send(EngineMsg::EditPanel(PanelEdit::SetToggle { key: "32".into(), opt: 4, on: quick_exit }));
+            }
+            let mut panic_aud = toggle_on(prog, "12", 6);
+            if ui.checkbox(&mut panic_aud, "Keypad [P]anic key sounds the bell  ([12] opt 6)").changed() {
+                engine.send(EngineMsg::EditPanel(PanelEdit::SetToggle { key: "12".into(), opt: 6, on: panic_aud }));
+            }
+            let mut squawk = toggle_on(prog, "13", 3);
+            if ui.checkbox(&mut squawk, "Bell squawk on arming and disarming  ([13] opt 3)").changed() {
+                engine.send(EngineMsg::EditPanel(PanelEdit::SetToggle { key: "13".into(), opt: 3, on: squawk }));
+            }
+            let mut t3 = !toggle_on(prog, "32", 6);
+            if ui.checkbox(&mut t3, "Temporal Three fire bell pattern (off: standard pulsed)  ([32] opt 6)").changed() {
+                engine.send(EngineMsg::EditPanel(PanelEdit::SetToggle { key: "32".into(), opt: 6, on: !t3 }));
+            }
+        }
+
+        // Keypad lockout
+        ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
+            let (lock_key, width) = if m == Model::Pc1832 { ("012", 3usize) } else { ("36", 2usize) };
+            let raw_lock = raw_val(prog, lock_key);
+            let mut bad = read_entry(&raw_lock, 0, width, 0);
+            let mut mins = read_entry(&raw_lock, 1, width, 0);
+            ui.label("Keypad lockout after");
+            if ui.add(egui::DragValue::new(&mut bad).range(0..=99)).changed() {
+                let v = replace_entry(&raw_lock, 2, width, 0, bad);
+                engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: lock_key.into(), value: v }));
+            }
+            ui.label("wrong codes (0 = off) for");
+            if ui.add(egui::DragValue::new(&mut mins).range(0..=99).suffix(" min")).changed() {
+                let v = replace_entry(&raw_lock, 2, width, 1, mins);
+                engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: lock_key.into(), value: v }));
+            }
+        });
+
+        // Auto-arm schedule
+        ui.horizontal_wrapped(|ui| {
+            let mut auto_on = prog.auto_arm;
+            let (mut hh, mut mm) = prog.auto_arm_hm.unwrap_or((23, 0));
+            if ui.checkbox(&mut auto_on, "Auto-arm daily at").changed() {
+                engine.send(EngineMsg::EditPanel(PanelEdit::SetAutoArm {
+                    enabled: auto_on,
+                    hm: Some((hh, mm)),
+                }));
+            }
+            ui.add_enabled_ui(auto_on, |ui| {
+                let h_ch = ui.add(egui::DragValue::new(&mut hh).range(0..=23).fixed_decimals(0)).changed();
+                ui.label(":");
+                let m_ch = ui.add(egui::DragValue::new(&mut mm).range(0..=59).fixed_decimals(0)).changed();
+                if h_ch || m_ch {
+                    engine.send(EngineMsg::EditPanel(PanelEdit::SetAutoArm {
+                        enabled: auto_on,
+                        hm: Some((hh, mm)),
+                    }));
+                }
+            });
+        });
+
+        let mut lock = prog.installer_lockout;
+        if ui.checkbox(&mut lock, "Installer lockout (factory reset keeps your installer code)").changed() {
+            engine.send(EngineMsg::EditPanel(PanelEdit::SetInstallerLockout(lock)));
+        }
+    });
+
+    // --- 3. PK5500 LCD & Buzzer Levels (PC1832) ---
+    if m == Model::Pc1832 {
+        section_hdr(ui, "PK5500 LCD & buzzer levels");
+        let mut br = prog.brightness;
+        let mut co = prog.contrast;
+        let mut bz = prog.buzzer;
+        let mut lvl_changed = false;
+        egui::Grid::new("pk5500-levels").num_columns(3).spacing([12.0, 6.0]).show(ui, |ui| {
+            ui.label("Backlight brightness");
+            lvl_changed |= ui.add(egui::Slider::new(&mut br, 0..=15)).changed();
+            ui.label(theme::muted("[*][6] Brightness"));
+            ui.end_row();
+
+            ui.label("LCD contrast");
+            lvl_changed |= ui.add(egui::Slider::new(&mut co, 0..=15)).changed();
+            ui.label(theme::muted("[*][6] Contrast"));
+            ui.end_row();
+
+            ui.label("Buzzer tone / level");
+            lvl_changed |= ui.add(egui::Slider::new(&mut bz, 0..=20)).changed();
+            ui.label(theme::muted(if bz == 0 { "0 = muted" } else { "[*][6] Buzzer (01–20 pitch)" }));
+            ui.end_row();
+        });
+        if lvl_changed {
+            engine.send(EngineMsg::EditPanel(PanelEdit::SetKeypadLevels { brightness: br, contrast: co, buzzer: bz }));
+        }
+    }
+
+    // --- 4. Zones (Definitions & Chime Sounds) ---
+    section_hdr(ui, "Zone programming");
+    ui.add_enabled_ui(!armed, |ui| {
+        if m == Model::Pc1832 {
+            let raw001 = raw_val(prog, "001");
+            egui::Grid::new("panel-zones-1832").num_columns(4).spacing([8.0, 6.0]).show(ui, |ui| {
+                ui.label(theme::muted("Zone"));
+                ui.label(theme::muted("Definition ([001])"));
+                ui.label(theme::muted("Chime sound"));
+                ui.label(theme::muted("Options ([101]–[108])"));
+                ui.end_row();
+
+                for z in 1..=8usize {
+                    ui.label(RichText::new(format!("Z{}", z)).font(theme::semi(12.5)));
+                    let cur_code = raw001.get((z - 1) * 2..(z - 1) * 2 + 2).unwrap_or("00");
+                    let cur_name = zone_type_1832(cur_code);
+                    egui::ComboBox::from_id_salt(("zdef1832", z))
+                        .selected_text(format!("{} {}", cur_code, cur_name))
+                        .width(175.0)
+                        .show_ui(ui, |ui| {
+                            for &(code_str, label) in ZONE_CHOICES_1832 {
+                                if ui.selectable_label(cur_code == code_str, format!("{} {}", code_str, label)).clicked() {
+                                    let next = replace_entry_str(&raw001, 16, 2, z - 1, code_str);
+                                    engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: "001".into(), value: next }));
+                                }
+                            }
+                        });
+
+                    let kp_key = format!("kp{:03}", 200 + z);
+                    let cur_chime = raw_val(prog, &kp_key);
+                    let cur_c = cur_chime.chars().next().unwrap_or('1');
+                    let chime_label = match cur_c {
+                        '2' => "Bing bing",
+                        '3' => "Ding dong",
+                        '4' => "Alarm tone",
+                        _ => "Six beeps",
+                    };
+                    egui::ComboBox::from_id_salt(("zchime", z))
+                        .selected_text(chime_label)
+                        .width(96.0)
+                        .show_ui(ui, |ui| {
+                            for (c, lbl) in [('1', "Six beeps"), ('2', "Bing bing"), ('3', "Ding dong"), ('4', "Alarm tone")] {
+                                if ui.selectable_label(cur_c == c, lbl).clicked() {
+                                    engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: kp_key.clone(), value: c.to_string() }));
+                                }
+                            }
+                        });
+
+                    let attr_key = format!("{:03}", 100 + z);
+                    ui.horizontal(|ui| {
+                        for (opt, short) in [(1u8, "Aud"), (3, "Chime"), (4, "Byp"), (5, "Force")] {
+                            let mut on = toggle_on(prog, &attr_key, opt);
+                            if ui.checkbox(&mut on, short).changed() {
+                                engine.send(EngineMsg::EditPanel(PanelEdit::SetToggle { key: attr_key.clone(), opt, on }));
+                            }
+                        }
+                    });
+                    ui.end_row();
+                }
+            });
+        } else {
+            let raw11 = raw_val(prog, "11");
+            egui::Grid::new("panel-zones-1550").num_columns(4).spacing([10.0, 6.0]).show(ui, |ui| {
+                ui.label(theme::muted("Zone"));
+                ui.label(theme::muted("Definition ([11])"));
+                ui.label(theme::muted("Audible"));
+                ui.label(theme::muted("Bypassable ([16])"));
+                ui.end_row();
+
+                for z in 1..=6usize {
+                    ui.label(RichText::new(format!("Zone {}", z)).font(theme::semi(12.5)));
+                    let chars: Vec<char> = raw11.chars().collect();
+                    let d1 = chars.get((z - 1) * 2).copied().unwrap_or('0');
+                    let d2 = chars.get((z - 1) * 2 + 1).copied().unwrap_or('0');
+                    egui::ComboBox::from_id_salt(("zdef1550", z))
+                        .selected_text(format!("{} {}", d2, zone_type_1550(d2)))
+                        .width(175.0)
+                        .show_ui(ui, |ui| {
+                            for &(ch, label) in ZONE_CHOICES_1550 {
+                                if ui.selectable_label(d2 == ch, format!("{} {}", ch, label)).clicked() {
+                                    let pair = format!("{}{}", d1, ch);
+                                    let next = replace_entry_str(&raw11, 6, 2, z - 1, &pair);
+                                    engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: "11".into(), value: next }));
+                                }
+                            }
+                        });
+                    let mut aud = d1 == '0' || d1 == '2';
+                    if ui.checkbox(&mut aud, "").changed() {
+                        let new_d1 = match (d1, aud) {
+                            ('2' | '3', true) => '2',
+                            ('2' | '3', false) => '3',
+                            (_, true) => '0',
+                            (_, false) => '1',
+                        };
+                        let pair = format!("{}{}", new_d1, d2);
+                        let next = replace_entry_str(&raw11, 6, 2, z - 1, &pair);
+                        engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: "11".into(), value: next }));
+                    }
+                    let mut byp = toggle_on(prog, "16", z as u8);
+                    if ui.checkbox(&mut byp, "").changed() {
+                        engine.send(EngineMsg::EditPanel(PanelEdit::SetToggle { key: "16".into(), opt: z as u8, on: byp }));
+                    }
+                    ui.end_row();
+                }
+            });
+        }
+    });
+
+    // --- 5. Access Codes ---
+    section_hdr(ui, "Access codes");
+    ui.add_enabled_ui(!armed, |ui| {
+        let master_slot = if m == Model::Pc1832 { "40" } else { "1" };
+        let extra_slot = if m == Model::Pc1832 { "maint" } else { "m2" };
+        let extra_label = if m == Model::Pc1832 { "Maintenance code ([008])" } else { "2nd Master code ([22])" };
+        egui::Grid::new("panel-codes").num_columns(3).spacing([10.0, 6.0]).show(ui, |ui| {
+            ui.label("Master code");
+            ui.add(
+                egui::TextEdit::singleline(&mut st.master_code)
+                    .password(true)
+                    .char_limit(4)
+                    .hint_text(if prog.master_default { "factory 1234" } else { "4 digits" })
+                    .desired_width(110.0),
+            );
+            let ok_m = st.master_code.len() == 4 && st.master_code.chars().all(|c| c.is_ascii_digit());
+            if ui.add_enabled(ok_m, egui::Button::new("Save")).clicked() {
+                engine.send(EngineMsg::EditPanel(PanelEdit::SetCode {
+                    slot: master_slot.into(),
+                    code: std::mem::take(&mut st.master_code),
+                }));
+            }
+            ui.end_row();
+
+            ui.label("Installer code");
+            ui.add(
+                egui::TextEdit::singleline(&mut st.installer_code)
+                    .password(true)
+                    .char_limit(4)
+                    .hint_text(if prog.installer_default { format!("factory {}", code) } else { "4 digits".into() })
+                    .desired_width(110.0),
+            );
+            let ok_i = st.installer_code.len() == 4 && st.installer_code.chars().all(|c| c.is_ascii_digit());
+            if ui.add_enabled(ok_i, egui::Button::new("Save")).clicked() {
+                engine.send(EngineMsg::EditPanel(PanelEdit::SetCode {
+                    slot: "inst".into(),
+                    code: std::mem::take(&mut st.installer_code),
+                }));
+            }
+            ui.end_row();
+
+            ui.label(extra_label);
+            let has_extra = prog.codes.iter().any(|c| c == extra_slot);
+            ui.add(
+                egui::TextEdit::singleline(&mut st.extra_code)
+                    .password(true)
+                    .char_limit(4)
+                    .hint_text(if has_extra { "set (4 digits)" } else { "blank" })
+                    .desired_width(110.0),
+            );
+            ui.horizontal(|ui| {
+                let ok_e = st.extra_code.len() == 4 && st.extra_code.chars().all(|c| c.is_ascii_digit());
+                if ui.add_enabled(ok_e, egui::Button::new("Save")).clicked() {
+                    engine.send(EngineMsg::EditPanel(PanelEdit::SetCode {
+                        slot: extra_slot.into(),
+                        code: std::mem::take(&mut st.extra_code),
+                    }));
+                }
+                if has_extra && ui.button("Clear").clicked() {
+                    engine.send(EngineMsg::EditPanel(PanelEdit::SetCode {
+                        slot: extra_slot.into(),
+                        code: String::new(),
+                    }));
+                }
+            });
+            ui.end_row();
+        });
+        let mut users: Vec<String> = prog
+            .codes
+            .iter()
+            .filter(|s| s.as_str() != "inst" && s.as_str() != "m2" && s.as_str() != "maint")
+            .cloned()
+            .collect();
+        users.sort();
+        ui.label(theme::muted(format!(
+            "Programmed user slots: {}. (You can also add/edit user codes via [*][5] on the keypad.)",
+            if users.is_empty() { "none".to_string() } else { users.join(", ") }
+        )));
+    });
+
+    // --- 6. Factory Reset Panel Programming ---
+    ui.add_space(6.0);
+    ui.add_enabled_ui(!armed, |ui| {
+        if !st.confirm_default {
+            if ui.button("Reset panel programming to defaults").clicked() {
+                st.confirm_default = true;
+            }
+        } else {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("Reset all EEPROM sections for this panel?").color(theme::AMBER));
+                if super::accent_button(ui, "Confirm reset", theme::RED).clicked() {
+                    st.confirm_default = false;
+                    st.raw_drafts.clear();
+                    engine.send(EngineMsg::EditPanel(PanelEdit::FactoryDefault));
+                }
+                if ui.button("Cancel").clicked() {
+                    st.confirm_default = false;
+                }
+            });
+        }
+    });
+
+    // --- 7. All Installer Sections (Searchable & Directly Editable) ---
+    section_hdr(ui, "All installer sections (advanced)");
     ui.horizontal(|ui| {
         ui.label("Find");
-        ui.add(egui::TextEdit::singleline(filter).hint_text("a section number or a word, like exit or chime").desired_width(280.0));
-        if !filter.is_empty() && ui.button("Clear").clicked() {
-            filter.clear();
+        ui.add(egui::TextEdit::singleline(&mut st.filter).hint_text("section number or word, e.g. 015, exit, chime").desired_width(280.0));
+        if !st.filter.is_empty() && ui.button("Clear").clicked() {
+            st.filter.clear();
         }
     });
     ui.add_space(4.0);
-    let needle = filter.trim().to_lowercase();
+    let needle = st.filter.trim().to_lowercase();
     let mut shown = 0;
     for spec in eeprom::table(m) {
         if matches!(spec.kind, Kind::Sub) {
@@ -650,43 +1182,85 @@ pub fn ui(ui: &mut egui::Ui, prog: &ProgView, filter: &mut String) {
         }
         shown += 1;
         let changed = !matches!(spec.kind, Kind::Code(_) | Kind::Action) && raw != spec.default;
-        let label = format!("[{}]  {}{}", spec.key.trim_start_matches("kp"), spec.name, if changed { "   (changed)" } else { "" });
+        let label = format!("[{}]  {}{}", spec.key.trim_start_matches("kp"), spec.name, if changed { "   (modified)" } else { "" });
         egui::CollapsingHeader::new(RichText::new(label).size(13.0)).show(ui, |ui| {
             if !text.is_empty() {
                 ui.label(theme::muted(text));
             }
             match spec.kind {
+                Kind::Toggle(n) => {
+                    let names = options(m, spec.key);
+                    ui.add_enabled_ui(!armed, |ui| {
+                        for i in 1..=n {
+                            let mut on = toggle_on(prog, spec.key, i);
+                            let name = names.get(i as usize - 1).copied().unwrap_or("");
+                            let lbl = if name.is_empty() {
+                                format!("Option {}", i)
+                            } else {
+                                format!("{} — {}", i, name)
+                            };
+                            if ui.checkbox(&mut on, lbl).changed() {
+                                engine.send(EngineMsg::EditPanel(PanelEdit::SetToggle {
+                                    key: spec.key.to_string(),
+                                    opt: i,
+                                    on,
+                                }));
+                            }
+                        }
+                    });
+                }
+                Kind::Data { .. } | Kind::Phone(_) => {
+                    for l in &lines {
+                        ui.label(RichText::new(l).monospace().size(12.0));
+                    }
+                    ui.add_enabled_ui(!armed, |ui| {
+                        let mut clear_draft = false;
+                        {
+                            let draft = st.raw_drafts.entry(spec.key.to_string()).or_insert_with(|| raw.clone());
+                            ui.horizontal(|ui| {
+                                ui.label(theme::muted("Raw value:"));
+                                ui.add(egui::TextEdit::singleline(draft).font(egui::TextStyle::Monospace).desired_width(220.0));
+                                if ui.button("Apply").clicked() {
+                                    engine.send(EngineMsg::EditPanel(PanelEdit::SetSection {
+                                        key: spec.key.to_string(),
+                                        value: draft.clone(),
+                                    }));
+                                    clear_draft = true;
+                                }
+                                if *draft != raw && ui.small_button("Revert").clicked() {
+                                    *draft = raw.clone();
+                                }
+                            });
+                        }
+                        if clear_draft {
+                            st.raw_drafts.remove(spec.key);
+                        }
+                    });
+                    if changed {
+                        ui.label(theme::muted(format!(
+                            "RoomGuard default: {}",
+                            if spec.default.is_empty() { "blank" } else { spec.default }
+                        )));
+                    }
+                }
                 Kind::Code(slot) => {
                     let line = match slot {
-                        "inst" => format!("Now: {}", if prog.installer_default { format!("the factory {}", code) } else { "changed".to_string() }),
-                        "1" | "40" => format!("Now: {}", if prog.master_default { "the factory 1234" } else { "changed" }),
+                        "inst" => format!("Now: {}", if prog.installer_default { format!("factory {}", code) } else { "changed".to_string() }),
+                        "1" | "40" => format!("Now: {}", if prog.master_default { "factory 1234" } else { "changed" }),
                         other => format!("Now: {}", if prog.codes.iter().any(|c| c == other) { "programmed" } else { "blank" }),
                     };
                     ui.label(line);
                 }
                 Kind::Action => {}
-                _ => {
-                    for l in &lines {
-                        ui.label(RichText::new(l).monospace().size(12.0));
-                    }
-                    if changed {
-                        let def = describe(m, spec, spec.default);
-                        ui.label(theme::muted(format!("RoomGuard default: {}", if spec.default.is_empty() { "all off".to_string() } else { spec.default.to_string() })));
-                        if def.len() <= 1 {
-                            if let Some(d) = def.first() {
-                                ui.label(theme::muted(format!("  {}", d)));
-                            }
-                        }
-                    }
-                }
+                Kind::Sub => {}
             }
             if let Some((factory, why)) = installed(m, spec.key) {
-                ui.label(theme::muted(format!("From the factory this is {}. RoomGuard sets it up this way: {}.", factory, why)));
+                ui.label(theme::muted(format!("Factory: {}. RoomGuard sets this so: {}.", factory, why)));
             }
-            ui.label(theme::muted(format!("To change it: {}", how_to(m, spec.key, code))));
+            ui.label(theme::muted(format!("Keypad sequence: {}", how_to(m, spec.key, code))));
         });
     }
     if shown == 0 {
-        ui.label(theme::muted("Nothing matches that. Try a section number like 17, or a word like delay."));
+        ui.label(theme::muted("Nothing matches that. Try a section number like 17 or 005, or a word like delay."));
     }
 }

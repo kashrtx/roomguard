@@ -14,6 +14,32 @@ use chrono::{Datelike, Timelike};
 static LOG: Mutex<Option<std::fs::File>> = Mutex::new(None);
 static BACKED_UP: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
+/// Thread priorities, so the keypad, its sound and the window always win the
+/// CPU over heavy background work like body tracking. Windows only; on macOS
+/// and Linux the scheduler balances these threads well on its own.
+pub mod prio {
+    pub const BACKGROUND: i32 = -1;
+    pub const PANEL: i32 = 1;
+    pub const AUDIO: i32 = 2;
+}
+
+#[cfg(windows)]
+pub fn set_thread_priority(level: i32) {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentThread() -> isize;
+        fn SetThreadPriority(thread: isize, priority: i32) -> i32;
+    }
+    // SAFETY: GetCurrentThread returns a pseudo handle for the calling
+    // thread that needs no closing; SetThreadPriority only reads it.
+    unsafe {
+        SetThreadPriority(GetCurrentThread(), level);
+    }
+}
+
+#[cfg(not(windows))]
+pub fn set_thread_priority(_level: i32) {}
+
 pub fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -215,6 +241,7 @@ fn save_queue() -> &'static SaveQueue {
 }
 
 fn save_worker(q: &'static SaveQueue) {
+    set_thread_priority(prio::BACKGROUND);
     loop {
         let (path, bytes) = {
             let mut st = lock_saves(q);

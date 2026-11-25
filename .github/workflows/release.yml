@@ -91,3 +91,4 @@ jobs:
           name: RoomGuard ${{ github.ref_name }}
           body_path: notes.md
           files: dist/*
+          prerelease: ${{ contains(github.ref_name, '-') }}

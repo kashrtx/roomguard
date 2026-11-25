@@ -30,6 +30,7 @@ pub enum Start {
 }
 
 /// Held for as long as this copy runs.
+#[derive(Clone)]
 pub struct Guard {
     ctx: Arc<Mutex<Option<egui::Context>>>,
 }

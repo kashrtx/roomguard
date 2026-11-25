@@ -256,6 +256,8 @@ pub struct UiCfg {
     pub show_tracks: bool,
     /// The hidden installer tab in Settings has been unlocked.
     pub installer_view: bool,
+    /// Draw with OpenGL instead of Direct3D, Vulkan or Metal.
+    pub opengl: bool,
 }
 
 impl Default for UiCfg {
@@ -268,6 +270,7 @@ impl Default for UiCfg {
             show_motion: true,
             show_tracks: true,
             installer_view: false,
+            opengl: false,
         }
     }
 }

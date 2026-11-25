@@ -35,6 +35,21 @@ pub enum OpInput {
     Clear,
 }
 
+/// A direct change to the panel's programming from Settings, writing the same
+/// EEPROM sections and panel state as keying it in at the keypad.
+#[derive(Clone, Debug)]
+pub enum PanelEdit {
+    SetSection { key: String, value: String },
+    SetToggle { key: String, opt: u8, on: bool },
+    SetCode { slot: String, code: String },
+    SetChime(bool),
+    SetQuickArm(bool),
+    SetAutoArm { enabled: bool, hm: Option<(u8, u8)> },
+    SetKeypadLevels { brightness: u8, contrast: u8, buzzer: u8 },
+    SetInstallerLockout(bool),
+    FactoryDefault,
+}
+
 pub enum EngineMsg {
     Key { key: Key, down: bool },
     SimZone { zone: u8, open: bool },
@@ -44,6 +59,7 @@ pub enum EngineMsg {
     NotifyResult { ok: bool, test: bool, err: String },
     NetStatus(bool),
     SetMasterCode(String),
+    EditPanel(PanelEdit),
     /// Checks a code without pressing keys, used before closing while armed.
     VerifyCode { code: String, reply: std::sync::mpsc::Sender<bool> },
     TestNotify,
@@ -97,6 +113,9 @@ pub struct ProgView {
     pub auto_arm: bool,
     pub auto_arm_hm: Option<(u8, u8)>,
     pub installer_lockout: bool,
+    pub brightness: u8,
+    pub contrast: u8,
+    pub buzzer: u8,
 }
 
 impl Default for ProgView {
@@ -112,6 +131,9 @@ impl Default for ProgView {
             auto_arm: false,
             auto_arm_hm: None,
             installer_lockout: false,
+            brightness: 7,
+            contrast: 5,
+            buzzer: 12,
         }
     }
 }
@@ -134,6 +156,9 @@ fn prog_fingerprint(p: &Panel) -> u64 {
     p.auto_arm.hash(&mut h);
     p.auto_arm_hm.hash(&mut h);
     p.ee.installer_lockout.hash(&mut h);
+    p.brightness.hash(&mut h);
+    p.contrast.hash(&mut h);
+    p.buzzer.hash(&mut h);
     h.finish()
 }
 
@@ -149,6 +174,9 @@ fn prog_view(p: &Panel) -> ProgView {
         auto_arm: p.auto_arm,
         auto_arm_hm: p.auto_arm_hm,
         installer_lockout: p.ee.installer_lockout,
+        brightness: p.brightness,
+        contrast: p.contrast,
+        buzzer: p.buzzer,
     }
 }
 
@@ -227,6 +255,8 @@ pub fn start(
     let v2 = view.clone();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let spawned = std::thread::Builder::new().name("engine".into()).spawn(move || {
+        // The panel's clock and beeps come first, ahead of camera work.
+        util::set_thread_priority(util::prio::PANEL);
         let mut e = Engine::new(cfg, audio, cam, notify, ctx, v2);
         e.run(rx);
         let _ = done_tx.send(());
@@ -295,6 +325,10 @@ struct Engine {
     /// A change waiting out the zone's loop response time.
     zone_pend: [Option<(bool, Instant)>; 8],
     prog_cache: (u64, Arc<ProgView>),
+    /// Since when the sound output has been missing.
+    audio_bad_since: Option<Instant>,
+    /// Internal errors recovered from in a row.
+    faults: u32,
 }
 
 impl Engine {
@@ -336,6 +370,8 @@ impl Engine {
             zone_want: [(false, false, false); 8],
             zone_pend: [None; 8],
             prog_cache: (0, Arc::new(ProgView::default())),
+            audio_bad_since: None,
+            faults: 0,
         };
         e.saved_events = e.panel.events_seq;
         e.push_settings();
@@ -376,16 +412,30 @@ impl Engine {
         self.panel.dirty = true;
     }
 
+    fn idle(&self) -> bool {
+        self.panel.held.is_none()
+            && self.panel.exit.is_none()
+            && self.panel.entry.is_none()
+            && self.panel.alarms.is_empty()
+            && !self.panel.walk_test
+            && self.panel.bell_test_until.is_none()
+            && self.panel.util_until.is_none()
+            && self.save_due.is_none()
+            && self.zone_pend.iter().all(|p| p.is_none())
+            && self.op.call_view().is_none()
+    }
+
     fn run(&mut self, rx: Receiver<EngineMsg>) {
         loop {
-            match rx.recv_timeout(Duration::from_millis(30)) {
+            let wait = if self.idle() { Duration::from_millis(100) } else { Duration::from_millis(30) };
+            match rx.recv_timeout(wait) {
                 Ok(msg) => {
-                    if !self.handle(msg) {
+                    if !self.handle_safely(msg) {
                         self.shutdown();
                         return;
                     }
                     while let Ok(m) = rx.try_recv() {
-                        if !self.handle(m) {
+                        if !self.handle_safely(m) {
                             self.shutdown();
                             return;
                         }
@@ -397,7 +447,47 @@ impl Engine {
                     return;
                 }
             }
-            self.tick();
+            let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.tick())).is_ok();
+            if ok {
+                self.faults = 0;
+            } else {
+                self.recover();
+            }
+        }
+    }
+
+    /// A bug in one key sequence must never stop the whole panel: without
+    /// this, the engine thread would end and the keypad would go silent and
+    /// freeze while the window kept drawing.
+    fn handle_safely(&mut self, msg: EngineMsg) -> bool {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.handle(msg))) {
+            Ok(keep_going) => keep_going,
+            Err(_) => {
+                self.recover();
+                true
+            }
+        }
+    }
+
+    fn recover(&mut self) {
+        self.faults += 1;
+        if self.faults <= 3 || self.faults % 100 == 0 {
+            util::log("the panel recovered from an internal error (the panic line above says where)");
+        }
+        self.panel.kp = panel::KpMode::Normal;
+        self.panel.held = None;
+        self.panel.buf.clear();
+        self.panel.dirty = true;
+        // If it keeps happening, go back to the last saved state.
+        if self.faults == 3 {
+            let now = Instant::now();
+            self.panel = load_panel(self.cfg.model, &self.cfg, now);
+            self.last_buzzer = self.panel.buzzer;
+            self.saved_events = self.panel.events_seq;
+            self.zone_pend = [None; 8];
+            self.push_settings();
+            self.sync_zones(now);
+            util::log("reloaded the panel from its last save");
         }
     }
 
@@ -449,6 +539,7 @@ impl Engine {
                 util::save_json(&panel_path(other), &save);
                 self.save(false);
             }
+            EngineMsg::EditPanel(edit) => self.apply_panel_edit(edit, now),
             EngineMsg::VerifyCode { code, reply } => {
                 let ok = self.panel.ee.find_code(&code).map_or(false, |s| s != "inst");
                 if !ok {
@@ -477,6 +568,187 @@ impl Engine {
             EngineMsg::Shutdown => return false,
         }
         true
+    }
+
+    fn apply_panel_edit(&mut self, edit: PanelEdit, now: Instant) {
+        let busy = self.panel.armed.is_some() || self.panel.exit.is_some();
+        let m = self.panel.model;
+        match edit {
+            PanelEdit::SetKeypadLevels { brightness, contrast, buzzer } => {
+                self.panel.brightness = brightness.min(15);
+                self.panel.contrast = contrast.min(15);
+                self.panel.buzzer = buzzer.min(20);
+                if self.panel.buzzer != self.last_buzzer {
+                    self.last_buzzer = self.panel.buzzer;
+                    self.push_volumes();
+                }
+            }
+            PanelEdit::SetChime(on) => {
+                self.panel.chime = on;
+                self.panel.log(EvKind::Program, if on { "Door chime enabled (Settings)" } else { "Door chime disabled (Settings)" });
+            }
+            PanelEdit::SetQuickArm(on) => {
+                if busy {
+                    return;
+                }
+                if m == Model::Pc1550 {
+                    self.panel.quick_arm = on;
+                } else {
+                    let mut t = self.panel.ee.toggles(m, "015");
+                    t[3] = on;
+                    self.panel.ee.set_toggles("015", &t);
+                }
+                self.panel.log(EvKind::Program, if on { "Quick arming enabled (Settings)" } else { "Quick arming disabled (Settings)" });
+            }
+            PanelEdit::SetAutoArm { enabled, hm } => {
+                if busy {
+                    return;
+                }
+                self.panel.auto_arm = enabled;
+                self.panel.auto_arm_hm = hm;
+                if m == Model::Pc1550 {
+                    let mut raw = self.panel.ee.raw(m, "19");
+                    if raw.len() < 8 {
+                        raw = "99999999".to_string();
+                    }
+                    let head = match hm {
+                        Some((h, mi)) => format!("{:02}{:02}", h.min(23), mi.min(59)),
+                        None => "9999".to_string(),
+                    };
+                    let tail = raw.get(4..8).unwrap_or("9999");
+                    self.panel.ee.sections.insert("19".to_string(), format!("{}{}", head, tail));
+                }
+                self.panel.log(EvKind::Program, "Auto-arm schedule updated (Settings)");
+            }
+            PanelEdit::SetSection { key, value } => {
+                if busy {
+                    return;
+                }
+                let Some(sp) = eeprom::spec(m, &key) else {
+                    return;
+                };
+                if matches!(sp.kind, eeprom::Kind::Action | eeprom::Kind::Sub | eeprom::Kind::Code(_)) {
+                    return;
+                }
+                let clean: String = value
+                    .trim()
+                    .to_ascii_uppercase()
+                    .chars()
+                    .filter(|c| c.is_ascii_hexdigit())
+                    .collect();
+                let final_val = match sp.kind {
+                    eeprom::Kind::Data { entries, width } => {
+                        let need = entries as usize * width as usize;
+                        let mut v = clean;
+                        while v.len() < need {
+                            v.push('0');
+                        }
+                        v.truncate(need);
+                        v
+                    }
+                    eeprom::Kind::Phone(max) => {
+                        let mut v = clean;
+                        v.truncate(max as usize);
+                        v
+                    }
+                    eeprom::Kind::Toggle(n) => {
+                        let mut v = String::new();
+                        for i in 1..=n {
+                            if let Some(c) = std::char::from_digit(i as u32, 10) {
+                                if clean.contains(c) {
+                                    v.push(c);
+                                }
+                            }
+                        }
+                        v
+                    }
+                    _ => return,
+                };
+                if m == Model::Pc1832 && key == "001" {
+                    let prev = self.panel.ee.raw(m, "001");
+                    for z in 1..=8usize {
+                        let i = (z - 1) * 2;
+                        let old_c = prev.get(i..i + 2).unwrap_or("00");
+                        let new_c = final_val.get(i..i + 2).unwrap_or("00");
+                        if old_c != new_c {
+                            let code = new_c.parse::<u32>().unwrap_or(0);
+                            self.panel.ee.sections.insert(
+                                format!("{:03}", 100 + z),
+                                eeprom::Eeprom::default_zone_attrs(code).to_string(),
+                            );
+                        }
+                    }
+                }
+                self.panel.ee.sections.insert(key.clone(), final_val);
+                self.panel.log(EvKind::Program, format!("Section [{}] updated (Settings)", key));
+            }
+            PanelEdit::SetToggle { key, opt, on } => {
+                if busy || !(1..=8).contains(&opt) {
+                    return;
+                }
+                let Some(sp) = eeprom::spec(m, &key) else {
+                    return;
+                };
+                let eeprom::Kind::Toggle(n) = sp.kind else {
+                    return;
+                };
+                if opt > n {
+                    return;
+                }
+                let mut t = self.panel.ee.toggles(m, &key);
+                t[opt as usize - 1] = on;
+                self.panel.ee.set_toggles(&key, &t[..n as usize]);
+                self.panel.log(EvKind::Program, format!("Section [{}] option {} {} (Settings)", key, opt, if on { "on" } else { "off" }));
+            }
+            PanelEdit::SetCode { slot, code } => {
+                if busy {
+                    return;
+                }
+                let digits: String = code.chars().filter(|c| c.is_ascii_digit()).collect();
+                if digits.is_empty() {
+                    if slot != "inst" && slot != master_slot(m) {
+                        self.panel.ee.clear_code(&slot);
+                        self.panel.log(EvKind::Program, format!("Code slot {} cleared (Settings)", slot));
+                    }
+                } else if digits.len() == 4 {
+                    self.panel.ee.set_code(&slot, &digits);
+                    self.panel.log(EvKind::Program, format!("Code slot {} updated (Settings)", slot));
+                } else {
+                    return;
+                }
+            }
+            PanelEdit::SetInstallerLockout(on) => {
+                if busy {
+                    return;
+                }
+                self.panel.ee.installer_lockout = on;
+                self.panel.log(EvKind::Program, if on { "Installer lockout enabled (Settings)" } else { "Installer lockout disabled (Settings)" });
+            }
+            PanelEdit::FactoryDefault => {
+                if busy {
+                    return;
+                }
+                let inst_keep = if self.panel.ee.installer_lockout {
+                    self.panel.ee.codes.get("inst").cloned()
+                } else {
+                    None
+                };
+                let lock = self.panel.ee.installer_lockout;
+                self.panel.ee = eeprom::Eeprom::factory(m);
+                self.panel.ee.installer_lockout = lock;
+                if let Some(c) = inst_keep {
+                    self.panel.ee.codes.insert("inst".to_string(), c);
+                }
+                self.panel.chime = false;
+                self.panel.quick_arm = true;
+                self.panel.auto_arm = false;
+                self.panel.auto_arm_hm = None;
+                self.panel.log(EvKind::Program, "Panel programming reset to defaults (Settings)");
+            }
+        }
+        self.panel.dirty = true;
+        self.save_due = Some(now + Duration::from_millis(400));
+        self.last_publish = None;
     }
 
     fn vision(&mut self, ev: VisionEvent, now: Instant) {
@@ -705,7 +977,15 @@ impl Engine {
             self.panel.inputs.ac_ok = st.on_ac;
             self.panel.inputs.battery_low = st.has_battery && !st.on_ac && st.percent < 0.20;
         }
-        self.panel.inputs.audio_ok = self.audio.is_ok() || now < self.grace_until;
+        // A sound output that reconnects within a few seconds (Windows does
+        // that when a device wakes up or changes) isn't a bell trouble.
+        if self.audio.is_ok() {
+            self.audio_bad_since = None;
+        } else if self.audio_bad_since.is_none() {
+            self.audio_bad_since = Some(now);
+        }
+        let audio_gone = self.audio_bad_since.map_or(false, |t| now.saturating_duration_since(t).as_secs() >= 4);
+        self.panel.inputs.audio_ok = !audio_gone || now < self.grace_until;
         if now.saturating_duration_since(self.last_cam_check).as_millis() >= 1000 {
             self.last_cam_check = now;
             self.check_camera(now);

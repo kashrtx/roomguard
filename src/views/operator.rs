@@ -11,10 +11,15 @@ use crate::theme;
 use crate::util;
 use crate::vision::frame;
 
+/// How many chat messages are drawn at a time.
+const CHAT_PAGE: usize = 60;
+
 #[derive(Default)]
 pub struct OperatorView {
     passcode: String,
     photos: HashMap<String, Option<egui::TextureHandle>>,
+    /// Extra older messages shown after "Show earlier messages".
+    older: usize,
 }
 
 impl OperatorView {
@@ -49,7 +54,17 @@ impl OperatorView {
                         operator_name
                     )));
                 }
-                for msg in view.chat.iter() {
+                // Drawing hundreds of old messages every frame slowed the
+                // whole window, so only the newest are drawn until you ask.
+                let total = view.chat.len();
+                if total <= CHAT_PAGE {
+                    self.older = 0;
+                }
+                let shown = (CHAT_PAGE + self.older).min(total);
+                if shown < total && ui.small_button(format!("Show earlier messages ({} more)", total - shown)).clicked() {
+                    self.older += CHAT_PAGE;
+                }
+                for msg in view.chat[total - shown..].iter() {
                     self.bubble(ui, msg);
                 }
             });

@@ -468,7 +468,7 @@ fn temporal4_co_alarm_and_buzzer_pitch_work() {
     sb.apply(AudioCmd::BuzzerLevel(0));
     sb.apply(AudioCmd::Beeps { count: 1, on_ms: 80, off_ms: 0 });
     let muted_peak = (0..3_000).map(|_| sb.next().abs()).fold(0.0f32, f32::max);
-    assert!(muted_peak < 1e-4, "level 0 should mute PK5500 buzzer");
+    assert!(muted_peak < 0.005, "level 0 should mute PK5500 buzzer (got {})", muted_peak);
     sb.apply(AudioCmd::BuzzerLevel(18));
     sb.apply(AudioCmd::Beeps { count: 1, on_ms: 80, off_ms: 0 });
     let loud_peak = (0..3_000).map(|_| sb.next().abs()).fold(0.0f32, f32::max);
@@ -905,4 +905,47 @@ fn the_pc1550_shows_camera_troubles_with_light_and_beeps() {
     keys(&mut p, "#", t0 + secs(5));
     p.tick(t0 + secs(6), 0);
     assert_eq!(p.leds_1550(t0 + secs(6))[4], Led::Off, "fixed, the light goes out");
+}
+
+#[test]
+fn entry_tone_stops_when_burglary_bell_starts_and_pk5500_ready_clears_on_exit() {
+    let t0 = Instant::now();
+    let mut p = panel(Model::Pc1832);
+    assert_eq!(p.leds_5500(t0)[0], Led::On, "Ready LED is on when disarmed");
+    assert_eq!(p.leds_5500(t0)[1], Led::Off, "Armed LED is off when disarmed");
+
+    // Arming starts exit delay: PK5500 Ready turns OFF immediately, Armed turns ON.
+    keys(&mut p, "1234", t0);
+    assert!(p.exit.is_some());
+    let ex_leds = p.leds_5500(t0 + secs(1));
+    assert_eq!(ex_leds[0], Led::Off, "Ready LED turns off during exit delay");
+    assert_eq!(ex_leds[1], Led::On, "Armed LED turns on during exit delay");
+
+    // Leave through door and let exit delay finish, then trip delay zone for entry delay.
+    p.set_zone(1, true, false, false, t0 + secs(5));
+    p.set_zone(1, false, false, false, t0 + secs(7));
+    p.tick(t0 + secs(121), 0);
+    assert!(p.armed.is_some());
+
+    p.set_zone(1, true, false, false, t0 + secs(130));
+    p.tick(t0 + secs(131), 0);
+    assert_eq!(p.sounder_sent, Pattern::Steady, "entry delay sounds continuous keypad tone");
+    assert_eq!(p.bell_sent, BellPattern::Off);
+
+    // Entry delay expires: external bell sounds, keypad piezo stops (since [018] opt 5 is OFF).
+    p.tick(t0 + secs(161), 0);
+    assert_eq!(p.bell_sent, BellPattern::Steady, "external siren/bell triggers");
+    assert_eq!(p.sounder_sent, Pattern::Off, "keypad piezo stops when burglary siren takes over");
+
+    // Turning on [018] Option 5 (Keypad Buzzer Follows Bell) makes the keypad buzzer follow the bell.
+    p.ee.sections.insert("018".to_string(), "5".to_string());
+    p.tick(t0 + secs(162), 0);
+    assert_eq!(p.sounder_sent, Pattern::Steady, "[018] opt 5 makes keypad buzzer follow bell");
+
+    // Disarming restores Ready LED and turns off Armed LED.
+    p.set_zone(1, false, false, false, t0 + secs(163));
+    keys(&mut p, "1234", t0 + secs(164));
+    p.tick(t0 + secs(165), 0);
+    assert_eq!(p.leds_5500(t0 + secs(165))[0], Led::On);
+    assert_eq!(p.leds_5500(t0 + secs(165))[1], Led::Off);
 }

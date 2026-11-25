@@ -2381,21 +2381,18 @@ impl Panel {
             return Pattern::Steady;
         }
         let mut fire = false;
-        let mut burg = false;
+        let mut buzzer_alarm = false;
         for a in self.live_alarms(now) {
-            if !(a.audible || a.buzzer) {
-                continue;
-            }
-            if a.kind.pulsed() {
+            if a.kind.pulsed() && (a.audible || a.buzzer) {
                 fire = true;
-            } else {
-                burg = true;
+            } else if a.buzzer {
+                buzzer_alarm = true;
             }
         }
         if fire {
             return Pattern::Beeps { on_ms: 500, off_ms: 500, count: 1, period_ms: 1000 };
         }
-        if burg {
+        if buzzer_alarm {
             return Pattern::Steady;
         }
         if self.model == Model::Pc1832

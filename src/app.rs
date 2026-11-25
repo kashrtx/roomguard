@@ -700,7 +700,7 @@ impl RoomGuardApp {
             }
             ShotAct::Settings => {
                 self.settings.open = true;
-                self.settings.tab = 3;
+                self.settings.tab = 4;
             }
             ShotAct::Quit => {
                 self.closing = true;
@@ -818,7 +818,15 @@ impl eframe::App for RoomGuardApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         self.drive_shots(ctx, &view);
-        let ms = if view.bell || view.status == StatusKind::Alarm { 50 } else { 100 };
+        let minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
+        self.cam.set_minimized(minimized);
+        let ms = if minimized {
+            1000
+        } else if view.bell || view.status == StatusKind::Alarm || view.hold.is_some() {
+            50
+        } else {
+            250
+        };
         ctx.request_repaint_after(Duration::from_millis(ms));
     }
 }

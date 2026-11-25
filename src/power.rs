@@ -27,6 +27,7 @@ impl Power {
         let latest = Arc::new(Mutex::new(None));
         let shared = latest.clone();
         let spawned = std::thread::Builder::new().name("power".into()).spawn(move || {
+            util::set_thread_priority(util::prio::BACKGROUND);
             let manager = match starship_battery::Manager::new() {
                 Ok(m) => Some(m),
                 Err(e) => {

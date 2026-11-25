@@ -1,11 +1,14 @@
 //! The event history, newest first, like the panel's event buffer.
 
-use eframe::egui::{self, Color32, RichText};
+use eframe::egui::{self, Color32};
 
-use crate::engine::types::EvKind;
+use crate::engine::types::{EvKind, EventRow};
 use crate::engine::{EngineHandle, EngineMsg, View};
 use crate::theme;
 use crate::util;
+
+/// Height of one history row: the event, then when it happened.
+const ROW_H: f32 = 38.0;
 
 #[derive(Default)]
 pub struct EventsView {
@@ -48,39 +51,39 @@ impl EventsView {
         });
         ui.add_space(4.0);
         let h = (ui.available_height() - 32.0).max(120.0);
+        // Only the rows on screen are drawn, so a full history costs no more
+        // each frame than a short one. Before, every row was laid out and its
+        // time converted to the local time zone on every frame, which slowed
+        // the whole window down a little more with every arm and disarm.
+        let rows: Vec<&EventRow> = view.events.iter().rev().filter(|e| passes(self.filter, e.kind)).collect();
         egui::ScrollArea::vertical()
             .id_salt("event-history")
             .max_height(h)
             .auto_shrink([false, false])
-            .show(ui, |ui| {
+            .show_rows(ui, ROW_H, rows.len(), |ui, range| {
                 let row_w = ui.available_width();
-                let mut shown = 0;
-                for ev in view.events.iter().rev().filter(|e| passes(self.filter, e.kind)) {
-                    shown += 1;
-                    let col = kind_color(ev.kind);
-                    let resp = ui.horizontal_top(|ui| {
-                        ui.add_space(10.0);
-                        ui.vertical(|ui| {
-                            ui.set_max_width((row_w - 14.0).max(100.0));
-                            ui.label(RichText::new(&ev.text).color(theme::TEXT).size(13.0));
-                            ui.label(RichText::new(util::fmt_stamp(ev.ts)).size(11.0).color(theme::FAINT));
-                        });
-                    });
-                    let r = resp.response.rect;
+                for ev in &rows[range] {
+                    let (rect, resp) = ui.allocate_exact_size(egui::vec2(row_w, ROW_H), egui::Sense::hover());
+                    let p = ui.painter_at(rect);
                     let bar = egui::Rect::from_min_max(
-                        egui::pos2(r.left() + 1.0, r.top() + 2.0),
-                        egui::pos2(r.left() + 4.0, r.bottom() - 2.0),
+                        egui::pos2(rect.left() + 1.0, rect.top() + 4.0),
+                        egui::pos2(rect.left() + 4.0, rect.bottom() - 6.0),
                     );
-                    ui.painter().rect_filled(bar, 1.5, col);
-                    ui.add_space(4.0);
-                    if shown >= 400 {
-                        break;
-                    }
-                }
-                if shown == 0 {
-                    ui.label(theme::muted("Nothing here yet."));
+                    p.rect_filled(bar, 1.5, kind_color(ev.kind));
+                    p.text(egui::pos2(rect.left() + 12.0, rect.top() + 3.0), egui::Align2::LEFT_TOP, &ev.text, theme::regular(13.0), theme::TEXT);
+                    p.text(
+                        egui::pos2(rect.left() + 12.0, rect.top() + 21.0),
+                        egui::Align2::LEFT_TOP,
+                        util::fmt_stamp(ev.ts),
+                        theme::regular(11.0),
+                        theme::FAINT,
+                    );
+                    resp.on_hover_text(&ev.text);
                 }
             });
+        if rows.is_empty() {
+            ui.label(theme::muted("Nothing here yet."));
+        }
         ui.horizontal(|ui| {
             if self.confirm_clear {
                 ui.label("Clear history?");

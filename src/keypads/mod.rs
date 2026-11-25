@@ -75,6 +75,8 @@ pub struct KeyInput {
     /// 0.0 = closed (up, over keys), 1.0 = open (flipped down).
     pub door_anim_5500: f32,
     doors_init: bool,
+    /// When the sound output was last nudged awake.
+    last_wake: f64,
 }
 
 impl Default for KeyInput {
@@ -86,6 +88,7 @@ impl Default for KeyInput {
             door_anim_1550: 1.0,
             door_anim_5500: 1.0,
             doors_init: false,
+            last_wake: -10.0,
         }
     }
 }
@@ -124,6 +127,13 @@ impl KeyInput {
             .interact(rect, id, egui::Sense::click_and_drag())
             .on_hover_cursor(egui::CursorIcon::PointingHand);
         let down = resp.is_pointer_button_down_on();
+        // The pointer reaching a key wakes the sound output before the click,
+        // so even the first press after a quiet spell beeps.
+        let t_now = ui.input(|i| i.time);
+        if (resp.hovered() || down) && t_now - self.last_wake > 1.5 {
+            self.last_wake = t_now;
+            audio.send(AudioCmd::Wake);
+        }
         // A quick tap, or the click that also focuses the window, can deliver
         // press and release in the same frame. Then `clicked()` is true but
         // the button is never seen held, so handle that case explicitly.

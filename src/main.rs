@@ -26,6 +26,9 @@ mod vision;
 #[cfg(test)]
 mod tests;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 use eframe::egui;
 
 fn main() -> eframe::Result<()> {
@@ -54,6 +57,33 @@ fn main() -> eframe::Result<()> {
             single::Start::AlreadyRunning => return Ok(()),
         }
     };
+    // Draw on the graphics card through wgpu: Direct3D 12 on Windows, Vulkan
+    // on Linux, Metal on macOS. If that can't start on this computer, fall
+    // back to OpenGL. "Use OpenGL" in Settings, or ROOMGUARD_RENDERER=gl,
+    // picks OpenGL from the start.
+    let want_gl = config::AppConfig::load().ui.opengl
+        || std::env::var("ROOMGUARD_RENDERER").map_or(false, |v| v.eq_ignore_ascii_case("gl") || v.eq_ignore_ascii_case("opengl"));
+    let started = Arc::new(AtomicBool::new(false));
+    let first = if want_gl { eframe::Renderer::Glow } else { eframe::Renderer::Wgpu };
+    let mut result = run(first, shots.clone(), minimized, guard.clone(), started.clone());
+    if !want_gl && result.is_err() && !started.load(Ordering::SeqCst) {
+        if let Err(e) = &result {
+            util::log(&format!("the GPU renderer couldn't start ({}), drawing with OpenGL instead", e));
+        }
+        result = run(eframe::Renderer::Glow, shots, minimized, guard, started);
+    }
+    // Anything saved during shutdown is still on its way to the disk.
+    util::flush_saves(std::time::Duration::from_secs(4));
+    result
+}
+
+fn run(
+    renderer: eframe::Renderer,
+    shots: Option<std::path::PathBuf>,
+    minimized: bool,
+    guard: Option<single::Guard>,
+    started: Arc<AtomicBool>,
+) -> eframe::Result<()> {
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("RoomGuard")
         .with_inner_size([1440.0, 900.0])
@@ -62,18 +92,18 @@ fn main() -> eframe::Result<()> {
     if shots.is_some() {
         viewport = viewport.with_resizable(false);
     }
-    let options = eframe::NativeOptions { viewport, ..Default::default() };
-    let result = eframe::run_native(
+    let options = eframe::NativeOptions { viewport, renderer, ..Default::default() };
+    eframe::run_native(
         "RoomGuard",
         options,
         Box::new(move |cc| {
+            started.store(true, Ordering::SeqCst);
             if let Some(g) = &guard {
                 g.attach(&cc.egui_ctx);
             }
+            let how = if cc.wgpu_render_state.is_some() { "the GPU through wgpu" } else { "OpenGL" };
+            util::log(&format!("drawing with {}", how));
             Ok(Box::new(app::RoomGuardApp::new(cc, shots, minimized)) as Box<dyn eframe::App>)
         }),
-    );
-    // Anything saved during shutdown is still on its way to the disk.
-    util::flush_saves(std::time::Duration::from_secs(4));
-    result
+    )
 }

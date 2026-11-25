@@ -771,7 +771,7 @@ impl Panel {
         if self.all_on(now) || self.walk_test {
             return [Led::Flash, Led::Flash, Led::Flash, Led::On];
         }
-        let ready = if self.armed.is_none() && self.ready() { Led::On } else { Led::Off };
+        let ready = if self.armed.is_none() && self.exit.is_none() && self.ready() { Led::On } else { Led::Off };
         let armed = if self.armed.is_some() || self.exit.is_some() {
             let no_entry = self.armed.map_or(false, |a| a.no_entry) || self.exit.map_or(false, |e| e.how == ArmHow::NoEntry);
             if no_entry {

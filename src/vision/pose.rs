@@ -52,7 +52,7 @@ pub const JOINTS: usize = 17;
 /// Most zoomed looks per round, on top of the whole frame.
 pub const MAX_ZOOMS: usize = 2;
 /// Most skeletons per round.
-const MAX_BODIES: usize = 4;
+const MAX_BODIES: usize = 3;
 
 /// COCO joints: 0 nose, 1/2 eyes, 3/4 ears, 5/6 shoulders, 7/8 elbows,
 /// 9/10 wrists, 11/12 hips, 13/14 knees, 15/16 ankles (left/right).
@@ -478,6 +478,9 @@ impl PoseWorker {
         let state = Arc::new(AtomicU8::new(POSE_LOADING));
         let st = state.clone();
         let spawned = std::thread::Builder::new().name("body-tracking".into()).spawn(move || {
+            // Heavy maths at background priority: the keypad, the sound and the
+            // window always get the CPU first.
+            util::set_thread_priority(util::prio::BACKGROUND);
             let t0 = Instant::now();
             let net = match PoseNet::load() {
                 Ok(n) => n,
@@ -491,7 +494,13 @@ impl PoseWorker {
             util::log(&format!("body tracking ready in {} ms", t0.elapsed().as_millis()));
             while let Ok(job) = jobs.recv() {
                 let t = Instant::now();
-                let people = net.detect_with(&job.img, &job.zooms);
+                let people = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| net.detect_with(&job.img, &job.zooms))) {
+                    Ok(p) => p,
+                    Err(_) => {
+                        util::log("body tracking recovered from an internal error (the panic line above says where)");
+                        Vec::new()
+                    }
+                };
                 let ms = t.elapsed().as_secs_f32() * 1000.0;
                 if out.send(PoseResult { people, ms }).is_err() {
                     break;

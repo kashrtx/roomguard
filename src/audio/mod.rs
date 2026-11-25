@@ -9,7 +9,7 @@ pub mod synth;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::engine::types::SirenModel;
 use crate::util;
@@ -70,6 +70,8 @@ pub enum AudioCmd {
     Click,
     Preview { model: SirenModel, warble: bool, ms: u32 },
     Silence,
+    /// The pointer is near the keypad: make sure the output is awake.
+    Wake,
 }
 
 #[derive(Clone)]
@@ -121,9 +123,21 @@ impl State {
             AudioCmd::Siren { .. } => &mut self.siren,
             AudioCmd::Volumes { .. } => &mut self.volumes,
             AudioCmd::Ring(_) => &mut self.ring,
+            AudioCmd::Silence => {
+                // A rebuilt output must not bring back what was silenced.
+                self.sounder = Some(AudioCmd::Sounder(Pattern::Off));
+                self.bell = Some(AudioCmd::Bell(BellPattern::Off));
+                self.ring = Some(AudioCmd::Ring(false));
+                return;
+            }
             _ => return,
         };
         *slot = Some(c.clone());
+    }
+
+    /// Sounds that matter if they're missed while the output reconnects.
+    fn worth_replaying(c: &AudioCmd) -> bool {
+        matches!(c, AudioCmd::KeyBeep | AudioCmd::Beeps { .. } | AudioCmd::Chime(_))
     }
 
     fn replay(&self) -> Vec<AudioCmd> {
@@ -137,6 +151,10 @@ impl State {
 fn run(rx: Receiver<AudioCmd>, ok: Arc<AtomicBool>) {
     let mut state = State::default();
     let mut logged = false;
+    // A beep asked for while the output was being rebuilt (Windows resets it
+    // when the device changes or wakes up). It still plays if it's fresh.
+    let mut pending: Option<(AudioCmd, Instant)> = None;
+    let mut backoff = Duration::from_millis(100);
     loop {
         let failed = Arc::new(AtomicBool::new(false));
         let (itx, irx) = mpsc::channel::<AudioCmd>();
@@ -144,9 +162,18 @@ fn run(rx: Receiver<AudioCmd>, ok: Arc<AtomicBool>) {
         match &stream {
             Ok(_) => {
                 ok.store(true, Ordering::Relaxed);
+                if logged {
+                    util::log("audio output is back");
+                }
                 logged = false;
+                backoff = Duration::from_millis(100);
                 for c in state.replay() {
                     let _ = itx.send(c);
+                }
+                if let Some((c, at)) = pending.take() {
+                    if at.elapsed() < Duration::from_millis(600) {
+                        let _ = itx.send(c);
+                    }
                 }
             }
             Err(e) => {
@@ -158,11 +185,14 @@ fn run(rx: Receiver<AudioCmd>, ok: Arc<AtomicBool>) {
             }
         }
         loop {
-            match rx.recv_timeout(Duration::from_millis(500)) {
+            match rx.recv_timeout(Duration::from_millis(200)) {
                 Ok(cmd) => {
                     state.remember(&cmd);
-                    if stream.is_ok() {
+                    let alive = stream.is_ok() && !failed.load(Ordering::Relaxed);
+                    if alive {
                         let _ = itx.send(cmd);
+                    } else if State::worth_replaying(&cmd) {
+                        pending = Some((cmd, Instant::now()));
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {}
@@ -174,7 +204,29 @@ fn run(rx: Receiver<AudioCmd>, ok: Arc<AtomicBool>) {
         }
         drop(stream);
         ok.store(false, Ordering::Relaxed);
-        std::thread::sleep(Duration::from_millis(1500));
+        // Reconnect fast. A device that's just waking up is usually back in a
+        // moment, and a waiting beep gets the quickest retry of all.
+        let wait = if pending.is_some() { Duration::from_millis(50) } else { backoff };
+        std::thread::sleep(wait);
+        backoff = (backoff * 2).min(Duration::from_millis(1500));
+    }
+}
+
+/// Fills one buffer from the synth. A bug in the synth must never take the
+/// audio thread down with it, so a panic just gives a buffer of silence.
+fn render<T: Copy>(synth: &mut synth::Synth, data: &mut [T], channels: usize, silence: T, conv: impl Fn(f32) -> T) {
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        for frame in data.chunks_mut(channels) {
+            let s = conv(synth.next());
+            for o in frame.iter_mut() {
+                *o = s;
+            }
+        }
+    }));
+    if res.is_err() {
+        for o in data.iter_mut() {
+            *o = silence;
+        }
     }
 }
 
@@ -190,6 +242,10 @@ fn build_stream(rx: Receiver<AudioCmd>, failed: Arc<AtomicBool>) -> Result<cpal:
     let channels = config.channels.max(1) as usize;
     let rate = config.sample_rate.0 as f32;
     let mut synth = synth::Synth::new(rate);
+    // The sound thread gets a high priority the first time it runs, so heavy
+    // background work can never make the keypad stutter or beep late.
+    let mut boosted = false;
+    util::log(&format!("audio output: {} Hz, {} channels, {:?}", config.sample_rate.0, channels, format));
     let flag = failed.clone();
     let on_error = move |e: cpal::StreamError| {
         util::log(&format!("audio stream error: {}", e));
@@ -199,15 +255,14 @@ fn build_stream(rx: Receiver<AudioCmd>, failed: Arc<AtomicBool>) -> Result<cpal:
         cpal::SampleFormat::F32 => device.build_output_stream(
             &config,
             move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                if !boosted {
+                    boosted = true;
+                    util::set_thread_priority(util::prio::AUDIO);
+                }
                 while let Ok(c) = rx.try_recv() {
                     synth.apply(c);
                 }
-                for frame in data.chunks_mut(channels) {
-                    let s = synth.next();
-                    for o in frame.iter_mut() {
-                        *o = s;
-                    }
-                }
+                render(&mut synth, data, channels, 0.0f32, |s| s);
             },
             on_error,
             None,
@@ -215,15 +270,14 @@ fn build_stream(rx: Receiver<AudioCmd>, failed: Arc<AtomicBool>) -> Result<cpal:
         cpal::SampleFormat::I16 => device.build_output_stream(
             &config,
             move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
+                if !boosted {
+                    boosted = true;
+                    util::set_thread_priority(util::prio::AUDIO);
+                }
                 while let Ok(c) = rx.try_recv() {
                     synth.apply(c);
                 }
-                for frame in data.chunks_mut(channels) {
-                    let s = (synth.next().clamp(-1.0, 1.0) * 32767.0) as i16;
-                    for o in frame.iter_mut() {
-                        *o = s;
-                    }
-                }
+                render(&mut synth, data, channels, 0i16, |s| (s.clamp(-1.0, 1.0) * 32767.0) as i16);
             },
             on_error,
             None,
@@ -231,15 +285,14 @@ fn build_stream(rx: Receiver<AudioCmd>, failed: Arc<AtomicBool>) -> Result<cpal:
         cpal::SampleFormat::I32 => device.build_output_stream(
             &config,
             move |data: &mut [i32], _: &cpal::OutputCallbackInfo| {
+                if !boosted {
+                    boosted = true;
+                    util::set_thread_priority(util::prio::AUDIO);
+                }
                 while let Ok(c) = rx.try_recv() {
                     synth.apply(c);
                 }
-                for frame in data.chunks_mut(channels) {
-                    let s = (synth.next().clamp(-1.0, 1.0) as f64 * 2_147_483_647.0) as i32;
-                    for o in frame.iter_mut() {
-                        *o = s;
-                    }
-                }
+                render(&mut synth, data, channels, 0i32, |s| (s.clamp(-1.0, 1.0) as f64 * 2_147_483_647.0) as i32);
             },
             on_error,
             None,
@@ -247,15 +300,14 @@ fn build_stream(rx: Receiver<AudioCmd>, failed: Arc<AtomicBool>) -> Result<cpal:
         cpal::SampleFormat::U16 => device.build_output_stream(
             &config,
             move |data: &mut [u16], _: &cpal::OutputCallbackInfo| {
+                if !boosted {
+                    boosted = true;
+                    util::set_thread_priority(util::prio::AUDIO);
+                }
                 while let Ok(c) = rx.try_recv() {
                     synth.apply(c);
                 }
-                for frame in data.chunks_mut(channels) {
-                    let s = ((synth.next().clamp(-1.0, 1.0) * 0.5 + 0.5) * 65535.0) as u16;
-                    for o in frame.iter_mut() {
-                        *o = s;
-                    }
-                }
+                render(&mut synth, data, channels, 32768u16, |s| ((s.clamp(-1.0, 1.0) * 0.5 + 0.5) * 65535.0) as u16);
             },
             on_error,
             None,

@@ -300,6 +300,10 @@ impl Piezo {
         let v = y * (1.0 - self.buzz) + drive * (self.buzz + off) * 0.36;
         (v * self.sat).tanh() / self.sat.tanh()
     }
+
+    fn quiet(&self) -> bool {
+        self.res.energy() < 1e-5 && self.res2.energy() < 1e-5 && self.body.energy() < 1e-5
+    }
 }
 
 /// All four bell output devices.
@@ -663,6 +667,8 @@ pub struct Synth {
     click_res: Res,
     rng: Rng,
     keepalive: f32,
+    ka_phase: f32,
+    wake_left: u32,
 }
 
 impl Synth {
@@ -700,6 +706,8 @@ impl Synth {
             click_res: Res::new(sr, 1700.0, 2.0),
             rng: Rng(0x9E37_79B9),
             keepalive: 1.0 / 32_000.0,
+            ka_phase: 0.0,
+            wake_left: 0,
         }
     }
 
@@ -829,6 +837,7 @@ impl Synth {
             AudioCmd::Preview { model, warble, ms: dur } => {
                 self.preview = Some((Siren::new(self.sr, model, warble), ms(self.sr, dur)));
             }
+            AudioCmd::Wake => self.wake_left = ms(self.sr, 2500),
             AudioCmd::Silence => {
                 self.sounder.set(Pattern::Off);
                 self.segs.clear();
@@ -969,30 +978,60 @@ impl Synth {
             Some((gate, f, a)) => (gate, f, a),
             None => (bg_on, self.piezo.f0, 1.0),
         };
-        let keypad = self.piezo.next(on, freq, amp) * self.vol_keypad;
         let power = self.bell_gate() | self.squawk_next();
-        let siren = self.siren.next(power) * self.vol_siren;
-        let mut preview = 0.0;
-        if let Some((s, left)) = self.preview.as_mut() {
-            let on = *left > 0;
-            if on {
-                *left -= 1;
+        // Fast path when every voice is silent: skip 48 kHz resonator and tanh
+        // math so idle audio uses near-zero CPU and battery.
+        let idle = !on
+            && self.piezo.quiet()
+            && !power
+            && self.siren.quiet()
+            && self.preview.is_none()
+            && self.line_left == 0
+            && self.line.is_empty()
+            && !self.ring_on
+            && self.click_left == 0
+            && self.click_res.energy() < 1e-5;
+        let mix = if idle {
+            0.0
+        } else {
+            let keypad = self.piezo.next(on, freq, amp) * self.vol_keypad;
+            let siren = self.siren.next(power) * self.vol_siren;
+            let mut preview = 0.0;
+            if let Some((s, left)) = self.preview.as_mut() {
+                let on = *left > 0;
+                if on {
+                    *left -= 1;
+                }
+                preview = s.next(on) * self.vol_siren;
             }
-            preview = s.next(on) * self.vol_siren;
+            let finished = matches!(&self.preview, Some((s, left)) if *left == 0 && s.quiet());
+            if finished {
+                self.preview = None;
+            }
+            let line = self.line_next() * self.vol_line;
+            let ring = self.ring_next();
+            let click = self.click_next() * self.vol_keypad * 0.12;
+            (keypad * 0.8 + siren + preview + line + ring + click) * self.vol_master
+        };
+        // Keeps the output awake. Silence lets many laptop speakers and USB,
+        // HDMI and Bluetooth outputs power their amplifier down, and waking it
+        // swallows the next short keypad beep. A 30 Hz tone at about -66 dBFS
+        // passes every DAC's filters (a signal at the Nyquist frequency
+        // doesn't) yet sits far below hearing at that pitch on any speaker or
+        // headphone. Moving toward the keypad lifts it to about -54 dBFS for
+        // a couple of seconds, for outputs that sleep more deeply. The tiny
+        // alternating step keeps the stream from ever being exact zeros.
+        self.ka_phase += 30.0 / self.sr;
+        if self.ka_phase >= 1.0 {
+            self.ka_phase -= 1.0;
         }
-        let finished = matches!(&self.preview, Some((s, left)) if *left == 0 && s.quiet());
-        if finished {
-            self.preview = None;
-        }
-        let line = self.line_next() * self.vol_line;
-        let ring = self.ring_next();
-        let click = self.click_next() * self.vol_keypad * 0.12;
-        let mix = (keypad * 0.8 + siren + preview + line + ring + click) * self.vol_master;
-        // Inaudible 1 LSB (16-bit, about -90 dBFS) alternating keep-alive at
-        // Nyquist. Pure digital silence lets many USB, Bluetooth and Realtek
-        // outputs power down their amplifier, which then swallows the first
-        // short keypad beep. This keeps the output awake.
+        let ka_level = if self.wake_left > 0 {
+            self.wake_left -= 1;
+            2.0e-3
+        } else {
+            5.0e-4
+        };
         self.keepalive = -self.keepalive;
-        mix.clamp(-0.9999, 0.9999) + self.keepalive
+        mix.clamp(-0.9999, 0.9999) + (TAU * self.ka_phase).sin() * ka_level + self.keepalive
     }
 }

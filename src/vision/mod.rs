@@ -14,6 +14,7 @@ pub mod track;
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -178,11 +179,18 @@ pub struct CameraHandle {
     pub tx: Sender<CamCmd>,
     pub shared: Arc<Mutex<CamShared>>,
     done: Arc<Mutex<Option<Receiver<()>>>>,
+    minimized: Arc<AtomicBool>,
 }
 
 impl CameraHandle {
     pub fn send(&self, c: CamCmd) {
         let _ = self.tx.send(c);
+    }
+
+    /// Tells the camera thread when the window is hidden so it skips GPU
+    /// repaints and slows down preview decoding while disarmed.
+    pub fn set_minimized(&self, m: bool) {
+        self.minimized.store(m, Ordering::Relaxed);
     }
 
     /// Waits (briefly) for the camera thread to save its room map and stop.
@@ -199,16 +207,19 @@ pub fn start(cfg: CameraCfg, engine: Sender<EngineMsg>, ctx: egui::Context) -> C
     let (tx, rx) = mpsc::channel();
     let (done_tx, done_rx) = mpsc::channel::<()>();
     let shared = Arc::new(Mutex::new(CamShared::default()));
+    let minimized = Arc::new(AtomicBool::new(false));
     let s2 = shared.clone();
+    let m2 = minimized.clone();
     let spawned = std::thread::Builder::new().name("camera".into()).spawn(move || {
-        let worker = Worker::new(cfg, engine, ctx, s2);
+        util::set_thread_priority(util::prio::BACKGROUND);
+        let worker = Worker::new(cfg, engine, ctx, s2, m2);
         worker.run(rx);
         let _ = done_tx.send(());
     });
     if let Err(e) = spawned {
         util::log(&format!("could not start the camera thread: {}", e));
     }
-    CameraHandle { tx, shared, done: Arc::new(Mutex::new(Some(done_rx))) }
+    CameraHandle { tx, shared, done: Arc::new(Mutex::new(Some(done_rx))), minimized }
 }
 
 struct Enroll {
@@ -225,6 +236,7 @@ struct Worker {
     engine: Sender<EngineMsg>,
     ctx: egui::Context,
     shared: Arc<Mutex<CamShared>>,
+    minimized: Arc<AtomicBool>,
     cam: Option<nokhwa::Camera>,
     cam_key: String,
     retry_at: Instant,
@@ -272,10 +284,12 @@ struct Worker {
     people_at: Option<Instant>,
     pose_sent_at: Option<Instant>,
     pose_ms: f32,
+    /// Internal errors recovered from.
+    faults: u32,
 }
 
 impl Worker {
-    fn new(cfg: CameraCfg, engine: Sender<EngineMsg>, ctx: egui::Context, shared: Arc<Mutex<CamShared>>) -> Worker {
+    fn new(cfg: CameraCfg, engine: Sender<EngineMsg>, ctx: egui::Context, shared: Arc<Mutex<CamShared>>, minimized: Arc<AtomicBool>) -> Worker {
         let cascade = faces::Cascade::load(include_bytes!("../../assets/cascade/lbp_frontalface.bin"));
         if cascade.is_none() {
             util::log("the face cascade failed to load, face features are off");
@@ -289,6 +303,7 @@ impl Worker {
             engine,
             ctx,
             shared,
+            minimized,
             cam: None,
             cam_key: String::new(),
             retry_at: now,
@@ -336,6 +351,7 @@ impl Worker {
             people_at: None,
             pose_sent_at: None,
             pose_ms: 0.0,
+            faults: 0,
         };
         w.publish_people();
         if let Ok(mut s) = w.shared.lock() {
@@ -393,13 +409,23 @@ impl Worker {
             match result {
                 Ok(buf) => {
                     self.fails = 0;
-                    // Cap camera processing to ~15 FPS so high-framerate webcams never
-                    // saturate CPU/GPU or freeze the UI thread.
+                    // Cap camera processing to ~15 FPS (or 5 FPS when minimized &
+                    // disarmed) so high-framerate webcams never saturate CPU/GPU
+                    // or drain laptop battery.
                     let now = Instant::now();
+                    let min_gap = if self.minimized.load(Ordering::Relaxed)
+                        && !self.armed
+                        && self.enroll.is_none()
+                        && self.sweep.is_none()
+                    {
+                        Duration::from_millis(200)
+                    } else {
+                        Duration::from_millis(62)
+                    };
                     if let Some(prev) = self.last_frame_at {
                         let elapsed = now.saturating_duration_since(prev);
-                        if elapsed < Duration::from_millis(62) {
-                            std::thread::sleep(Duration::from_millis(62).saturating_sub(elapsed).min(Duration::from_millis(25)));
+                        if elapsed < min_gap {
+                            std::thread::sleep(min_gap.saturating_sub(elapsed).min(Duration::from_millis(35)));
                             continue;
                         }
                     }
@@ -732,7 +758,22 @@ impl Worker {
         }
     }
 
+    /// One frame through the pipeline. A bug in it must never stop the
+    /// camera thread, so a panic is logged and the trackers start fresh.
     fn process(&mut self, rgb: frame::Rgb) {
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.process_frame(rgb)));
+        if res.is_err() {
+            self.faults += 1;
+            if self.faults <= 3 || self.faults % 100 == 0 {
+                util::log("the camera recovered from an internal error (the panic line above says where)");
+            }
+            self.tracker.clear();
+            self.motion.reset();
+            self.people.clear();
+        }
+    }
+
+    fn process_frame(&mut self, rgb: frame::Rgb) {
         let now = Instant::now();
         self.frame_no += 1;
         self.fps_n += 1;
@@ -778,7 +819,15 @@ impl Worker {
             // About ten looks a second while anything is going on, about one
             // a second in a still, empty room. That keeps one CPU core from
             // being pinned while still catching anyone the moment they move.
-            let gap = if active { 0.1 } else { 0.9 };
+            // The worker gets a breather after each round, so it can't keep a
+            // core flat out and heat the computer until everything throttles.
+            let gap = if active {
+                (self.pose_ms / 1000.0 * 1.6).clamp(0.12, 0.6)
+            } else if self.armed {
+                2.0
+            } else {
+                3.0
+            };
             let due = self.pose_sent_at.map_or(true, |t| now.saturating_duration_since(t).as_secs_f32() >= gap);
             let zooms = if due && self.pose.is_some() { self.zoom_targets(&m, w, h) } else { Vec::new() };
             let mut dead = false;
@@ -1465,7 +1514,9 @@ impl Worker {
                 }
             }
         }
-        if self.last_repaint_at.map_or(true, |t| now.saturating_duration_since(t) >= Duration::from_millis(66)) {
+        if !self.minimized.load(Ordering::Relaxed)
+            && self.last_repaint_at.map_or(true, |t| now.saturating_duration_since(t) >= Duration::from_millis(66))
+        {
             self.last_repaint_at = Some(now);
             self.ctx.request_repaint();
         }

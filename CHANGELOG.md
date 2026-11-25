@@ -3,7 +3,9 @@
 Every release lists what changed. The release workflow copies the section for
 each version onto its GitHub release page.
 
-## [2.1.0] - 2026-11-25
+## [2.1.0-beta.1] - 2026-11-25
+
+> **Beta pre-release:** RoomGuard is a new project and this build is marked as a beta while remaining kinks are worked out. Feedback and bug reports are welcome!
 
 ### Smoother, no more freezes
 - Saving now happens in the background. Before, every save forced a full flush to the disk on the window or panel thread, which antivirus or a synced folder could stall. That was the freezing, and it's why a keypress sometimes didn't beep until the second try.
@@ -12,6 +14,13 @@ each version onto its GitHub release page.
 - Two slow memory leaks are gone: font sizes from window resizing, and every chat photo staying loaded forever.
 - The sound engine no longer bogs down while it sits idle. Leftover numbers too tiny to hear made the CPU work dozens of times harder in every filter, which could cause crackles and late beeps.
 - The keypad's lights and screen now change the instant its key beeps, instead of up to a few frames later.
+- The window no longer slows down the longer you use it. History drew all of its rows on every frame and the monitoring chat drew every message, each converting its time to your time zone, so every arm and disarm made each frame a little heavier. Now only what's on screen is drawn, and the chat shows the newest 60 messages with a button for older ones.
+- Body tracking runs at background priority and takes a breather between looks, so it can't hold a CPU core at 100% and heat a laptop until everything throttles.
+- On Windows the panel, its sound and the window always get the CPU before background work.
+- Drawing happens on the graphics card through Direct3D 12, Vulkan or Metal, falling back to OpenGL if needed. Settings has a switch to use OpenGL.
+- The panel, the camera and body tracking recover from an internal error instead of stopping. Before, one rare bug could end the panel's thread and leave the keypad silent and frozen.
+- The first keypress after a quiet spell beeps. An inaudible 30 Hz signal keeps speakers and headphones from powering down, it gets a little stronger as your pointer reaches the keypad, and if Windows resets the sound device, it reconnects in a moment and still plays the beep you just pressed.
+- A sound output that reconnects within a few seconds no longer shows a bell circuit trouble.
 
 ### Body tracking that only sees people
 - Every frame gets a full look plus up to two zoomed looks where something moved, so people far across the room are found too.
@@ -32,6 +41,8 @@ each version onto its GitHub release page.
 - Keypresses are 80 ms, and the last digit of a code is heard before "beep beep beep" instead of being cut off.
 - Feature off tones are a full 2 seconds on the PC1832.
 - A force armed zone that's open when the exit delay ends is left out until it closes.
+- The entry-delay keypad piezo now stops when the external burglary siren takes over, and PC1832 section [018] option 5 (Keypad Buzzer Follows Bell) controls whether the keypad buzzer follows the bell.
+- On the PK5500 LCD keypad, the green Ready light turns off immediately when the exit delay begins and returns on disarm.
 
 ### Easier to use
 - A line under the keypad says what the panel is waiting for in each menu, like "type the zone as two digits".
