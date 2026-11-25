@@ -308,12 +308,68 @@ fn uniform_map() -> &'static [u8; 256] {
     })
 }
 
+/// Center-weighted 7x7 LBPH grid weights (Ahonen et al.): emphasize eyes,
+/// eyebrows, nose and mouth while down-weighting outer background corners.
+const CELL_WEIGHTS: [f32; GRID * GRID] = [
+    0.3, 0.6, 0.8, 0.8, 0.8, 0.6, 0.3,
+    0.5, 1.3, 1.8, 1.4, 1.8, 1.3, 0.5,
+    0.5, 1.5, 2.0, 1.6, 2.0, 1.5, 0.5,
+    0.4, 1.0, 1.4, 1.6, 1.4, 1.0, 0.4,
+    0.4, 0.9, 1.2, 1.3, 1.2, 0.9, 0.4,
+    0.3, 0.7, 1.3, 1.5, 1.3, 0.7, 0.3,
+    0.2, 0.4, 0.7, 0.8, 0.7, 0.4, 0.2,
+];
+
+/// Mild clipped histogram equalization on a 64x64 face crop so changing room
+/// lighting and webcam auto-exposure don't throw off LBP textures.
+fn equalize_face(crop: &mut [u8]) {
+    let n = crop.len();
+    if n == 0 {
+        return;
+    }
+    let mut hist = [0u32; 256];
+    for &v in crop.iter() {
+        hist[v as usize] += 1;
+    }
+    // Clip histogram peaks (CLAHE-style limit) to avoid amplifying flat noise.
+    let clip = ((n / 256) * 4).max(16) as u32;
+    let mut excess = 0u32;
+    for h in hist.iter_mut() {
+        if *h > clip {
+            excess += *h - clip;
+            *h = clip;
+        }
+    }
+    let add = excess / 256;
+    let rem = (excess % 256) as usize;
+    for (i, h) in hist.iter_mut().enumerate() {
+        *h += add + u32::from(i < rem);
+    }
+    let mut cdf = [0u32; 256];
+    let mut acc = 0u32;
+    let mut cdf_min = 0u32;
+    for i in 0..256 {
+        acc += hist[i];
+        cdf[i] = acc;
+        if cdf_min == 0 && acc > 0 {
+            cdf_min = acc;
+        }
+    }
+    let denom = (n as u32).saturating_sub(cdf_min).max(1) as f32;
+    for v in crop.iter_mut() {
+        let eq = (((cdf[*v as usize].saturating_sub(cdf_min)) as f32 / denom) * 255.0).clamp(0.0, 255.0);
+        // Blend 70% equalized + 30% original to keep natural shading cues.
+        *v = (eq * 0.70 + *v as f32 * 0.30).round().clamp(0.0, 255.0) as u8;
+    }
+}
+
 /// The LBP histogram fingerprint of a face, quantized to bytes.
 pub fn describe(gray: &[u8], w: usize, h: usize, r: &FaceRect) -> Option<Vec<u8>> {
-    if r.w < 24.0 || r.h < 24.0 {
+    if r.w < 20.0 || r.h < 20.0 {
         return None;
     }
-    let crop = frame::crop_resize(gray, w, h, r.x, r.y, r.w, r.h, FACE, FACE);
+    let mut crop = frame::crop_resize(gray, w, h, r.x, r.y, r.w, r.h, FACE, FACE);
+    equalize_face(&mut crop);
     let um = uniform_map();
     let s = FACE - 2;
     let mut codes = vec![0u8; s * s];
@@ -363,14 +419,21 @@ pub fn describe(gray: &[u8], w: usize, h: usize, r: &FaceRect) -> Option<Vec<u8>
 
 pub fn chi2(a: &[u8], b: &[u8]) -> f32 {
     let mut s = 0.0f32;
-    for (x, y) in a.iter().zip(b.iter()) {
-        let xa = *x as f32 / 255.0;
-        let ya = *y as f32 / 255.0;
-        let t = xa + ya;
-        if t > 1e-6 {
-            let d = xa - ya;
-            s += d * d / t;
+    let cells = (a.len().min(b.len())) / BINS;
+    for cell in 0..cells.min(CELL_WEIGHTS.len()) {
+        let w = CELL_WEIGHTS[cell];
+        let base = cell * BINS;
+        let mut cs = 0.0f32;
+        for k in 0..BINS {
+            let xa = a[base + k] as f32 / 255.0;
+            let ya = b[base + k] as f32 / 255.0;
+            let t = xa + ya;
+            if t > 1e-6 {
+                let d = xa - ya;
+                cs += d * d / t;
+            }
         }
+        s += cs * w;
     }
     s
 }
@@ -380,7 +443,7 @@ pub fn chi2(a: &[u8], b: &[u8]) -> f32 {
 pub fn threshold_for(samples: &[Vec<u8>]) -> f32 {
     let n = samples.len();
     if n < 4 {
-        return 34.0;
+        return 30.0;
     }
     let mut d = Vec::new();
     for i in 0..n {
@@ -396,12 +459,12 @@ pub fn threshold_for(samples: &[Vec<u8>]) -> f32 {
         }
     }
     if d.is_empty() {
-        return 34.0;
+        return 30.0;
     }
     d.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let med = d[d.len() / 2];
     let p90 = d[(d.len() * 9 / 10).min(d.len() - 1)];
-    (med * 1.45).max(p90 * 1.15).clamp(med * 1.2, med * 2.0)
+    (med * 1.48).max(p90 * 1.18).clamp(med * 1.25, med * 2.1).max(14.0)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]

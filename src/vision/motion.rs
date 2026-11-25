@@ -94,19 +94,26 @@ impl Motion {
 
         let mut sum = 0f64;
         let mut sq = 0f64;
-        for &v in &self.blur {
-            let f = v as f64;
+        let mut bg_sum = 0f64;
+        for i in 0..n {
+            let f = self.blur[i] as f64;
             sum += f;
             sq += f * f;
+            bg_sum += self.bg[i] as f64;
         }
         let mean = sum / n as f64;
+        let bg_mean = bg_sum / n as f64;
         let std = ((sq / n as f64) - mean * mean).max(0.0).sqrt();
+        // Compensate for gradual global brightness shifts (webcam auto-exposure,
+        // monitor glow, clouds passing a window) so lighting swings don't look like people.
+        let raw_delta = (mean - bg_mean) as f32;
+        let illum_shift = if raw_delta.abs() < 35.0 { raw_delta * 0.85 } else { 0.0 };
 
         let mut ns = 0f32;
         let mut nc = 0u32;
         let mut i = 0;
         while i < n {
-            let d = (self.blur[i] as f32 - self.bg[i]).abs();
+            let d = ((self.blur[i] as f32 - self.bg[i]) - illum_shift).abs();
             if d < 20.0 {
                 ns += d;
                 nc += 1;
@@ -116,12 +123,12 @@ impl Motion {
         if nc > 0 {
             self.noise = self.noise * 0.95 + (ns / nc as f32) * 0.05;
         }
-        let base = [34.0f32, 26.0, 19.0, 14.0, 10.0][(sensitivity.clamp(1, 5) - 1) as usize];
-        let thr = base + 1.8 * self.noise;
+        let base = [36.0f32, 28.0, 21.0, 15.0, 11.0][(sensitivity.clamp(1, 5) - 1) as usize];
+        let thr = base + 2.0 * self.noise;
 
         let mut count = 0usize;
         for i in 0..n {
-            let d = (self.blur[i] as f32 - self.bg[i]).abs();
+            let d = ((self.blur[i] as f32 - self.bg[i]) - illum_shift).abs();
             let on = d > thr && self.ignore[i] == 0;
             self.raw[i] = on as u8;
             if on {
@@ -129,8 +136,8 @@ impl Motion {
             }
         }
         let total = count as f32 / n as f32;
-        if total > 0.45 || self.settle > 0 {
-            let light = total > 0.45 && self.settle == 0;
+        if total > 0.42 || raw_delta.abs() >= 35.0 || self.settle > 0 {
+            let light = (total > 0.42 || raw_delta.abs() >= 35.0) && self.settle == 0;
             if self.settle > 0 {
                 self.settle -= 1;
             }
@@ -258,7 +265,7 @@ fn clean(raw: &[u8], w: usize, h: usize, out: &mut [u8]) {
                     n += raw[row + x + dx - 1] as u32;
                 }
             }
-            if n >= 4 {
+            if n >= 5 {
                 out[i] = 1;
             }
         }

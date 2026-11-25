@@ -1,6 +1,5 @@
-//! The two keypads, drawn entirely in code. They're original designs, built
-//! to match the controls of the panels they emulate exactly: the same keys,
-//! the same indicator lights and the same screen behaviour.
+//! The two keypads, drawn entirely in code with realistic glossy molded
+//! plastics, optical LCD depth, recessed LED lenses, and animated flip covers.
 
 pub mod classic;
 pub mod lcd;
@@ -56,15 +55,68 @@ fn key_id(k: Key) -> u32 {
     }
 }
 
-/// Mouse and keyboard input for the keypad.
-#[derive(Default)]
+/// Clicking the keypad takes focus away from any text box so the computer
+/// keyboard drives the keypad straight away.
+fn surrender_text_focus(ui: &egui::Ui) {
+    ui.memory_mut(|m| {
+        if let Some(id) = m.focused() {
+            m.surrender_focus(id);
+        }
+    });
+}
+
+/// Mouse, keyboard, and flip-cover animation state for the keypads.
 pub struct KeyInput {
     down: HashSet<Key>,
     kb_down: HashSet<Key>,
     flash: Vec<(Key, f64)>,
+    /// 0.0 = closed (right, over keys), 1.0 = open (swung left).
+    pub door_anim_1550: f32,
+    /// 0.0 = closed (up, over keys), 1.0 = open (flipped down).
+    pub door_anim_5500: f32,
+    doors_init: bool,
+}
+
+impl Default for KeyInput {
+    fn default() -> Self {
+        KeyInput {
+            down: HashSet::new(),
+            kb_down: HashSet::new(),
+            flash: Vec::new(),
+            door_anim_1550: 1.0,
+            door_anim_5500: 1.0,
+            doors_init: false,
+        }
+    }
 }
 
 impl KeyInput {
+    /// Smoothly advances the open/close cover animations toward the saved config.
+    pub fn sync_doors(&mut self, ctx: &egui::Context, open_1550: bool, open_5500: bool) {
+        let t1550 = if open_1550 { 1.0 } else { 0.0 };
+        let t5500 = if open_5500 { 1.0 } else { 0.0 };
+        if !self.doors_init {
+            self.door_anim_1550 = t1550;
+            self.door_anim_5500 = t5500;
+            self.doors_init = true;
+            return;
+        }
+        let dt = ctx.input(|i| i.unstable_dt).clamp(0.001, 0.05);
+        let speed = 1.0 - (-dt * 11.0).exp();
+        let mut moving = false;
+        for (cur, tgt) in [(&mut self.door_anim_1550, t1550), (&mut self.door_anim_5500, t5500)] {
+            if (*cur - tgt).abs() > 0.002 {
+                *cur += (tgt - *cur) * speed;
+                moving = true;
+            } else {
+                *cur = tgt;
+            }
+        }
+        if moving {
+            ctx.request_repaint();
+        }
+    }
+
     /// One on screen key. Returns true while it's held down.
     pub fn key(&mut self, ui: &mut egui::Ui, rect: Rect, key: Key, engine: &EngineHandle, audio: &AudioHandle) -> bool {
         let id = egui::Id::new(("roomguard-key", key_id(key)));
@@ -72,29 +124,41 @@ impl KeyInput {
             .interact(rect, id, egui::Sense::click_and_drag())
             .on_hover_cursor(egui::CursorIcon::PointingHand);
         let down = resp.is_pointer_button_down_on();
+        // A quick tap, or the click that also focuses the window, can deliver
+        // press and release in the same frame. Then `clicked()` is true but
+        // the button is never seen held, so handle that case explicitly.
+        let tapped = resp.clicked();
         let was = self.down.contains(&key);
+        let now = ui.input(|i| i.time);
         if down && !was {
             self.down.insert(key);
             engine.send(EngineMsg::Key { key, down: true });
             audio.send(AudioCmd::Click);
-        }
-        if !down && was {
+            surrender_text_focus(ui);
+            ui.ctx().request_repaint();
+        } else if !down && was {
             self.down.remove(&key);
             engine.send(EngineMsg::Key { key, down: false });
+            ui.ctx().request_repaint();
+        } else if tapped && !down && !was {
+            engine.send(EngineMsg::Key { key, down: true });
+            engine.send(EngineMsg::Key { key, down: false });
+            audio.send(AudioCmd::Click);
+            self.flash.push((key, now));
+            surrender_text_focus(ui);
+            ui.ctx().request_repaint();
         }
-        let now = ui.input(|i| i.time);
         self.flash.retain(|(_, t)| now - *t < 0.12);
         down || self.kb_down.contains(&key) || self.flash.iter().any(|(k, _)| *k == key)
     }
 
     /// Typing on the computer keyboard presses keypad keys, as long as no
-    /// text box has focus. Digits, * and # type; F, A and P are the
-    /// emergency keys (hold them); Enter or Esc is [#]; on the LCD keypad the
-    /// arrow keys scroll and F1 to F5 are Stay, Away, Chime, Reset and Exit.
-    pub fn keyboard(&mut self, ctx: &egui::Context, engine: &EngineHandle, model: Model) {
+    /// text box has focus. Returns true if any keypad key was pressed.
+    pub fn keyboard(&mut self, ctx: &egui::Context, engine: &EngineHandle, model: Model) -> bool {
         if ctx.memory(|m| m.focused().is_some()) {
-            return;
+            return false;
         }
+        let mut any = false;
         let (events, now) = ctx.input(|i| (i.events.clone(), i.time));
         for ev in events {
             match ev {
@@ -110,6 +174,7 @@ impl KeyInput {
                             engine.send(EngineMsg::Key { key: k, down: true });
                             engine.send(EngineMsg::Key { key: k, down: false });
                             self.flash.push((k, now));
+                            any = true;
                         }
                     }
                 }
@@ -135,6 +200,7 @@ impl KeyInput {
                     if let Some(k) = k {
                         if pressed {
                             self.kb_down.insert(k);
+                            any = true;
                         } else {
                             self.kb_down.remove(&k);
                         }
@@ -144,5 +210,6 @@ impl KeyInput {
                 _ => {}
             }
         }
+        any
     }
 }

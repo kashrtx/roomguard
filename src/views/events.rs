@@ -38,6 +38,7 @@ fn passes(filter: u8, k: EvKind) -> bool {
 impl EventsView {
     pub fn ui(&mut self, ui: &mut egui::Ui, view: &View, engine: &EngineHandle) {
         ui.label(theme::heading("History"));
+        ui.add_space(2.0);
         ui.horizontal_wrapped(|ui| {
             for (i, name) in ["All", "Alarms", "Arming", "Troubles", "Camera"].iter().enumerate() {
                 if ui.selectable_label(self.filter == i as u8, *name).clicked() {
@@ -52,18 +53,26 @@ impl EventsView {
             .max_height(h)
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                let row_w = ui.available_width();
                 let mut shown = 0;
                 for ev in view.events.iter().rev().filter(|e| passes(self.filter, e.kind)) {
                     shown += 1;
-                    ui.horizontal_top(|ui| {
-                        let (r, _) = ui.allocate_exact_size(egui::vec2(3.0, 30.0), egui::Sense::hover());
-                        ui.painter().rect_filled(r, 1.5, kind_color(ev.kind));
+                    let col = kind_color(ev.kind);
+                    let resp = ui.horizontal_top(|ui| {
+                        ui.add_space(10.0);
                         ui.vertical(|ui| {
-                            ui.label(RichText::new(&ev.text).color(theme::TEXT));
+                            ui.set_max_width((row_w - 14.0).max(100.0));
+                            ui.label(RichText::new(&ev.text).color(theme::TEXT).size(13.0));
                             ui.label(RichText::new(util::fmt_stamp(ev.ts)).size(11.0).color(theme::FAINT));
                         });
                     });
-                    ui.add_space(3.0);
+                    let r = resp.response.rect;
+                    let bar = egui::Rect::from_min_max(
+                        egui::pos2(r.left() + 1.0, r.top() + 2.0),
+                        egui::pos2(r.left() + 4.0, r.bottom() - 2.0),
+                    );
+                    ui.painter().rect_filled(bar, 1.5, col);
+                    ui.add_space(4.0);
                     if shown >= 400 {
                         break;
                     }
@@ -74,7 +83,7 @@ impl EventsView {
             });
         ui.horizontal(|ui| {
             if self.confirm_clear {
-                ui.label("Clear the whole history?");
+                ui.label("Clear history?");
                 if ui.small_button("Yes, clear it").clicked() {
                     engine.send(EngineMsg::ClearEvents);
                     self.confirm_clear = false;

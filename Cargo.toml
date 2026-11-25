@@ -1,11 +1,11 @@
 [package]
 name = "roomguard"
-version = "2.0.0"
+version = "2.1.0"
 edition = "2021"
 rust-version = "1.80"
 authors = ["Kaushal Bhingaradia"]
 license = "Apache-2.0"
-description = "A camera based room alarm with faithful DSC PC1550 and PowerSeries PC1832 keypad replicas."
+description = "A camera based room alarm with faithful RmG Classic PC1550 and GuardSeries PC1832 keypad replicas."
 readme = "README.md"
 build = "build.rs"
 
@@ -25,6 +25,7 @@ open = "5"
 qrcode = { version = "0.14", default-features = false }
 starship-battery = "0.10"
 self-replace = "1"
+tract-onnx = "0.21"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"

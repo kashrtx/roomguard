@@ -30,8 +30,8 @@ impl Model {
     }
     pub fn era(self) -> &'static str {
         match self {
-            Model::Pc1550 => "Classic LED keypad, 1990s",
-            Model::Pc1832 => "PowerSeries LCD keypad, 2000s",
+            Model::Pc1550 => "RmG Classic LED keypad, 1990s",
+            Model::Pc1832 => "GuardSeries LCD keypad, 2000s",
         }
     }
     pub fn file_key(self) -> &'static str {
@@ -76,10 +76,10 @@ impl SirenModel {
     }
     pub fn blurb(self) -> &'static str {
         match self {
-            SirenModel::Wave2F => "Square flush mount two tone siren, 106 dB",
-            SirenModel::MasterBlaster => "Motor driven siren, 1600 Hz, spins up and coasts down",
-            SirenModel::Rx7c => "Small chirping indoor piezo sounder, about 90 dB",
-            SirenModel::MotorBell => "Classic striker bell from 90s installs",
+            SirenModel::Wave2F => "Flush mount re-entrant horn siren, 106 dB (steady or warble/yelp)",
+            SirenModel::MasterBlaster => "120 dB cast-metal motor siren, 1640 Hz, spins up and coasts down",
+            SirenModel::Rx7c => "Piercing indoor ceramic piezo warble sounder, 90-106 dB",
+            SirenModel::MotorBell => "10-inch steel gong motor bell with metallic striker clatter",
         }
     }
 }
@@ -151,7 +151,10 @@ pub enum H24 {
     Sprinkler,
     Supervisory,
     SupervisoryBuzzer,
+    FireSupervisory,
     Tamper,
+    NonLatchTamper,
+    CarbonMonoxide,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -163,6 +166,11 @@ pub enum ZoneKind {
     Interior,
     StayAway,
     DelayStayAway,
+    InteriorDelay,
+    InstantStayAway,
+    NightZone,
+    DayZone,
+    NonAlarm,
     Fire,
     FireDelayed,
     H24(H24),
@@ -179,7 +187,7 @@ impl ZoneKind {
         matches!(self, ZoneKind::Fire | ZoneKind::FireDelayed | ZoneKind::H24(_))
     }
     pub fn is_stay_away(self) -> bool {
-        matches!(self, ZoneKind::StayAway | ZoneKind::DelayStayAway)
+        matches!(self, ZoneKind::StayAway | ZoneKind::DelayStayAway | ZoneKind::InstantStayAway | ZoneKind::NightZone)
     }
     pub fn short(self) -> &'static str {
         match self {
@@ -190,6 +198,11 @@ impl ZoneKind {
             ZoneKind::Interior => "Interior",
             ZoneKind::StayAway => "Stay/Away",
             ZoneKind::DelayStayAway => "Delay Stay/Away",
+            ZoneKind::InteriorDelay => "Interior/Delay",
+            ZoneKind::InstantStayAway => "Instant Stay/Away",
+            ZoneKind::NightZone => "Night zone",
+            ZoneKind::DayZone => "Day zone",
+            ZoneKind::NonAlarm => "24 hr non-alarm",
             ZoneKind::Fire => "Fire",
             ZoneKind::FireDelayed => "Delayed fire",
             ZoneKind::H24(h) => match h {
@@ -207,7 +220,10 @@ impl ZoneKind {
                 H24::Sprinkler => "24 hr sprinkler",
                 H24::Supervisory => "24 hr supervisory",
                 H24::SupervisoryBuzzer => "24 hr supv buzzer",
+                H24::FireSupervisory => "24 hr fire supv",
                 H24::Tamper => "24 hr tamper",
+                H24::NonLatchTamper => "24 hr tamper (nl)",
+                H24::CarbonMonoxide => "24 hr CO alarm",
             },
         }
     }
@@ -223,8 +239,9 @@ impl ZoneKind {
                 H24::Heat => AlarmKind::Heat,
                 H24::Water | H24::Sprinkler => AlarmKind::Water,
                 H24::Freeze => AlarmKind::Freeze,
-                H24::Supervisory | H24::SupervisoryBuzzer => AlarmKind::Supervisory,
-                H24::Tamper => AlarmKind::Tamper,
+                H24::Supervisory | H24::SupervisoryBuzzer | H24::FireSupervisory => AlarmKind::Supervisory,
+                H24::Tamper | H24::NonLatchTamper => AlarmKind::Tamper,
+                H24::CarbonMonoxide => AlarmKind::CarbonMonoxide,
                 H24::Burglary | H24::BellBuzzer | H24::Buzzer => AlarmKind::Burglary,
             },
             _ => AlarmKind::Burglary,
@@ -236,6 +253,7 @@ impl ZoneKind {
 pub enum AlarmKind {
     Burglary,
     Fire,
+    CarbonMonoxide,
     Panic,
     Medical,
     Duress,
@@ -254,6 +272,7 @@ impl AlarmKind {
         match self {
             AlarmKind::Burglary => "Burglary",
             AlarmKind::Fire => "Fire",
+            AlarmKind::CarbonMonoxide => "Carbon Monoxide",
             AlarmKind::Panic => "Panic",
             AlarmKind::Medical => "Medical",
             AlarmKind::Duress => "Duress",
@@ -272,6 +291,7 @@ impl AlarmKind {
         match self {
             AlarmKind::Burglary => 130,
             AlarmKind::Fire => 110,
+            AlarmKind::CarbonMonoxide => 162,
             AlarmKind::Panic => 120,
             AlarmKind::Medical => 100,
             AlarmKind::Duress => 121,
@@ -285,9 +305,12 @@ impl AlarmKind {
             AlarmKind::Supervisory => 200,
         }
     }
-    /// Fire style alarms pulse the bell; everything else sounds steady.
+    /// Fire style alarms pulse the bell; CO uses Temporal 4; everything else sounds steady.
     pub fn pulsed(self) -> bool {
         matches!(self, AlarmKind::Fire | AlarmKind::Heat)
+    }
+    pub fn is_co(self) -> bool {
+        matches!(self, AlarmKind::CarbonMonoxide)
     }
 }
 
@@ -314,6 +337,8 @@ pub struct ZoneView {
     pub tamper: bool,
     pub fault: bool,
     pub camera: bool,
+    /// Why a camera zone is open, when it's the camera itself: blocked or offline.
+    pub note: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

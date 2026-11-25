@@ -22,5 +22,15 @@ Face detection cascade (assets/cascade/lbp_frontalface.bin)
   the Apache License 2.0 (releases 4.5 and later) and the 3-clause BSD
   license (earlier releases).
 
+Body detection model (assets/models/person_det.onnx)
+  RTMDet-Nano person detector from OpenMMLab MMPose/MMDetection
+  (https://github.com/open-mmlab/mmpose), exported to ONNX.
+  Licensed under the Apache License 2.0.
+
+Body pose model (assets/models/body_pose.onnx)
+  RTMPose-Tiny (rtmpose-t_simcc-body7, 17 COCO keypoints) from OpenMMLab
+  MMPose (https://github.com/open-mmlab/mmpose), exported to ONNX.
+  Licensed under the Apache License 2.0.
+
 Rust crates used at build time are listed in Cargo.toml and keep their own
 licenses (MIT, Apache 2.0 or similar).

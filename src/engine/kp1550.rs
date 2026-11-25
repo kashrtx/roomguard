@@ -16,6 +16,7 @@ fn trouble_light(bit: u32) -> usize {
         tb::AC => 2,
         tb::BELL => 3,
         tb::FTC => 4,
+        tb::FIRE_LOOP => 5,
         tb::CLOCK => 6,
         _ => 0,
     }
@@ -94,7 +95,7 @@ impl Panel {
         match key {
             Key::Digit(1) => {
                 if self.armed.is_some() {
-                    self.reactivate_stay();
+                    self.reactivate_stay(now);
                     KpMode::Normal
                 } else if !disarmed {
                     self.error_tone();
@@ -107,11 +108,14 @@ impl Panel {
             }
             Key::Digit(2) => {
                 self.ack_troubles();
-                KpMode::Troubles { idx: 0, sub: false, mem: false }
+                KpMode::Troubles { idx: 0, sub: 0, mem: false }
             }
             Key::Digit(3) => KpMode::Memory { level: 0, idx: 0 },
             Key::Digit(4) => {
                 if self.ee.toggle(self.model, "14", 2) {
+                    if self.ee.toggle(self.model, "14", 4) {
+                        return KpMode::NeedCode { purpose: CodeFor::Download, buf: String::new() };
+                    }
                     self.beeps(3);
                     self.log(EvKind::Info, "Downloading call requested, but no computer is set up to answer");
                 } else {
@@ -122,6 +126,9 @@ impl Panel {
             Key::Digit(5) if disarmed => KpMode::NeedCode { purpose: CodeFor::UserCodes, buf: String::new() },
             Key::Digit(6) if disarmed => KpMode::NeedCode { purpose: CodeFor::UserFns, buf: String::new() },
             Key::Digit(7) => {
+                if self.ee.raw(self.model, "24") == "03" {
+                    return KpMode::NeedCode { purpose: CodeFor::CmdOut, buf: String::new() };
+                }
                 self.util_until = Some(now + Duration::from_secs(5));
                 self.sensor_reset(now);
                 KpMode::Normal
@@ -170,7 +177,8 @@ impl Panel {
             Key::Digit(d) if d >= 1 && (d as usize) <= self.n() => {
                 let z = d as usize;
                 let c = self.cfg(z);
-                if !c.bypassable || c.kind == ZoneKind::Null {
+                // PC1550 manual: Fire zones cannot be bypassed; 24-hr zones cannot be bypassed while violated.
+                if !c.bypassable || c.kind == ZoneKind::Null || (c.kind.is_24h() && self.violated(z)) {
                     self.error_tone();
                 } else {
                     let r = &mut self.zones[z - 1];
@@ -202,7 +210,7 @@ impl Panel {
         match key {
             Key::Digit(9) => {
                 self.key_beep();
-                KpMode::Troubles { idx: 0, sub: false, mem: !mem }
+                KpMode::Troubles { idx: 0, sub: 0, mem: !mem }
             }
             Key::Hash => {
                 self.key_beep();
@@ -211,7 +219,7 @@ impl Panel {
                 self.ack_troubles();
                 KpMode::Normal
             }
-            _ => KpMode::Troubles { idx: 0, sub: false, mem },
+            _ => KpMode::Troubles { idx: 0, sub: 0, mem },
         }
     }
 
@@ -485,6 +493,15 @@ impl Panel {
                 for (bit, _) in trouble_names(self.model) {
                     if bits & bit != 0 {
                         zone(&mut l, trouble_light(bit), Led::On);
+                    }
+                }
+                // A camera problem flashes the light of the zone that camera
+                // feeds, without hiding a real trouble on the same light.
+                if bits & (tb::ZONE_FAULT | tb::ZONE_TAMPER) != 0 {
+                    for z in 1..=self.n().min(6) {
+                        if self.camera_zone[z - 1] && l[4 + z] == Led::Off {
+                            zone(&mut l, z, Led::Flash);
+                        }
                     }
                 }
                 return l;

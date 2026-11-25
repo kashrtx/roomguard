@@ -148,13 +148,20 @@ impl Updater {
             self.set(UpdateState::NoRepo, ctx);
             return;
         };
+        // Never interrupt a download that's under way.
+        if matches!(self.state(), UpdateState::Downloading { .. }) {
+            return;
+        }
         self.set(UpdateState::Checking, ctx);
         let me = self.clone();
         let ctx = ctx.clone();
-        std::thread::spawn(move || match fetch_latest(repo) {
-            Ok(Some(rel)) => me.set(UpdateState::Available(rel), &ctx),
-            Ok(None) => me.set(UpdateState::UpToDate, &ctx),
-            Err(e) => me.set(UpdateState::Failed(e), &ctx),
+        std::thread::spawn(move || {
+            clean_leftovers();
+            match fetch_latest(repo) {
+                Ok(Some(rel)) => me.set(UpdateState::Available(rel), &ctx),
+                Ok(None) => me.set(UpdateState::UpToDate, &ctx),
+                Err(e) => me.set(UpdateState::Failed(e), &ctx),
+            }
         });
     }
 
@@ -212,6 +219,20 @@ impl Updater {
         }
         let dest: PathBuf = util::data_dir().join(format!("roomguard-update-{}", rel.version));
         self.download(url, &dest, ctx)?;
+        // Never swap in something that isn't a program. A captive portal or a
+        // proxy can answer with a web page instead of the file.
+        let head = {
+            let mut f = std::fs::File::open(&dest).map_err(|e| e.to_string())?;
+            let mut b = [0u8; 4];
+            let n = f.read(&mut b).map_err(|e| e.to_string())?;
+            b[..n].to_vec()
+        };
+        let size = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
+        let looks_right = if cfg!(windows) { head.starts_with(b"MZ") } else { head.starts_with(b"\x7fELF") };
+        if !looks_right || size < 1_000_000 {
+            let _ = std::fs::remove_file(&dest);
+            return Err("the download wasn't a RoomGuard program, so nothing was changed. Try again in a little while".to_string());
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -224,9 +245,22 @@ impl Updater {
     }
 }
 
-/// Starts a fresh copy of the (possibly just updated) program.
+/// Removes downloads left behind by an update that didn't finish.
+fn clean_leftovers() {
+    if let Ok(entries) = std::fs::read_dir(util::data_dir()) {
+        for e in entries.flatten() {
+            if e.file_name().to_string_lossy().starts_with("roomguard-update-") {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+}
+
+/// Starts a fresh copy of the (possibly just updated) program. It's marked
+/// as restarted, so it waits for this copy to close instead of deciding
+/// RoomGuard is already open.
 pub fn relaunch() {
     if let Ok(exe) = std::env::current_exe() {
-        let _ = std::process::Command::new(exe).spawn();
+        let _ = std::process::Command::new(exe).arg("--restarted").spawn();
     }
 }

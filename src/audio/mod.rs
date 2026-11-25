@@ -27,6 +27,7 @@ pub enum BellPattern {
     Steady,
     Pulsed,
     Temporal3,
+    Temporal4,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,7 +56,9 @@ pub struct ToneSeg {
 #[derive(Clone, Debug)]
 pub enum AudioCmd {
     Voice(KeypadVoice),
+    BuzzerLevel(u8),
     Sounder(Pattern),
+    KeyBeep,
     Beeps { count: u8, on_ms: u16, off_ms: u16 },
     Chime(ChimeKind),
     Bell(BellPattern),
@@ -100,6 +103,7 @@ pub fn start() -> AudioHandle {
 #[derive(Default)]
 struct State {
     voice: Option<AudioCmd>,
+    buzzer_level: Option<AudioCmd>,
     sounder: Option<AudioCmd>,
     bell: Option<AudioCmd>,
     siren: Option<AudioCmd>,
@@ -111,6 +115,7 @@ impl State {
     fn remember(&mut self, c: &AudioCmd) {
         let slot = match c {
             AudioCmd::Voice(_) => &mut self.voice,
+            AudioCmd::BuzzerLevel(_) => &mut self.buzzer_level,
             AudioCmd::Sounder(_) => &mut self.sounder,
             AudioCmd::Bell(_) => &mut self.bell,
             AudioCmd::Siren { .. } => &mut self.siren,
@@ -122,7 +127,7 @@ impl State {
     }
 
     fn replay(&self) -> Vec<AudioCmd> {
-        [&self.voice, &self.volumes, &self.siren, &self.sounder, &self.bell, &self.ring]
+        [&self.voice, &self.buzzer_level, &self.volumes, &self.siren, &self.sounder, &self.bell, &self.ring]
             .iter()
             .filter_map(|c| (*c).clone())
             .collect()

@@ -3,6 +3,46 @@
 Every release lists what changed. The release workflow copies the section for
 each version onto its GitHub release page.
 
+## [2.1.0] - 2026-11-25
+
+### Smoother, no more freezes
+- Saving now happens in the background. Before, every save forced a full flush to the disk on the window or panel thread, which antivirus or a synced folder could stall. That was the freezing, and it's why a keypress sometimes didn't beep until the second try.
+- The laptop battery is read on its own thread, so the panel's clock never waits on slow firmware.
+- Closing waits for the room map and every save to be written.
+- Two slow memory leaks are gone: font sizes from window resizing, and every chat photo staying loaded forever.
+- The sound engine no longer bogs down while it sits idle. Leftover numbers too tiny to hear made the CPU work dozens of times harder in every filter, which could cause crackles and late beeps.
+- The keypad's lights and screen now change the instant its key beeps, instead of up to a few frames later.
+
+### Body tracking that only sees people
+- Every frame gets a full look plus up to two zoomed looks where something moved, so people far across the room are found too.
+- The detector and the 17 joint skeleton have to agree, and nothing becomes a person until it's been seen clearly several times and has moved. Posters, photos and coats on hooks never count. Tested against real photos, including torso only, dark, blurred and noisy ones, and against a real bedroom full of clothes.
+- Ignored areas apply to bodies, so a person on a TV you've ignored isn't in the room.
+- The room zone works like a real motion detector: it follows people moving, so you can stand at the keypad, get a Ready light and arm.
+- The camera card shows whether body tracking is on and how long each look takes.
+
+### Closer to the real panels
+- Factory defaults now match the manuals. On the PC1832 that's sections [012], [013], [014], [015], [017], [018], [102], [105], [106], [199], [377], [380], [381] and [702], and on the PC1550 [29] and [36]. Panels saved by 2.0.0 get the fix once, and only for sections you never changed.
+- The zone attribute defaults follow the manual's table, so stay/away zones can be force armed like the real ones.
+- [*][1] while armed Stay brings the room back after the exit delay time, not instantly.
+- The PC1832 exit delay is silent when [014] option 6 is off, and a silent exit delay runs twice as long, up to 255 seconds.
+- [014] option 8 keeps the fire bell ringing past bell cut-off instead of changing its pattern.
+- Holding 1 to 5 for two seconds on the PowerSeries works like the function keys.
+- Holding F, A or P closes any open menu, and function keys inside a menu give the error tone.
+- Zones respect the loop response time: 500 ms on the PC1550, 400 ms on the PC1832, faster for fast zones.
+- Keypresses are 80 ms, and the last digit of a code is heard before "beep beep beep" instead of being cut off.
+- Feature off tones are a full 2 seconds on the PC1832.
+- A force armed zone that's open when the exit delay ends is left out until it closes.
+
+### Easier to use
+- A line under the keypad says what the panel is waiting for in each menu, like "type the zone as two digits".
+- Bypass zone numbers on the PC1832 are two digits, 02 for zone 2, like the real keypad.
+- A hidden Installer tab (tap the version in About five times) shows every programming section in plain English: current value, factory value, what each option does and the keys to change it.
+- Start over erases everything and restarts into the setup wizard.
+- Updates check that the download really is a program before installing it, and leftover downloads are cleaned up.
+- Only one copy of RoomGuard runs at a time. Opening it again brings the open window to the front, even when it's minimized. Restarting after an update or Start over still works, because the new copy waits for the old one to close.
+- Three wrong codes in a row save a snapshot of whoever is guessing, even with the keypad lockout off.
+- The PC1550 now shows camera troubles like the PC1832 does. Cover or unplug the webcam and the Trouble light comes on with two beeps every 10 seconds until you press #. In [*][2] the camera's zone light flashes, while the six real trouble lights keep their meanings. The status bar and zones list say whether the camera is blocked or offline.
+
 ## [2.0.0] - 2026-11-24
 
 A complete rewrite as a native desktop app in Rust for Windows, macOS and Linux.

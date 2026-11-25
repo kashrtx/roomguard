@@ -42,6 +42,7 @@ impl OperatorView {
             .auto_shrink([false, false])
             .stick_to_bottom(true)
             .show(ui, |ui| {
+                ui.set_max_width(ui.available_width());
                 if view.chat.is_empty() {
                     ui.label(theme::muted(format!(
                         "Nothing yet. When the panel reports an alarm, {} at RoomGuard Central messages you here and calls you to check that you're okay.",
@@ -54,7 +55,8 @@ impl OperatorView {
             });
         ui.horizontal(|ui| {
             if !view.notify_status.is_empty() {
-                ui.label(theme::muted(view.notify_status.clone()));
+                ui.add(egui::Label::new(theme::muted(view.notify_status.clone())).truncate())
+                    .on_hover_text(&view.notify_status);
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if !view.chat.is_empty() && ui.small_button("Clear").clicked() {
@@ -71,6 +73,7 @@ impl OperatorView {
                 CallState::Ringing => {
                     ui.label(RichText::new(format!("{} is calling", call.caller)).font(theme::semi(15.0)));
                     ui.label(theme::muted("They're calling about the alarm. Answer to talk to them."));
+                    ui.add_space(4.0);
                     ui.horizontal(|ui| {
                         if super::accent_button(ui, "Answer", theme::GREEN).clicked() {
                             engine.send(EngineMsg::Op(OpInput::Answer));
@@ -84,8 +87,9 @@ impl OperatorView {
                     let secs = ((util::now_ms() - call.since_ms).max(0) / 1000) as u64;
                     ui.label(RichText::new(format!("On a call with {}   {}:{:02}", call.caller, secs / 60, secs % 60)).font(theme::semi(14.0)));
                     if call.ask_passcode {
+                        ui.add_space(4.0);
                         ui.horizontal(|ui| {
-                            let r = ui.add(egui::TextEdit::singleline(&mut self.passcode).password(true).hint_text("Your passcode").desired_width(170.0));
+                            let r = ui.add(egui::TextEdit::singleline(&mut self.passcode).password(true).hint_text("Your passcode").desired_width(155.0));
                             let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                             if (ui.button("Tell them").clicked() || enter) && !self.passcode.trim().is_empty() {
                                 let word = std::mem::take(&mut self.passcode);
@@ -94,7 +98,8 @@ impl OperatorView {
                         });
                     }
                     if call.ask_dispatch {
-                        ui.horizontal(|ui| {
+                        ui.add_space(4.0);
+                        ui.horizontal_wrapped(|ui| {
                             if super::accent_button(ui, "Send help", theme::RED).clicked() {
                                 engine.send(EngineMsg::Op(OpInput::Dispatch(true)));
                             }
@@ -111,6 +116,12 @@ impl OperatorView {
     fn photo(&mut self, ctx: &egui::Context, path: &str) -> Option<egui::TextureHandle> {
         if let Some(t) = self.photos.get(path) {
             return t.clone();
+        }
+        // Each photo is a texture on the graphics card. A long chat history
+        // shouldn't keep every one of them loaded forever; the visible ones
+        // reload from disk in a moment.
+        if self.photos.len() >= 40 {
+            self.photos.clear();
         }
         let tex = std::fs::read(path).ok().and_then(|b| frame::decode_jpeg_file(&b)).map(|img| {
             let ci = egui::ColorImage::from_rgb([img.w, img.h], &img.data);
@@ -130,7 +141,7 @@ impl OperatorView {
             ChatFrom::Operator | ChatFrom::Me => {
                 let me = msg.from == ChatFrom::Me;
                 let layout = if me { egui::Layout::right_to_left(egui::Align::Min) } else { egui::Layout::left_to_right(egui::Align::Min) };
-                let max_w = ui.available_width() * 0.85;
+                let max_w = (ui.available_width() * 0.85).max(120.0);
                 let photo = msg.photo.as_ref().and_then(|p| self.photo(ui.ctx(), p));
                 ui.with_layout(layout, |ui| {
                     let fill = if me { Color32::from_rgb(0x2B, 0x4D, 0x3F) } else { theme::CARD_HI };
@@ -144,7 +155,7 @@ impl OperatorView {
                                 ui.label(RichText::new(&msg.text).color(theme::TEXT));
                                 if let Some(tex) = &photo {
                                     let size = tex.size_vec2();
-                                    let w = 230.0f32.min(size.x).min(max_w - 20.0).max(60.0);
+                                    let w = 220.0f32.min(size.x).min(max_w - 20.0).max(60.0);
                                     let h = w * size.y / size.x.max(1.0);
                                     ui.add(egui::Image::new((tex.id(), egui::vec2(w, h))).rounding(6.0));
                                 }

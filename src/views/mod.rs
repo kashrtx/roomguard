@@ -2,6 +2,7 @@
 
 pub mod camera;
 pub mod events;
+pub mod installer;
 pub mod operator;
 pub mod sensors;
 pub mod settings;
@@ -24,15 +25,14 @@ pub fn status_color(s: StatusKind) -> Color32 {
     }
 }
 
-/// A small coloured label, like a status chip.
+/// A small coloured label, like a status chip with consistent compact height.
 pub fn chip(ui: &mut egui::Ui, text: &str, color: Color32) {
-    egui::Frame::none()
-        .fill(color.gamma_multiply(0.18))
-        .rounding(egui::Rounding::same(9.0))
-        .inner_margin(egui::Margin::symmetric(7.0, 1.5))
-        .show(ui, |ui| {
-            ui.label(RichText::new(text).color(color).size(11.5));
-        });
+    let font = theme::semi(11.0);
+    let galley = ui.painter().layout_no_wrap(text.to_string(), font, color);
+    let size = galley.size() + egui::vec2(14.0, 5.0);
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    ui.painter().rect_filled(rect, egui::Rounding::same(9.0), color.gamma_multiply(0.18));
+    ui.painter().galley(rect.center() - galley.size() * 0.5, galley, color);
 }
 
 pub fn accent_button(ui: &mut egui::Ui, text: &str, color: Color32) -> egui::Response {

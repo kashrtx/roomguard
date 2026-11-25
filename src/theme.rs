@@ -40,15 +40,15 @@ pub fn install(ctx: &egui::Context) {
     v.extreme_bg_color = BG;
     v.faint_bg_color = CARD_HI;
     v.window_rounding = Rounding::same(10.0);
-    v.window_stroke = Stroke::new(1.0, LINE);
+    v.window_stroke = Stroke::new(1.0f32, LINE);
     v.override_text_color = Some(TEXT);
     v.hyperlink_color = BLUE;
     v.selection.bg_fill = Color32::from_rgb(0x2C, 0x5A, 0x44);
-    v.selection.stroke = Stroke::new(1.0, GREEN);
+    v.selection.stroke = Stroke::new(1.0f32, GREEN);
     v.widgets.noninteractive.bg_fill = CARD;
     v.widgets.noninteractive.weak_bg_fill = CARD;
-    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, LINE);
-    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT);
+    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0f32, LINE);
+    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0f32, TEXT);
     v.widgets.noninteractive.rounding = Rounding::same(6.0);
     for (w, fill) in [
         (&mut v.widgets.inactive, Color32::from_rgb(0x2E, 0x33, 0x39)),
@@ -58,8 +58,8 @@ pub fn install(ctx: &egui::Context) {
     ] {
         w.bg_fill = fill;
         w.weak_bg_fill = fill;
-        w.bg_stroke = Stroke::new(1.0, LINE);
-        w.fg_stroke = Stroke::new(1.0, TEXT);
+        w.bg_stroke = Stroke::new(1.0f32, LINE);
+        w.fg_stroke = Stroke::new(1.0f32, TEXT);
         w.rounding = Rounding::same(6.0);
     }
     style.visuals = v;
@@ -75,12 +75,20 @@ pub fn install(ctx: &egui::Context) {
     ctx.set_style(style);
 }
 
+/// Font sizes are rounded to the nearest half point. The keypads scale their
+/// lettering with the window, and every distinct size gets its own entry in
+/// the font cache that's never freed, so unrounded sizes slowly grow memory
+/// each time the window is resized. Half a point is invisible on screen.
+fn snap_size(size: f32) -> f32 {
+    ((size * 2.0).round() / 2.0).max(1.0)
+}
+
 pub fn semi(size: f32) -> FontId {
-    FontId::new(size, FontFamily::Name("semi".into()))
+    FontId::new(snap_size(size), FontFamily::Name("semi".into()))
 }
 
 pub fn regular(size: f32) -> FontId {
-    FontId::proportional(size)
+    FontId::proportional(snap_size(size))
 }
 
 pub fn heading(text: &str) -> egui::RichText {
@@ -96,6 +104,6 @@ pub fn card() -> egui::Frame {
     egui::Frame::none()
         .fill(CARD)
         .rounding(Rounding::same(10.0))
-        .stroke(Stroke::new(1.0, LINE))
+        .stroke(Stroke::new(1.0f32, LINE))
         .inner_margin(egui::Margin::same(12.0))
 }

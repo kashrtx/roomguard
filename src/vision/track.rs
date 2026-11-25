@@ -1,10 +1,15 @@
 //! Follows people from frame to frame.
 //!
-//! Motion pixels are grouped into blobs, and each person gets a track with a
-//! small Kalman filter that estimates where they are and how fast they move.
-//! When someone disappears, the filter's velocity says where they were going,
-//! and the prediction fades the speed out over about a second, because people
-//! slow down and turn rather than flying off in a straight line.
+//! Body detections (or, without body tracking, motion blobs) are matched to
+//! tracks, and each person gets a small Kalman filter that estimates where
+//! they are and how fast they move. When someone disappears, the filter's
+//! velocity says where they were going, and the prediction fades the speed
+//! out over about a second, because people slow down and turn rather than
+//! flying off in a straight line.
+//!
+//! A body track works like a good motion detector: it only counts as a person
+//! once it has been seen clearly several times AND has actually moved. A
+//! poster, a photo or a coat on a hook never moves, so it never becomes one.
 
 use std::collections::VecDeque;
 use std::time::Instant;
@@ -13,6 +18,10 @@ use std::time::Instant;
 const Q: f32 = 2.5;
 /// Measurement noise of a blob centre.
 const R: f32 = 0.0004;
+/// Share of a body's box that has to change for the body itself to be moving.
+pub const MOVE_FRAC: f32 = 0.05;
+/// Speed, in views per second, that counts as moving.
+const MOVE_SPEED: f32 = 0.12;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Blob {
@@ -21,6 +30,10 @@ pub struct Blob {
     pub w: f32,
     pub h: f32,
     pub px: u32,
+    /// 0 for a motion blob. For a body detection: 1 weak, 2 sure, 3 certain.
+    pub strength: u8,
+    /// Share of this box that moved in the current frame.
+    pub motion: f32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -82,6 +95,18 @@ pub struct Track {
     pub label: Option<String>,
     pub known: bool,
     pub travelled: f32,
+    /// Started from a body detection rather than raw motion.
+    pub body: bool,
+    /// Body sightings sure enough to count toward confirming this person.
+    pub sure_hits: u32,
+    pub last_sure: Instant,
+    /// Sightings where the body itself was moving.
+    pub moving_hits: u32,
+    /// The last time this person was seen moving, like a PIR detector.
+    pub last_moved: Instant,
+    origin: (f32, f32),
+    /// Furthest the body has gone from where it was first seen, in body widths.
+    pub shift: f32,
 }
 
 impl Track {
@@ -89,6 +114,7 @@ impl Track {
         let foot = (b.cx, b.cy + b.h * 0.5);
         let mut path = VecDeque::new();
         path.push_back(foot);
+        let moving = b.strength == 0 || b.motion >= MOVE_FRAC;
         Track {
             id,
             kx: Kf::new(b.cx),
@@ -105,7 +131,19 @@ impl Track {
             label: None,
             known: false,
             travelled: 0.0,
+            body: b.strength > 0,
+            sure_hits: if b.strength >= 2 { 1 } else { 0 },
+            last_sure: now,
+            moving_hits: if moving { 1 } else { 0 },
+            last_moved: now,
+            origin: (b.cx, b.cy),
+            shift: 0.0,
         }
+    }
+
+    /// Seen moving within the last `secs` seconds.
+    pub fn moved_within(&self, now: Instant, secs: f32) -> bool {
+        now.saturating_duration_since(self.last_moved).as_secs_f32() < secs
     }
 
     pub fn pos(&self) -> (f32, f32) {
@@ -172,11 +210,16 @@ pub struct Tracker {
     next_id: u32,
     pub finished: Vec<Finished>,
     last: Option<Instant>,
+    /// Sightings needed before a track counts as a person. Body detections
+    /// are already verified humans, so they need fewer than motion blobs.
+    pub confirm_hits: u32,
+    /// Fed body detections instead of motion blobs.
+    pub body_mode: bool,
 }
 
 impl Tracker {
     pub fn new() -> Self {
-        Tracker { tracks: Vec::new(), next_id: 1, finished: Vec::new(), last: None }
+        Tracker { tracks: Vec::new(), next_id: 1, finished: Vec::new(), last: None, confirm_hits: 5, body_mode: false }
     }
 
     pub fn clear(&mut self) {
@@ -213,6 +256,7 @@ impl Tracker {
         pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
         let mut t_used = vec![false; self.tracks.len()];
         let mut b_used = vec![false; blobs.len()];
+        let need_hits = self.confirm_hits.max(1);
         for (_, ti, bi) in pairs {
             if t_used[ti] || b_used[bi] {
                 continue;
@@ -229,13 +273,34 @@ impl Tracker {
             t.hits += 1;
             t.misses = 0;
             t.last_seen = now;
-            if t.hits >= 3 {
-                t.confirmed = true;
-            }
             let foot = t.foot();
             let dx = foot.0 - before.0;
             let dy = foot.1 - before.1;
             t.travelled += (dx * dx + dy * dy).sqrt();
+            if b.strength >= 2 {
+                t.sure_hits += 1;
+                t.last_sure = now;
+            }
+            if b.strength == 0 || b.motion >= MOVE_FRAC || t.speed() >= MOVE_SPEED {
+                t.moving_hits += 1;
+                t.last_moved = now;
+            }
+            let (cx, cy) = t.pos();
+            let d = ((cx - t.origin.0).powi(2) + (cy - t.origin.1).powi(2)).sqrt() / t.w.max(0.04);
+            t.shift = t.shift.max(d);
+            let alive = now.saturating_duration_since(t.born).as_secs_f32();
+            if t.body {
+                // A real person: seen clearly several times, and moving, either
+                // within their own outline or across the room. Nothing that
+                // just hangs there (a poster, a coat, a photo) ever qualifies.
+                if t.sure_hits >= need_hits && alive >= 0.25 && (t.moving_hits >= 2 || t.shift >= 0.35 || t.known) {
+                    t.confirmed = true;
+                }
+            } else if t.hits >= need_hits && alive >= 0.22 && (t.travelled >= 0.015 || t.known) {
+                // Motion only: sustained presence that actually travels,
+                // filtering out brief shadows, flickers and camera glitches.
+                t.confirmed = true;
+            }
             t.path.push_back(foot);
             if t.path.len() > 160 {
                 t.path.pop_front();
@@ -247,16 +312,28 @@ impl Tracker {
             }
         }
         for (bi, b) in blobs.iter().enumerate() {
-            if !b_used[bi] {
+            // A weak body sighting can keep a person going, never start one.
+            if !b_used[bi] && b.strength != 1 {
                 self.tracks.push(Track::new(self.next_id, b, now));
                 self.next_id = self.next_id.wrapping_add(1).max(1);
             }
         }
 
+        let body_mode = self.body_mode;
         let mut keep = Vec::with_capacity(self.tracks.len());
         for t in self.tracks.drain(..) {
-            let limit = if t.confirmed { 1.5 } else { 0.35 };
-            if t.unseen(now) > limit {
+            // Body detections arrive a few times a second rather than every
+            // frame, so body tracks get a little longer before they lapse.
+            let limit = match (body_mode, t.confirmed) {
+                (true, true) => 2.0,
+                (true, false) => 0.9,
+                (false, true) => 1.5,
+                (false, false) => 0.35,
+            };
+            // Weak sightings alone can't hold a body track for long, so a
+            // track can't drift onto a coat and stay there.
+            let stale = t.body && now.saturating_duration_since(t.last_sure).as_secs_f32() > 3.0;
+            if t.unseen(now) > limit || stale {
                 if t.confirmed {
                     self.finished.push(t.finish());
                 }
@@ -287,8 +364,9 @@ fn score(t: &Track, now: Instant) -> f32 {
     (t.w * t.h).sqrt() * fresh * unknown
 }
 
-/// Groups moving pixels into blobs, then merges pieces of the same person.
-pub fn find_blobs(mask: &[u8], w: usize, h: usize, min_px: u32) -> Vec<Blob> {
+/// Every group of moving pixels, merged when close, with no person-shape
+/// filter. The body tracker uses these to decide where to look closer.
+pub fn components(mask: &[u8], w: usize, h: usize, min_px: u32) -> Vec<Blob> {
     if w == 0 || h == 0 || mask.len() < w * h {
         return Vec::new();
     }
@@ -329,10 +407,34 @@ pub fn find_blobs(mask: &[u8], w: usize, h: usize, min_px: u32) -> Vec<Blob> {
                 w: (x1 - x0 + 1) as f32 / w as f32,
                 h: (y1 - y0 + 1) as f32 / h as f32,
                 px: n,
+                strength: 0,
+                motion: 1.0,
             });
         }
     }
     merge_close(out)
+}
+
+/// Groups moving pixels into blobs, then merges pieces of the same person.
+pub fn find_blobs(mask: &[u8], w: usize, h: usize, min_px: u32) -> Vec<Blob> {
+    let merged = components(mask, w, h, min_px);
+    let area_px = (w * h) as f32;
+    merged
+        .into_iter()
+        .filter(|b| {
+            // Person-shape filter: reject tiny flickers, flat horizontal bars (monitors/curtains/shadows),
+            // and sparse scattered noise clouds.
+            let bbox_px = (b.w * b.h * area_px).max(1.0);
+            let fill = b.px as f32 / bbox_px;
+            let aspect = b.h / b.w.max(0.01);
+            b.px >= min_px
+                && b.w >= 0.055
+                && b.h >= 0.11
+                && aspect >= 0.50
+                && aspect <= 4.8
+                && fill >= 0.16
+        })
+        .collect()
 }
 
 fn merge_close(mut v: Vec<Blob>) -> Vec<Blob> {
@@ -373,5 +475,13 @@ fn union(a: &Blob, b: &Blob) -> Blob {
     let x1 = (a.cx + a.w * 0.5).max(b.cx + b.w * 0.5);
     let y0 = (a.cy - a.h * 0.5).min(b.cy - b.h * 0.5);
     let y1 = (a.cy + a.h * 0.5).max(b.cy + b.h * 0.5);
-    Blob { cx: (x0 + x1) * 0.5, cy: (y0 + y1) * 0.5, w: x1 - x0, h: y1 - y0, px: a.px + b.px }
+    Blob {
+        cx: (x0 + x1) * 0.5,
+        cy: (y0 + y1) * 0.5,
+        w: x1 - x0,
+        h: y1 - y0,
+        px: a.px + b.px,
+        strength: a.strength.max(b.strength),
+        motion: a.motion.max(b.motion),
+    }
 }

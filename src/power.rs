@@ -1,6 +1,9 @@
 //! The computer's power state. Unplugging a laptop is the panel's AC
 //! failure, and a low battery while unplugged is its low battery trouble.
 
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
 use crate::util;
 
 #[derive(Clone, Copy, Debug)]
@@ -10,49 +13,71 @@ pub struct PowerState {
     pub percent: f32,
 }
 
+/// A desktop without a battery always reads as on AC power.
+const DESKTOP: PowerState = PowerState { on_ac: true, has_battery: false, percent: 1.0 };
+
+/// The battery is read on its own thread. On some laptops the query goes
+/// through slow firmware calls, and the panel's clock must never wait on it.
 pub struct Power {
-    manager: Option<starship_battery::Manager>,
+    latest: Arc<Mutex<Option<PowerState>>>,
 }
 
 impl Power {
     pub fn new() -> Power {
-        let manager = match starship_battery::Manager::new() {
-            Ok(m) => Some(m),
-            Err(e) => {
-                util::log(&format!("battery status unavailable: {}", e));
-                None
+        let latest = Arc::new(Mutex::new(None));
+        let shared = latest.clone();
+        let spawned = std::thread::Builder::new().name("power".into()).spawn(move || {
+            let manager = match starship_battery::Manager::new() {
+                Ok(m) => Some(m),
+                Err(e) => {
+                    util::log(&format!("battery status unavailable: {}", e));
+                    None
+                }
+            };
+            loop {
+                let st = read_now(manager.as_ref());
+                if let Ok(mut g) = shared.lock() {
+                    *g = Some(st);
+                }
+                std::thread::sleep(Duration::from_secs(4));
             }
-        };
-        Power { manager }
+        });
+        if let Err(e) = spawned {
+            util::log(&format!("could not start the power watcher: {}", e));
+        }
+        Power { latest }
     }
 
-    /// A desktop without a battery always reads as on AC power.
+    /// The newest reading, without waiting.
     pub fn read(&mut self) -> PowerState {
-        let desktop = PowerState { on_ac: true, has_battery: false, percent: 1.0 };
-        let Some(m) = self.manager.as_ref() else {
-            return desktop;
-        };
-        let batteries = match m.batteries() {
-            Ok(b) => b,
-            Err(_) => return desktop,
-        };
-        let mut any = false;
-        let mut discharging = false;
-        let mut sum = 0.0f32;
-        let mut count = 0.0f32;
-        for b in batteries.flatten() {
-            any = true;
-            sum += b.state_of_charge().get::<starship_battery::units::ratio::ratio>();
-            count += 1.0;
-            if b.state() == starship_battery::State::Discharging {
-                discharging = true;
-            }
-        }
-        if !any {
-            return desktop;
-        }
-        PowerState { on_ac: !discharging, has_battery: true, percent: if count > 0.0 { sum / count } else { 1.0 } }
+        self.latest.lock().ok().and_then(|g| *g).unwrap_or(DESKTOP)
     }
+}
+
+fn read_now(manager: Option<&starship_battery::Manager>) -> PowerState {
+    let Some(m) = manager else {
+        return DESKTOP;
+    };
+    let batteries = match m.batteries() {
+        Ok(b) => b,
+        Err(_) => return DESKTOP,
+    };
+    let mut any = false;
+    let mut discharging = false;
+    let mut sum = 0.0f32;
+    let mut count = 0.0f32;
+    for b in batteries.flatten() {
+        any = true;
+        sum += b.state_of_charge().get::<starship_battery::units::ratio::ratio>();
+        count += 1.0;
+        if b.state() == starship_battery::State::Discharging {
+            discharging = true;
+        }
+    }
+    if !any {
+        return DESKTOP;
+    }
+    PowerState { on_ac: !discharging, has_battery: true, percent: if count > 0.0 { sum / count } else { 1.0 } }
 }
 
 /// Keeps the computer from going to sleep while the system is armed, using

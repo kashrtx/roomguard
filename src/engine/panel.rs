@@ -26,6 +26,7 @@ pub mod tb {
     pub const ZONE_FAULT: u32 = 32;
     pub const ZONE_TAMPER: u32 = 64;
     pub const CLOCK: u32 = 128;
+    pub const FIRE_LOOP: u32 = 256;
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -56,6 +57,8 @@ pub struct ExitRt {
     pub how: ArmHow,
     pub user: u8,
     pub delay_seen: bool,
+    pub delay_closed: bool,
+    pub restarted: bool,
     pub silent: bool,
 }
 
@@ -67,6 +70,8 @@ pub struct ArmedRt {
     pub since: Instant,
     pub quick_exit: Option<Instant>,
     pub shunt_until: Option<Instant>,
+    /// [*][1] in Stay: when the Stay/Away zones come back.
+    pub reactivate_at: Option<Instant>,
 }
 
 #[derive(Clone, Debug)]
@@ -105,6 +110,10 @@ pub enum CodeFor {
     Keypad,
     NoEntry,
     Bypass,
+    Troubles,
+    Memory,
+    Download,
+    CmdOut,
     Arm(ArmHow),
 }
 
@@ -118,11 +127,22 @@ pub struct Prog {
     pub hex: bool,
     pub sub_for: Option<String>,
     pub reset_stage: u8,
+    pub confirm_action: Option<&'static str>,
 }
 
 impl Prog {
     pub fn new(keypad: bool) -> Prog {
-        Prog { keypad, section: None, sel: String::new(), pos: 0, work: Vec::new(), hex: false, sub_for: None, reset_stage: 0 }
+        Prog {
+            keypad,
+            section: None,
+            sel: String::new(),
+            pos: 0,
+            work: Vec::new(),
+            hex: false,
+            sub_for: None,
+            reset_stage: 0,
+            confirm_action: None,
+        }
     }
 }
 
@@ -132,7 +152,7 @@ pub enum KpMode {
     Star { idx: usize },
     NeedCode { purpose: CodeFor, buf: String },
     Bypass { buf: String, idx: usize },
-    Troubles { idx: usize, sub: bool, mem: bool },
+    Troubles { idx: usize, sub: u8, mem: bool },
     Memory { level: usize, idx: usize },
     UserCodes { slot: Option<String>, buf: String, idx: usize, attrs: bool },
     UserFn { item: Option<u8>, buf: String, idx: usize },
@@ -201,6 +221,7 @@ pub struct PanelSave {
     pub memory_flag: bool,
     pub events: Vec<EventRow>,
     pub last_bypass: Vec<u8>,
+    pub saved_bypass: Vec<u8>,
     pub clock_offset_ms: i64,
     pub brightness: u8,
     pub contrast: u8,
@@ -221,6 +242,7 @@ impl Default for PanelSave {
             memory_flag: false,
             events: Vec::new(),
             last_bypass: Vec::new(),
+            saved_bypass: Vec::new(),
             clock_offset_ms: 0,
             brightness: 7,
             contrast: 5,
@@ -279,6 +301,7 @@ pub struct Panel {
     pub temp_msg: Option<(String, String, Instant)>,
     pub lcd_scroll: i32,
     pub last_bypass: Vec<u8>,
+    pub saved_bypass: Vec<u8>,
     pub clock_offset_ms: i64,
     pub brightness: u8,
     pub contrast: u8,
@@ -353,6 +376,7 @@ impl Panel {
             temp_msg: None,
             lcd_scroll: 0,
             last_bypass: save.last_bypass,
+            saved_bypass: save.saved_bypass,
             clock_offset_ms: save.clock_offset_ms,
             brightness: save.brightness.min(9),
             contrast: save.contrast.min(9),
@@ -368,17 +392,14 @@ impl Panel {
         };
         // Like a real panel after a power cut, come back armed if it was armed.
         if let Some(a) = save.armed {
-            let shunt = match model {
-                Model::Pc1550 => p.ee.toggle(model, "32", 6),
-                Model::Pc1832 => true,
-            };
             p.armed = Some(ArmedRt {
                 mode: a.mode,
                 no_entry: a.no_entry,
                 user: a.user,
                 since: now,
                 quick_exit: None,
-                shunt_until: if shunt { Some(now + Duration::from_secs(60)) } else { None },
+                shunt_until: Some(now + Duration::from_secs(60)),
+                reactivate_at: None,
             });
             if a.mode == ArmMode::Stay {
                 for z in 1..=p.zones.len() {
@@ -391,6 +412,14 @@ impl Panel {
             let how = if save.clean_exit { "after a shutdown" } else { "after an unexpected shutdown" };
             p.log(EvKind::Arm, format!("Power restored while armed ({}), still armed", how));
             p.report(ReportKind::PowerUp, 305, 0, format!("System restarted while armed {}", how), 0);
+        }
+        // Panels saved by an earlier RoomGuard get the manual's real factory
+        // defaults for any section that was never changed by hand.
+        let fixed = p.ee.migrate(model);
+        if !fixed.is_empty() {
+            let plural = if fixed.len() == 1 { "" } else { "s" };
+            p.log(EvKind::Program, format!("Section{} {} updated to the manual's factory default{}", plural, fixed.join(", "), plural));
+            p.out.push(Out::Save);
         }
         p
     }
@@ -413,6 +442,7 @@ impl Panel {
             memory_flag: self.memory_flag,
             events: self.events.clone(),
             last_bypass: self.last_bypass.clone(),
+            saved_bypass: self.saved_bypass.clone(),
             clock_offset_ms: self.clock_offset_ms,
             brightness: self.brightness,
             contrast: self.contrast,
@@ -456,13 +486,21 @@ impl Panel {
         self.out.push(Out::Audio(c));
     }
     pub fn key_beep(&mut self) {
-        self.audio(AudioCmd::Beeps { count: 1, on_ms: 55, off_ms: 0 });
+        self.audio(AudioCmd::KeyBeep);
     }
+    /// Quick confirmation beeps, about 80 ms on and 80 ms off like the real
+    /// keypads ("beep beep beep" when a code or command is accepted).
     pub fn beeps(&mut self, n: u8) {
-        self.audio(AudioCmd::Beeps { count: n, on_ms: 70, off_ms: 70 });
+        self.audio(AudioCmd::Beeps { count: n, on_ms: 80, off_ms: 80 });
     }
+    /// A feature turning off. The PC1832 manual calls it "a steady 2-second
+    /// tone"; the PC1550 gives "one long beep".
     pub fn long_beep(&mut self) {
-        self.audio(AudioCmd::Beeps { count: 1, on_ms: 900, off_ms: 0 });
+        let ms = match self.model {
+            Model::Pc1550 => 1000,
+            Model::Pc1832 => 2000,
+        };
+        self.audio(AudioCmd::Beeps { count: 1, on_ms: ms, off_ms: 0 });
     }
     pub fn error_tone(&mut self) {
         let ms = match self.model {
@@ -487,8 +525,18 @@ impl Panel {
         self.dirty = true;
     }
 
+    pub fn comms_enabled(&self) -> bool {
+        match self.model {
+            Model::Pc1550 => !self.ee.toggle(self.model, "12", 1),
+            Model::Pc1832 => self.ee.toggle(self.model, "380", 1),
+        }
+    }
+
     pub fn report(&mut self, kind: ReportKind, cid: u16, zu: u16, text: String, delay_s: u32) -> u64 {
         self.next_report += 1;
+        if !self.comms_enabled() {
+            return self.next_report;
+        }
         let zone_label = if zu > 0 && matches!(kind, ReportKind::Alarm(_) | ReportKind::EntryStarted) {
             self.label(zu as usize)
         } else {
@@ -527,7 +575,7 @@ impl Panel {
     pub fn ready(&self) -> bool {
         for z in 1..=self.n() {
             let c = self.cfg(z);
-            if c.kind == ZoneKind::Null || c.kind.is_24h() || self.zones[z - 1].bypassed {
+            if c.kind == ZoneKind::Null || c.kind == ZoneKind::NonAlarm || c.kind.is_24h() || self.zones[z - 1].bypassed {
                 continue;
             }
             if c.force_arm && self.zones[z - 1].open {
@@ -603,14 +651,21 @@ impl Panel {
     pub fn swinger_limit(&self) -> u8 {
         match self.model {
             Model::Pc1550 => self.ee.entry_or(self.model, "15", 0, 3).min(99) as u8,
-            Model::Pc1832 => 3,
+            Model::Pc1832 => self.ee.entry_or(self.model, "377", 0, 3).min(99) as u8,
         }
     }
 
     pub fn tx_delay(&self) -> u32 {
         match self.model {
             Model::Pc1550 => self.ee.entry_or(self.model, "15", 1, 0),
-            Model::Pc1832 => 30,
+            Model::Pc1832 => self.ee.entry_or(self.model, "377", 3, 30),
+        }
+    }
+
+    pub fn ac_delay_mins(&self) -> u64 {
+        match self.model {
+            Model::Pc1550 => self.ee.entry_or(self.model, "17", 3, 30) as u64,
+            Model::Pc1832 => self.ee.entry_or(self.model, "377", 4, 30) as u64,
         }
     }
 
@@ -657,10 +712,17 @@ impl Panel {
             self.log(EvKind::Info, "Arming failed because a zone is open");
             return false;
         }
-        let silent = self.model == Model::Pc1832 && matches!(how, ArmHow::StayKey | ArmHow::NoEntry);
+        let audible_stay = self.model == Model::Pc1832 && self.ee.toggle(self.model, "022", 8);
+        let silent = self.model == Model::Pc1832
+            && !audible_stay
+            && matches!(how, ArmHow::StayKey | ArmHow::NoEntry);
         let mut secs = self.exit_secs();
-        if silent {
-            secs *= 2;
+        // PC1832 manual: "If the Exit Delay is silent (Section 14, Option 6 or
+        // Stay Function Key Arming), the exit delay must be twice the
+        // programmed value. It cannot, however, exceed 255 seconds."
+        let silent_exit = silent || (self.model == Model::Pc1832 && !self.ee.toggle(self.model, "014", 6));
+        if silent_exit {
+            secs = (secs * 2).min(255);
         }
         if how == ArmHow::Auto {
             secs = 0;
@@ -675,11 +737,29 @@ impl Panel {
         self.alarms.clear();
         self.entry = None;
         self.kp = KpMode::Normal;
-        self.exit = Some(ExitRt { started: now, dur: Duration::from_secs(secs), how, user, delay_seen: false, silent });
+        self.exit = Some(ExitRt {
+            started: now,
+            dur: Duration::from_secs(secs),
+            how,
+            user,
+            delay_seen: false,
+            delay_closed: false,
+            restarted: false,
+            silent,
+        });
         if self.model == Model::Pc1550 && how != ArmHow::Auto {
             self.beeps(6);
+        } else if self.model == Model::Pc1832 && how != ArmHow::Auto {
+            if self.ee.toggle(self.model, "381", 4) {
+                self.beeps(8);
+            } else {
+                self.beeps(3);
+            }
         }
-        if self.squawk_on() {
+        let user_squawk = self.model == Model::Pc1832
+            && user > 0
+            && (self.ee.attrs(&format!("{:02}", user)) & (1 << 6)) != 0;
+        if self.squawk_on() || user_squawk {
             self.squawk(1);
         }
         let what = match how {
@@ -730,6 +810,7 @@ impl Panel {
             since: now,
             quick_exit: None,
             shunt_until: None,
+            reactivate_at: None,
         });
         let text = match (mode, ex.how == ArmHow::NoEntry) {
             (ArmMode::Stay, true) => "Armed, no entry delay",
@@ -747,8 +828,14 @@ impl Panel {
             if !self.violated(z) || self.zones[z - 1].bypassed {
                 continue;
             }
-            let kind = self.cfg(z).kind;
+            let c = self.cfg(z);
+            let kind = c.kind;
             if kind.is_24h() || kind == ZoneKind::Null {
+                continue;
+            }
+            // A force armed zone that's still open is left out until it
+            // closes, then it works normally.
+            if c.force_arm && !kind.is_delay() {
                 continue;
             }
             if kind.is_delay() && self.entry.is_none() {
@@ -785,8 +872,16 @@ impl Panel {
                 }
             }
         }
-        if was_on && self.squawk_on() {
+        let user_squawk = self.model == Model::Pc1832
+            && user > 0
+            && (self.ee.attrs(&format!("{:02}", user)) & (1 << 6)) != 0;
+        if was_on && (self.squawk_on() || user_squawk) {
             self.squawk(2);
+        }
+        if had_alarm && self.model == Model::Pc1832 && self.ee.toggle(self.model, "381", 1) {
+            self.beeps(8);
+        } else if was_on {
+            self.beeps(3);
         }
         self.log(EvKind::Disarm, format!("Disarmed by {}", self.who(user)));
         self.report(ReportKind::Opening, 401, user as u16, format!("Opening by {}", self.who(user)), 0);
@@ -829,7 +924,12 @@ impl Panel {
         if self.alarms.iter().any(|a| a.kind == kind && a.zone == zone && !a.silenced) {
             return;
         }
-        let bell = Duration::from_secs(self.bell_minutes() * 60);
+        let mut bell = Duration::from_secs(self.bell_minutes() * 60);
+        // PC1832 [014] option 8, "Residential Fire Bell is Continuous": a fire
+        // alarm rings until it's silenced instead of stopping at bell cut-off.
+        if kind.pulsed() && self.model == Model::Pc1832 && self.ee.toggle(self.model, "014", 8) {
+            bell = Duration::from_secs(24 * 3600);
+        }
         let delay = if matches!(kind, AlarmKind::Burglary | AlarmKind::Tamper) && zone > 0 { self.tx_delay() } else { 0 };
         let where_ = if zone == 0 { "keypad".to_string() } else { format!("zone {} ({})", zone, self.label(zone as usize)) };
         let text = format!("{} alarm, {}", kind.label(), where_);
@@ -852,6 +952,7 @@ impl Panel {
         for a in self.alarms.iter_mut() {
             a.silenced = true;
         }
+        self.beeps(3);
         self.log(EvKind::Disarm, format!("Alarm silenced by {}", self.who(user)));
         self.out.push(Out::Disarmed { after_alarm: true });
         self.dirty = true;
@@ -869,26 +970,155 @@ impl Panel {
         }
     }
 
-    /// [*][1] while armed stay: bring the interior zones back.
-    pub fn reactivate_stay(&mut self) {
-        let mut any = false;
-        for z in self.zones.iter_mut() {
-            if z.auto_bypass {
-                z.bypassed = false;
-                z.auto_bypass = false;
-                any = true;
+    /// [*][1] while armed stay. The PC1832 switches to Away and "will add the
+    /// Stay/Away zones back into the system after the exit delay time
+    /// expires." The PC1550 does the same when its Home-Away zones have delay
+    /// (section [32] light 3, on from the factory: "the Bypass light will go
+    /// out after the delay"), and right away otherwise. Night zones and zones
+    /// you bypassed by hand stay bypassed.
+    pub fn reactivate_stay(&mut self, now: Instant) {
+        let any = (1..=self.n()).any(|z| self.zones[z - 1].auto_bypass && self.cfg(z).kind != ZoneKind::NightZone);
+        let delayed = match self.model {
+            Model::Pc1832 => true,
+            Model::Pc1550 => self.ee.toggle(self.model, "32", 3),
+        };
+        let secs = self.exit_secs();
+        if let Some(a) = self.armed.as_mut() {
+            a.mode = ArmMode::Away;
+            if any && delayed {
+                a.reactivate_at = Some(now + Duration::from_secs(secs));
+            }
+        }
+        if !any {
+            self.key_beep();
+        } else if delayed {
+            self.beeps(3);
+            self.log(EvKind::Arm, format!("Interior zones come back in {} seconds (night arming)", secs));
+        } else {
+            self.beeps(3);
+            self.finish_reactivate(now);
+        }
+        self.dirty = true;
+    }
+
+    fn finish_reactivate(&mut self, now: Instant) {
+        let mut back = Vec::new();
+        for z in 1..=self.n() {
+            if self.zones[z - 1].auto_bypass && self.cfg(z).kind != ZoneKind::NightZone {
+                self.zones[z - 1].bypassed = false;
+                self.zones[z - 1].auto_bypass = false;
+                back.push(z);
             }
         }
         if let Some(a) = self.armed.as_mut() {
-            a.mode = ArmMode::Away;
+            a.reactivate_at = None;
         }
-        if any {
-            self.beeps(3);
-            self.log(EvKind::Arm, "Interior zones activated (night arming)");
-        } else {
-            self.key_beep();
-        }
+        self.log(EvKind::Arm, "Interior zones active (night arming)");
         self.dirty = true;
+        // A zone that's already open when it comes back counts right away.
+        for z in back {
+            if self.violated(z) {
+                self.zone_tripped(z, now);
+            }
+        }
+    }
+
+    /// How long a zone has to stay open or closed before the panel believes
+    /// it. PC1550: zone definition digit 1 slow (section [17], 500 ms from
+    /// the factory) or fast (10 ms). PC1832: section [030], 400 ms normal or
+    /// 36 ms fast.
+    pub fn loop_response_ms(&self, z: usize) -> u64 {
+        match self.model {
+            Model::Pc1550 => {
+                let raw: Vec<char> = self.ee.raw(self.model, "11").chars().collect();
+                let d1 = raw.get(z.saturating_sub(1) * 2).and_then(|c| c.to_digit(16)).unwrap_or(0);
+                if d1 == 2 || d1 == 3 {
+                    10
+                } else {
+                    self.ee.entry_or(self.model, "17", 4, 50).max(1) as u64 * 10
+                }
+            }
+            Model::Pc1832 => {
+                if z <= 8 && self.ee.toggle(self.model, "030", z as u8) {
+                    36
+                } else {
+                    400
+                }
+            }
+        }
+    }
+
+    /// One line of plain help about what the keypad is waiting for, shown
+    /// under it. Empty when there's nothing to explain.
+    pub fn hint(&self) -> String {
+        let lcd = self.model == Model::Pc1832;
+        let text: &str = match &self.kp {
+            KpMode::Bypass { buf, .. } => {
+                if !lcd {
+                    "Zone bypass: press a zone number from 1 to 6. Its light turns on while it's bypassed. 9 brings back the last group, # when you're done."
+                } else if buf.is_empty() {
+                    "Zone bypass: type the zone as two digits, 02 for zone 2, or scroll with < > and press *. B means bypassed. # when you're done."
+                } else {
+                    "Zone bypass: now type the second digit of the zone number."
+                }
+            }
+            KpMode::Troubles { .. } => {
+                if lcd {
+                    "Trouble display: scroll with < > and press the number to see details. # goes back."
+                } else {
+                    "Trouble display: steady lights are troubles (1 battery, 2 AC power, 3 bell, 4 communication, 5 fire loop, 6 clock). A flashing light is a zone whose camera is blocked or offline. # goes back."
+                }
+            }
+            KpMode::Memory { .. } => {
+                if lcd {
+                    "Alarm memory: scroll with < > to see which zones went into alarm. # goes back."
+                } else {
+                    "Alarm memory: flashing zone lights went into alarm. Any digit shows older history, # goes back."
+                }
+            }
+            KpMode::NeedCode { .. } => "Enter your 4 digit code. # cancels.",
+            KpMode::UserCodes { .. } => {
+                if lcd {
+                    "Access codes: type the user number as two digits (40 is the master), then the new 4 digit code. * erases. # when you're done."
+                } else {
+                    "Access codes: press 1 to 6 for the code, then the new 4 digit code. **** erases it (not the master). # when you're done."
+                }
+            }
+            KpMode::UserFn { .. } => {
+                if lcd {
+                    "User functions: scroll with < > and press *, or press the number. # goes back."
+                } else {
+                    "User functions: 1 clock, 2 auto arm time, 4 quick arm, 5 auto arm, 6 door chime, 8 bell test, 0 installer test. # goes back."
+                }
+            }
+            KpMode::Program(_) => {
+                if lcd {
+                    "Installer programming: type a 3 digit section. # backs out. Settings has a plain English list of every section."
+                } else {
+                    "Installer programming: type a 2 digit section. Zone lights 1 to 4 show each digit in binary. # backs out. Settings lists every section."
+                }
+            }
+            KpMode::Star { .. } => {
+                if lcd {
+                    "Star menu: scroll with < > and press *, or press the command number. # goes back."
+                } else {
+                    "Star command: 1 bypass, 2 troubles, 3 memory, 5 codes, 6 user functions, 7 sensor reset, 8 installer, 9 no entry, 0 quick arm or exit."
+                }
+            }
+            KpMode::Normal => {
+                if self.entry.is_some() {
+                    "Entry delay: enter your code to disarm."
+                } else if self.exit.map_or(false, |e| e.how == ArmHow::StayKey || e.how == ArmHow::NoEntry) {
+                    "Exit delay: arming in Stay mode."
+                } else if self.exit.is_some() {
+                    "Exit delay: leave through the doorway to arm Away, or stay in the room and it arms in Stay mode."
+                } else {
+                    ""
+                }
+            }
+            _ => "Scroll with < >, # goes back.",
+        };
+        text.to_string()
     }
 
     pub fn quick_exit(&mut self, now: Instant) {
@@ -975,6 +1205,15 @@ impl Panel {
             self.bad_code(now);
             return;
         }
+        // PC1832 [021] Opt 1: Access code blocked during entry delay (unless disarmed or no entry)
+        if self.model == Model::Pc1832
+            && self.entry.is_some()
+            && self.ee.toggle(self.model, "021", 1)
+            && !eeprom::is_master(self.model, &self.ee, &slot)
+        {
+            self.error_tone();
+            return;
+        }
         self.bad_codes = 0;
         let user = eeprom::slot_user(&slot);
         if self.is_duress(&slot) {
@@ -987,14 +1226,32 @@ impl Panel {
             return;
         }
         if self.exit.is_some() || self.armed.is_some() {
+            // PC1832 [008] Maintenance code can arm, but cannot disarm unless in alarm.
+            if self.model == Model::Pc1832 && slot == "maint" && !self.alarm_sounding(now) {
+                self.error_tone();
+                self.temp("Code Not Valid", "To Disarm", 2000);
+                return;
+            }
+            let one_time = self.model == Model::Pc1832 && (self.ee.attrs(&slot) & (1 << 7)) != 0;
             self.disarm(user, now);
+            if one_time {
+                self.ee.clear_code(&slot);
+                self.log(EvKind::Program, format!("One-time code {} used and cleared", slot));
+                self.out.push(Out::Save);
+            }
             if self.entry.is_none() {
                 self.out.push(Out::LearnFace);
             }
         } else if self.alarms.iter().any(|a| !a.silenced) {
             self.silence(user);
         } else {
-            self.arm(ArmHow::Code, user, now);
+            let armed = self.arm(ArmHow::Code, user, now);
+            // PC1550 [13] Light 5: 6th user code is Maid's (one-time) code, erased after arming.
+            if armed && self.model == Model::Pc1550 && slot == "6" && self.ee.toggle(self.model, "13", 5) {
+                self.ee.clear_code("6");
+                self.log(EvKind::Program, "One-time code 6 used to arm and cleared");
+                self.out.push(Out::Save);
+            }
         }
     }
 
@@ -1010,6 +1267,10 @@ impl Panel {
             self.log(EvKind::Alarm, format!("Keypad lockout after {} wrong codes", count));
             self.report(ReportKind::Lockout, 461, 0, format!("{} wrong codes entered at the keypad", count), 0);
             self.out.push(Out::Snapshot("keypad-lockout".to_string()));
+        } else if self.bad_codes == 3 {
+            // RoomGuard's own touch, not the panel's: a photo of whoever is
+            // guessing, even with the keypad lockout off the way it ships.
+            self.out.push(Out::Snapshot("wrong-codes".to_string()));
         }
         self.dirty = true;
     }
@@ -1048,27 +1309,63 @@ impl Panel {
                     KpMode::Normal
                 }
             }
-            CodeFor::UserCodes | CodeFor::UserFns => match slot {
+            CodeFor::UserCodes => match slot {
                 Some(s) if eeprom::is_master(self.model, &self.ee, &s) => {
                     self.bad_codes = 0;
                     self.beeps(2);
-                    if purpose == CodeFor::UserCodes {
-                        KpMode::UserCodes { slot: None, buf: String::new(), idx: 0, attrs: false }
-                    } else {
-                        KpMode::UserFn { item: None, buf: String::new(), idx: 0 }
-                    }
+                    KpMode::UserCodes { slot: None, buf: String::new(), idx: 0, attrs: false }
                 }
                 _ => {
                     self.bad_code(now);
                     KpMode::Normal
                 }
             },
-            CodeFor::NoEntry | CodeFor::Bypass | CodeFor::Arm(_) => match slot {
+            CodeFor::UserFns => {
+                let allow_all = self.model == Model::Pc1832 && self.ee.toggle(self.model, "019", 7);
+                match slot {
+                    Some(s) if s != "inst" && (allow_all || eeprom::is_master(self.model, &self.ee, &s)) => {
+                        self.bad_codes = 0;
+                        self.beeps(2);
+                        KpMode::UserFn { item: None, buf: String::new(), idx: 0 }
+                    }
+                    _ => {
+                        self.bad_code(now);
+                        KpMode::Normal
+                    }
+                }
+            }
+            CodeFor::NoEntry | CodeFor::Bypass | CodeFor::Troubles | CodeFor::Memory | CodeFor::Download | CodeFor::CmdOut | CodeFor::Arm(_) => match slot {
                 Some(s) if s != "inst" => {
                     self.bad_codes = 0;
                     let user = eeprom::slot_user(&s);
                     match purpose {
-                        CodeFor::Bypass => KpMode::Bypass { buf: String::new(), idx: 0 },
+                        CodeFor::Bypass => {
+                            let allowed = self.model != Model::Pc1832
+                                || eeprom::is_master(self.model, &self.ee, &s)
+                                || (self.ee.attrs(&s) & (1 << 2)) != 0
+                                || self.ee.attrs(&s) == 0;
+                            if allowed {
+                                KpMode::Bypass { buf: String::new(), idx: 0 }
+                            } else {
+                                self.error_tone();
+                                KpMode::Normal
+                            }
+                        }
+                        CodeFor::Troubles => {
+                            self.ack_troubles();
+                            KpMode::Troubles { idx: 0, sub: 0, mem: false }
+                        }
+                        CodeFor::Memory => KpMode::Memory { level: 0, idx: 0 },
+                        CodeFor::Download => {
+                            self.beeps(3);
+                            self.log(EvKind::Info, "Downloading call requested, but no computer is set up to answer");
+                            KpMode::Normal
+                        }
+                        CodeFor::CmdOut => {
+                            self.util_until = Some(now + Duration::from_secs(5));
+                            self.sensor_reset(now);
+                            KpMode::Normal
+                        }
                         CodeFor::NoEntry => {
                             self.arm(ArmHow::NoEntry, user, now);
                             KpMode::Normal
@@ -1125,10 +1422,21 @@ impl Panel {
                     }
                     let code = std::mem::take(&mut p.sel);
                     if self.ee.code_matches("inst", &code) {
-                        p.reset_stage = 2;
+                        if p.confirm_action == Some("989") {
+                            p.reset_stage = 0;
+                            p.confirm_action = None;
+                            self.ee.set_code("40", "1234");
+                            self.beeps(6);
+                            self.temp("Master Code", "Reset to 1234", 2500);
+                            self.log(EvKind::Program, "Master code defaulted to 1234 ([989])");
+                            self.out.push(Out::Save);
+                        } else {
+                            p.reset_stage = 2;
+                        }
                     } else {
                         self.error_tone();
                         p.reset_stage = 0;
+                        p.confirm_action = None;
                     }
                     return KpMode::Program(p);
                 }
@@ -1137,16 +1445,39 @@ impl Panel {
                         return KpMode::Program(p);
                     }
                     let confirm = std::mem::take(&mut p.sel);
+                    let act = p.confirm_action.take();
                     p.reset_stage = 0;
-                    if confirm == "999" {
-                        self.factory_reset();
-                        return KpMode::Normal;
+                    if act == Some(confirm.as_str()) {
+                        match confirm.as_str() {
+                            "999" => {
+                                self.factory_reset();
+                                return KpMode::Normal;
+                            }
+                            "990" => {
+                                self.ee.installer_lockout = true;
+                                self.beeps(6);
+                                self.temp("Inst Lockout", "Enabled", 2500);
+                                self.log(EvKind::Program, "Installer's lockout enabled ([990])");
+                                self.out.push(Out::Save);
+                                return KpMode::Program(p);
+                            }
+                            "991" => {
+                                self.ee.installer_lockout = false;
+                                self.beeps(6);
+                                self.temp("Inst Lockout", "Disabled", 2500);
+                                self.log(EvKind::Program, "Installer's lockout disabled ([991])");
+                                self.out.push(Out::Save);
+                                return KpMode::Program(p);
+                            }
+                            _ => {}
+                        }
                     }
                     self.error_tone();
                     return KpMode::Program(p);
                 }
                 if let Some(parent) = p.sub_for.clone() {
-                    if p.sel.len() < 2 {
+                    let need = if parent == "000" { 1 } else { 2 };
+                    if p.sel.len() < need {
                         return KpMode::Program(p);
                     }
                     let key = format!("{}.{}", parent, p.sel);
@@ -1167,6 +1498,7 @@ impl Panel {
                     p.sel.clear();
                     p.sub_for = None;
                     p.reset_stage = 0;
+                    p.confirm_action = None;
                     return KpMode::Program(p);
                 }
                 self.exit_programming();
@@ -1199,9 +1531,52 @@ impl Panel {
                         self.factory_reset();
                         return KpMode::Normal;
                     }
+                    "900" => {
+                        self.beeps(3);
+                        self.temp("Panel Version", "0460 (v4.60)", 3500);
+                        self.log(EvKind::Program, "Panel version displayed: 0460 (v4.60)");
+                    }
+                    "901" => {
+                        self.walk_test = !self.walk_test;
+                        if self.walk_test {
+                            self.beeps(3);
+                            self.temp("Installer Walk", "Test Enabled", 2500);
+                            self.log(EvKind::Program, "Installer walk test enabled ([901])");
+                        } else {
+                            self.long_beep();
+                            self.temp("Installer Walk", "Test Disabled", 2500);
+                            self.log(EvKind::Program, "Installer walk test disabled ([901])");
+                        }
+                    }
+                    "902" => {
+                        self.beeps(3);
+                        self.temp("Module Superv.", "Reset Complete", 2500);
+                        self.log(EvKind::Program, "Module supervision reset ([902])");
+                    }
+                    "903" => {
+                        self.beeps(3);
+                        self.temp("Supervision", "01 PK5500 Keypad", 3500);
+                        self.log(EvKind::Program, "Supervision field viewed: Slot 01 PK5500");
+                    }
+                    "989" => {
+                        self.beeps(2);
+                        p.reset_stage = 1;
+                        p.confirm_action = Some("989");
+                    }
+                    "990" => {
+                        self.beeps(2);
+                        p.reset_stage = 1;
+                        p.confirm_action = Some("990");
+                    }
+                    "991" => {
+                        self.beeps(2);
+                        p.reset_stage = 1;
+                        p.confirm_action = Some("991");
+                    }
                     "999" => {
                         self.beeps(2);
                         p.reset_stage = 1;
+                        p.confirm_action = Some("999");
                     }
                     "90" => {
                         self.ee.installer_lockout = true;
@@ -1241,6 +1616,11 @@ impl Panel {
     }
 
     fn commit(&mut self, key: &str, work: &[char], kind: Kind) {
+        let prev = if self.model == Model::Pc1832 && key == "001" {
+            Some(self.ee.raw(self.model, "001"))
+        } else {
+            None
+        };
         match kind {
             Kind::Toggle(_) => {
                 let mut v: Vec<char> = work.to_vec();
@@ -1252,6 +1632,20 @@ impl Panel {
                 self.ee.sections.insert(key.to_string(), work.iter().collect());
             }
             _ => {}
+        }
+        // PC1832 manual: changing a zone's definition in [001] auto-defaults its [101]-[108] attributes.
+        if let Some(old) = prev {
+            let new_s: String = work.iter().collect();
+            for z in 1..=8usize {
+                let i = (z - 1) * 2;
+                let o = old.get(i..i + 2);
+                let n = new_s.get(i..i + 2);
+                if o != n {
+                    if let Some(code) = n.and_then(|s| s.parse::<u32>().ok()) {
+                        self.ee.sections.insert(format!("{:03}", 100 + z), Eeprom::default_zone_attrs(code).to_string());
+                    }
+                }
+            }
         }
         self.log(EvKind::Program, format!("Section [{}] programmed", key.trim_start_matches("kp")));
         self.dirty = true;
@@ -1493,10 +1887,15 @@ impl Panel {
         let zr = self.zones[z - 1];
         if self.walk_test && self.armed.is_none() && self.exit.is_none() {
             self.log(EvKind::Info, format!("Walk test: zone {} ({})", z, self.label(z)));
-            match self.model {
-                Model::Pc1550 => self.walk_burst_until = Some(now + Duration::from_secs(2)),
-                Model::Pc1832 => self.beeps(1),
-            }
+            self.walk_burst_until = Some(now + Duration::from_secs(2));
+            return;
+        }
+        if c.kind == ZoneKind::NonAlarm {
+            return;
+        }
+        if c.kind == ZoneKind::DayZone && self.armed.is_none() && self.exit.is_none() {
+            self.beeps(3);
+            self.log(EvKind::Trouble, format!("Day zone {} ({}) opened while disarmed", z, self.label(z)));
             return;
         }
         if c.kind.is_24h() {
@@ -1507,7 +1906,7 @@ impl Panel {
             let (audible, buzzer) = match c.kind {
                 ZoneKind::H24(H24::BellBuzzer) => (armed && c.audible, !armed),
                 ZoneKind::H24(H24::Buzzer) | ZoneKind::H24(H24::SupervisoryBuzzer) => (false, true),
-                ZoneKind::H24(H24::Supervisory) => (false, false),
+                ZoneKind::H24(H24::Supervisory) | ZoneKind::H24(H24::FireSupervisory) => (false, false),
                 _ => (c.audible, false),
             };
             self.trigger(c.kind.alarm_kind(), z as u8, audible, buzzer, now);
@@ -1518,7 +1917,22 @@ impl Panel {
         }
         if let Some(ex) = self.exit.as_mut() {
             if c.kind.is_delay() {
-                ex.delay_seen = true;
+                if self.model == Model::Pc1832
+                    && ex.delay_closed
+                    && !ex.restarted
+                    && self.ee.toggle(self.model, "018", 7)
+                {
+                    let secs = self.exit_secs();
+                    if let Some(ex2) = self.exit.as_mut() {
+                        ex2.started = now;
+                        ex2.dur = Duration::from_secs(secs);
+                        ex2.restarted = true;
+                        ex2.delay_closed = false;
+                    }
+                    self.log(EvKind::Arm, "Exit delay restarted");
+                } else {
+                    ex.delay_seen = true;
+                }
             }
             return;
         }
@@ -1538,7 +1952,8 @@ impl Panel {
             self.trigger(AlarmKind::Tamper, z as u8, c.audible, false, now);
         }
         let home_away_delay = self.model == Model::Pc1550 && c.kind == ZoneKind::StayAway && self.ee.toggle(self.model, "32", 3);
-        if c.kind.is_delay() || home_away_delay {
+        let interior_delay_stay = c.kind == ZoneKind::InteriorDelay && a.mode == ArmMode::Stay;
+        if c.kind.is_delay() || home_away_delay || interior_delay_stay {
             if a.no_entry {
                 self.trigger(AlarmKind::Burglary, z as u8, c.audible, false, now);
             } else if self.entry.is_none() && !self.alarms.iter().any(|al| !al.silenced && al.kind == AlarmKind::Burglary) {
@@ -1549,8 +1964,10 @@ impl Panel {
             return;
         }
         match c.kind {
-            ZoneKind::Instant => self.trigger(AlarmKind::Burglary, z as u8, c.audible, false, now),
-            ZoneKind::Interior | ZoneKind::StayAway => {
+            ZoneKind::Instant | ZoneKind::InstantStayAway | ZoneKind::DayZone => {
+                self.trigger(AlarmKind::Burglary, z as u8, c.audible, false, now);
+            }
+            ZoneKind::Interior | ZoneKind::StayAway | ZoneKind::InteriorDelay | ZoneKind::NightZone => {
                 if let Some(e) = self.entry.as_mut() {
                     if !e.followers.contains(&(z as u8)) {
                         e.followers.push(z as u8);
@@ -1564,9 +1981,14 @@ impl Panel {
     }
 
     fn zone_restored(&mut self, z: usize, now: Instant) {
-        // PowerSeries exit delay termination: once you're out and the door
-        // closes, the remaining exit time drops to five seconds.
         let is_delay = self.cfg(z).kind.is_delay();
+        if let Some(ex) = self.exit.as_mut() {
+            if is_delay && ex.delay_seen {
+                ex.delay_closed = true;
+            }
+        }
+        // GuardSeries exit delay termination: once you're out and the door
+        // closes, the remaining exit time drops to five seconds.
         if self.model == Model::Pc1832 && self.ee.toggle(self.model, "014", 7) {
             if let Some(ex) = self.exit.as_mut() {
                 if ex.delay_seen && ex.how != ArmHow::StayKey && is_delay {
@@ -1618,23 +2040,93 @@ impl Panel {
             Model::Pc1550 => self.press_1550(key, now),
             Model::Pc1832 => self.press_1832(key, now),
         }
+        // PowerSeries keypads: "These buttons can also be activated by
+        // pressing and holding numbers [1] through [5] respectively for 2
+        // seconds." Only the first digit of a code can start a hold.
+        if self.model == Model::Pc1832 && matches!(key, Key::Digit(1..=5)) && matches!(self.kp, KpMode::Normal) && self.buf.len() == 1 {
+            self.held = Some(HeldKey { key, since: now, fired: false });
+        }
     }
 
     fn hold_complete(&mut self, key: Key, now: Instant) {
         if key.is_emergency() {
             self.emergency(key, now);
+            // An emergency key cancels whatever menu was open.
+            if !self.is_programming() {
+                self.kp = KpMode::Normal;
+                self.buf.clear();
+            }
             return;
         }
+        // A held 1 to 5 on the PowerSeries is function key 1 to 5.
+        let key = match key {
+            Key::Digit(d) if self.model == Model::Pc1832 && (1..=5).contains(&d) => {
+                self.buf.clear();
+                match d {
+                    1 => Key::Stay,
+                    2 => Key::Away,
+                    3 => Key::Chime,
+                    4 => Key::Reset,
+                    _ => Key::Exit,
+                }
+            }
+            other => other,
+        };
+        // Function keys don't work inside a [*] menu; the keypad says so.
         if !matches!(self.kp, KpMode::Normal) {
+            self.error_tone();
             return;
         }
-        match key {
-            Key::Stay => self.fn_arm(ArmHow::StayKey, now),
-            Key::Away => self.fn_arm(ArmHow::AwayKey, now),
-            Key::Chime => self.toggle_chime(),
-            Key::Reset => self.sensor_reset(now),
-            Key::Exit => self.quick_exit(now),
-            _ => {}
+        let (fn_idx, default_code) = match key {
+            Key::Stay => (1u8, 3u32),
+            Key::Away => (2, 4),
+            Key::Chime => (3, 6),
+            Key::Reset => (4, 14),
+            Key::Exit => (5, 16),
+            _ => return,
+        };
+        let code = if self.model == Model::Pc1832 {
+            self.ee.entry_or(Model::Pc1832, &format!("000.{}", fn_idx), 0, default_code)
+        } else {
+            default_code
+        };
+        match code {
+            0 => {} // Null function key
+            3 => self.fn_arm(ArmHow::StayKey, now),
+            4 => self.fn_arm(ArmHow::AwayKey, now),
+            5 => {
+                if self.armed.is_none() && self.exit.is_none() {
+                    self.kp = KpMode::NeedCode { purpose: CodeFor::NoEntry, buf: String::new() };
+                } else {
+                    self.error_tone();
+                }
+            }
+            6 => self.toggle_chime(),
+            7 => self.system_test(now),
+            8 => {
+                if self.armed.is_none() && self.exit.is_none() {
+                    self.kp = KpMode::Bypass { buf: String::new(), idx: 0 };
+                } else {
+                    self.error_tone();
+                }
+            }
+            9 => {
+                self.ack_troubles();
+                self.kp = KpMode::Troubles { idx: 0, sub: 0, mem: false };
+            }
+            10 => {
+                self.kp = KpMode::Memory { level: 0, idx: 0 };
+            }
+            14 => self.sensor_reset(now),
+            16 => self.quick_exit(now),
+            17 => {
+                if self.armed.is_some() {
+                    self.reactivate_stay(now);
+                } else {
+                    self.error_tone();
+                }
+            }
+            _ => self.error_tone(),
         }
     }
 
@@ -1665,7 +2157,12 @@ impl Panel {
                     self.error_tone();
                     return;
                 }
-                self.audio(AudioCmd::Beeps { count: 10, on_ms: 50, off_ms: 50 });
+                let beeps_only = m == Model::Pc1832 && self.ee.toggle(m, "023", 1);
+                if beeps_only {
+                    self.beeps(3);
+                } else {
+                    self.audio(AudioCmd::Beeps { count: 10, on_ms: 50, off_ms: 50 });
+                }
                 self.trigger(AlarmKind::Fire, 0, true, false, now);
             }
             Key::Aux => {
@@ -1719,6 +2216,9 @@ impl Panel {
     // ----- the clock tick -----
 
     pub fn tick(&mut self, now: Instant, wall_ms: i64) {
+        if self.armed.map_or(false, |a| a.reactivate_at.map_or(false, |t| now >= t)) {
+            self.finish_reactivate(now);
+        }
         if let Some(h) = self.held {
             if !h.fired && now.saturating_duration_since(h.since).as_millis() >= self.model.hold_ms() {
                 self.held = Some(HeldKey { fired: true, ..h });
@@ -1792,10 +2292,23 @@ impl Panel {
         if i.ftc {
             t |= tb::FTC;
         }
+        if self.model == Model::Pc1550 {
+            let fire_trouble = (1..=self.n()).any(|z| {
+                self.cfg(z).kind.is_fire() && (self.zones[z - 1].fault || self.zones[z - 1].tamper)
+            });
+            if fire_trouble {
+                t |= tb::FIRE_LOOP;
+            }
+        }
         if self.model == Model::Pc1832 && i.net_watch && !i.net_ok {
             t |= tb::TLM;
         }
-        if self.model == Model::Pc1832 && i.cam_enabled {
+        // Both panels report a camera that's offline or covered. On the
+        // PowerSeries these are its real zone fault and tamper troubles. The
+        // PC1550 has no such troubles, so RoomGuard adds them: the Trouble
+        // light, the trouble beeps, and in [*][2] the camera's zone light
+        // flashes while the six real trouble lights keep their meanings.
+        if i.cam_enabled {
             if !i.cam_online {
                 t |= tb::ZONE_FAULT;
             }
@@ -1805,10 +2318,7 @@ impl Panel {
         }
         if t == self.troubles {
             if t & tb::AC != 0 && !self.ac_reported {
-                let delay_min: u64 = match self.model {
-                    Model::Pc1550 => self.ee.entry_or(self.model, "17", 3, 30) as u64,
-                    Model::Pc1832 => 30,
-                };
+                let delay_min = self.ac_delay_mins();
                 if self.ac_lost_at.map_or(false, |at| now.saturating_duration_since(at).as_secs() >= delay_min * 60) {
                     self.ac_reported = true;
                     self.report(ReportKind::Trouble, 301, 0, "AC power failure".to_string(), 0);
@@ -1840,10 +2350,15 @@ impl Panel {
             self.ac_lost_at = None;
             self.ac_reported = false;
         }
-        // New troubles start the trouble beeps again. AC loss stays quiet,
-        // like the real panels.
-        self.trouble_ack &= !(new & !tb::AC);
-        self.trouble_ack |= new & tb::AC;
+        // New troubles start the trouble beeps again. AC loss stays quiet unless
+        // PC1832 [018] Opt 8 (AC Trouble Beeps) is enabled.
+        let ac_beeps = self.model == Model::Pc1832 && self.ee.toggle(self.model, "018", 8);
+        if ac_beeps {
+            self.trouble_ack &= !new;
+        } else {
+            self.trouble_ack &= !(new & !tb::AC);
+            self.trouble_ack |= new & tb::AC;
+        }
         self.trouble_ack &= t;
         self.troubles = t;
         self.trouble_mem |= t;
@@ -1883,9 +2398,18 @@ impl Panel {
         if burg {
             return Pattern::Steady;
         }
+        if self.model == Model::Pc1832
+            && self.ee.toggle(self.model, "018", 5)
+            && self.bell_wanted(now) != BellPattern::Off
+        {
+            return Pattern::Steady;
+        }
         if let Some(e) = &self.entry {
             let left = (e.started + e.dur).saturating_duration_since(now).as_secs_f32();
-            let urgency = self.model == Model::Pc1550 && self.ee.toggle(self.model, "34", 4);
+            let urgency = match self.model {
+                Model::Pc1550 => self.ee.toggle(self.model, "34", 4),
+                Model::Pc1832 => true,
+            };
             if urgency && left <= 10.0 {
                 return Pattern::Beeps { on_ms: 250, off_ms: 250, count: 1, period_ms: 500 };
             }
@@ -1904,17 +2428,15 @@ impl Panel {
                     }
                 }
                 Model::Pc1832 => {
-                    if !ex.silent {
-                        let urgency = self.ee.toggle(self.model, "014", 6);
-                        if urgency && left <= 10.0 {
+                    // [014] option 6 "Audible Exit with Urgency" (on from the
+                    // factory): once a second, then three times a second for
+                    // the last ten. Off is "Silent Exit Delay". Stay key arming
+                    // stays silent unless [022] option 8 is on.
+                    if !ex.silent && self.ee.toggle(self.model, "014", 6) {
+                        if left <= 10.0 {
                             return Pattern::Beeps { on_ms: 90, off_ms: 0, count: 1, period_ms: 333 };
                         }
-                        let away = ex.how == ArmHow::AwayKey || ex.delay_seen || ex.how != ArmHow::StayKey;
-                        return if away {
-                            Pattern::Beeps { on_ms: 120, off_ms: 0, count: 1, period_ms: 1000 }
-                        } else {
-                            Pattern::Beeps { on_ms: 120, off_ms: 0, count: 1, period_ms: 3000 }
-                        };
+                        return Pattern::Beeps { on_ms: 100, off_ms: 0, count: 1, period_ms: 1000 };
                     }
                 }
             }
@@ -1923,7 +2445,8 @@ impl Panel {
             return Pattern::Steady;
         }
         let unacked = self.troubles & !self.trouble_ack;
-        if unacked != 0 && self.armed.is_none() && !self.is_programming() {
+        let silent_troubles = self.model == Model::Pc1832 && self.ee.toggle(self.model, "023", 7);
+        if unacked != 0 && !silent_troubles && self.armed.is_none() && !self.is_programming() {
             return Pattern::Beeps { on_ms: 100, off_ms: 120, count: 2, period_ms: 10_000 };
         }
         Pattern::Off
@@ -1934,6 +2457,7 @@ impl Panel {
             return BellPattern::Steady;
         }
         let mut fire = false;
+        let mut co = false;
         let mut burg = false;
         for a in self.live_alarms(now) {
             if !a.audible {
@@ -1941,15 +2465,34 @@ impl Panel {
             }
             if a.kind.pulsed() {
                 fire = true;
+            } else if a.kind.is_co() {
+                co = true;
             } else {
                 burg = true;
             }
         }
         if fire {
-            if self.model == Model::Pc1832 && self.ee.toggle(self.model, "013", 8) {
-                return BellPattern::Temporal3;
-            }
-            return BellPattern::Pulsed;
+            return match self.model {
+                Model::Pc1832 => {
+                    // [013] option 8: Temporal Three, otherwise standard pulsed.
+                    if self.ee.toggle(self.model, "013", 8) {
+                        BellPattern::Temporal3
+                    } else {
+                        BellPattern::Pulsed
+                    }
+                }
+                Model::Pc1550 => {
+                    // PC1550 [32] Light 6 ON = Standard Pulsed Fire, OFF = Temporal 3 Fire.
+                    if self.ee.toggle(self.model, "32", 6) {
+                        BellPattern::Pulsed
+                    } else {
+                        BellPattern::Temporal3
+                    }
+                }
+            };
+        }
+        if co {
+            return BellPattern::Temporal4;
         }
         if burg {
             return BellPattern::Steady;
@@ -2024,6 +2567,22 @@ impl Panel {
         })
     }
 
+    /// When a camera zone is open because of the camera itself. A real PC1550
+    /// has no zone tamper or fault trouble, so a covered camera shows on its
+    /// keypad as an open zone, exactly like a cut wire. This says why.
+    pub fn camera_note(&self, z: usize) -> &'static str {
+        let cam = self.camera_zone.get(z.wrapping_sub(1)).copied().unwrap_or(false);
+        if !cam || !self.inputs.cam_enabled {
+            ""
+        } else if self.inputs.cam_covered {
+            "Camera blocked"
+        } else if !self.inputs.cam_online {
+            "Camera offline"
+        } else {
+            ""
+        }
+    }
+
     pub fn zone_views(&self) -> Vec<ZoneView> {
         (1..=self.n())
             .map(|z| {
@@ -2038,6 +2597,7 @@ impl Panel {
                     tamper: r.tamper,
                     fault: r.fault,
                     camera: self.camera_zone.get(z - 1).copied().unwrap_or(false),
+                    note: self.camera_note(z).to_string(),
                 }
             })
             .collect()
@@ -2073,14 +2633,27 @@ impl Panel {
                 (ArmMode::Stay, false) => "Armed stay",
                 (ArmMode::Away, false) => "Armed away",
             };
-            let detail = if self.memory_flag { "An alarm happened while armed" } else { "Watching the room" };
+            let detail = if self.memory_flag {
+                "An alarm happened while armed"
+            } else if self.inputs.cam_enabled && self.inputs.cam_covered {
+                "The camera's view is blocked"
+            } else if self.inputs.cam_enabled && !self.inputs.cam_online {
+                "The camera stopped sending pictures"
+            } else {
+                "Watching the room"
+            };
             return (StatusKind::Armed, title.into(), detail.into());
         }
         let open = self.open_zones();
         if !open.is_empty() {
             let z = open[0] as usize;
             let more = if open.len() > 1 { format!(" and {} more", open.len() - 1) } else { String::new() };
-            return (StatusKind::NotReady, "Not ready".into(), format!("Zone {} {} is open{}", z, self.label(z), more));
+            let why = match self.camera_note(z) {
+                "Camera blocked" => " because the camera's view is blocked",
+                "Camera offline" => " because the camera stopped sending pictures",
+                _ => "",
+            };
+            return (StatusKind::NotReady, "Not ready".into(), format!("Zone {} {} is open{}{}", z, self.label(z), why, more));
         }
         let troubles = self.trouble_list();
         let detail = if !troubles.is_empty() {
@@ -2102,7 +2675,10 @@ pub fn trouble_names(model: Model) -> Vec<(u32, &'static str)> {
             (tb::AC, "AC failure"),
             (tb::BELL, "Bell circuit fuse"),
             (tb::FTC, "Failure to communicate"),
+            (tb::FIRE_LOOP, "Fire circuit trouble"),
             (tb::CLOCK, "Loss of time"),
+            (tb::ZONE_FAULT, "Camera offline"),
+            (tb::ZONE_TAMPER, "Camera view blocked"),
         ],
         Model::Pc1832 => vec![
             (tb::LOW_BATT, "Low battery"),
@@ -2124,6 +2700,7 @@ fn trouble_cid(bit: u32) -> u16 {
         tb::BELL => 321,
         tb::FTC => 354,
         tb::TLM => 351,
+        tb::FIRE_LOOP => 373,
         tb::ZONE_FAULT => 380,
         tb::ZONE_TAMPER => 383,
         _ => 300,

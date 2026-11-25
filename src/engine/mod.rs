@@ -77,6 +77,79 @@ pub struct View {
     pub programming: bool,
     pub notify_status: String,
     pub sim: [bool; 8],
+    /// Plain help about what the keypad is waiting for.
+    pub hint: String,
+    /// The panel's programming, for the installer view in Settings.
+    pub prog: Arc<ProgView>,
+}
+
+/// What the installer view in Settings shows: the panel's programming as it
+/// stands right now. It's rebuilt only when something in it changes.
+#[derive(Clone)]
+pub struct ProgView {
+    pub model: Model,
+    pub sections: std::collections::BTreeMap<String, String>,
+    pub installer_default: bool,
+    pub master_default: bool,
+    pub codes: Vec<String>,
+    pub chime: bool,
+    pub quick_arm: bool,
+    pub auto_arm: bool,
+    pub auto_arm_hm: Option<(u8, u8)>,
+    pub installer_lockout: bool,
+}
+
+impl Default for ProgView {
+    fn default() -> Self {
+        ProgView {
+            model: Model::Pc1832,
+            sections: std::collections::BTreeMap::new(),
+            installer_default: true,
+            master_default: true,
+            codes: Vec::new(),
+            chime: false,
+            quick_arm: false,
+            auto_arm: false,
+            auto_arm_hm: None,
+            installer_lockout: false,
+        }
+    }
+}
+
+fn prog_fingerprint(p: &Panel) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    p.model.file_key().hash(&mut h);
+    for (k, v) in &p.ee.sections {
+        k.hash(&mut h);
+        v.hash(&mut h);
+    }
+    for (k, c) in &p.ee.codes {
+        k.hash(&mut h);
+        c.hash.hash(&mut h);
+        c.attrs.hash(&mut h);
+    }
+    p.chime.hash(&mut h);
+    p.quick_arm.hash(&mut h);
+    p.auto_arm.hash(&mut h);
+    p.auto_arm_hm.hash(&mut h);
+    p.ee.installer_lockout.hash(&mut h);
+    h.finish()
+}
+
+fn prog_view(p: &Panel) -> ProgView {
+    ProgView {
+        model: p.model,
+        sections: p.ee.sections.clone(),
+        installer_default: p.ee.code_matches("inst", p.model.installer_default()),
+        master_default: p.ee.code_matches(master_slot(p.model), "1234"),
+        codes: p.ee.codes.iter().filter(|(_, c)| !c.hash.is_empty()).map(|(k, _)| k.clone()).collect(),
+        chime: p.chime,
+        quick_arm: p.quick_arm,
+        auto_arm: p.auto_arm,
+        auto_arm_hm: p.auto_arm_hm,
+        installer_lockout: p.ee.installer_lockout,
+    }
 }
 
 impl Default for View {
@@ -106,6 +179,8 @@ impl Default for View {
             programming: false,
             notify_status: String::new(),
             sim: [false; 8],
+            hint: String::new(),
+            prog: Arc::new(ProgView::default()),
         }
     }
 }
@@ -215,6 +290,11 @@ struct Engine {
     last_stranger: Option<Instant>,
     last_buzzer: u8,
     awake: crate::power::KeepAwake,
+    /// What each zone's sensor says right now (open, tamper, fault).
+    zone_want: [(bool, bool, bool); 8],
+    /// A change waiting out the zone's loop response time.
+    zone_pend: [Option<(bool, Instant)>; 8],
+    prog_cache: (u64, Arc<ProgView>),
 }
 
 impl Engine {
@@ -253,6 +333,9 @@ impl Engine {
             last_stranger: None,
             last_buzzer,
             awake: crate::power::KeepAwake::new(),
+            zone_want: [(false, false, false); 8],
+            zone_pend: [None; 8],
+            prog_cache: (0, Arc::new(ProgView::default())),
         };
         e.saved_events = e.panel.events_seq;
         e.push_settings();
@@ -264,11 +347,11 @@ impl Engine {
 
     fn push_volumes(&mut self) {
         let s = &self.cfg.sound;
-        let buzzer = if self.panel.model == Model::Pc1832 { self.panel.buzzer as f32 / 20.0 } else { 1.0 };
+        self.audio.send(AudioCmd::BuzzerLevel(if self.panel.model == Model::Pc1832 { self.panel.buzzer } else { 20 }));
         self.audio.send(AudioCmd::Volumes {
             master: s.master,
             siren: s.siren,
-            keypad: s.keypad * buzzer,
+            keypad: s.keypad,
             line: if s.line_audio { 0.35 } else { 0.0 },
         });
     }
@@ -321,7 +404,11 @@ impl Engine {
     fn handle(&mut self, msg: EngineMsg) -> bool {
         let now = Instant::now();
         match msg {
-            EngineMsg::Key { key, down } => self.panel.key(key, down, now),
+            EngineMsg::Key { key, down } => {
+                self.panel.key(key, down, now);
+                // Show the keypad's reaction right away, in step with its beep.
+                self.last_publish = None;
+            }
             EngineMsg::SimZone { zone, open } => {
                 let z = zone as usize;
                 if (1..=8).contains(&z) {
@@ -443,10 +530,10 @@ impl Engine {
     fn sync_zones(&mut self, now: Instant) {
         let enabled = self.cfg.camera.enabled;
         let has_door = self.cfg.camera.doorway.is_some();
-        for i in 0..2usize {
-            let z = i + 1;
-            let wired = enabled && (i == 0 || has_door);
-            let (open, tamper, fault) = if !wired {
+        let n = self.panel.n().min(8);
+        for i in 0..n {
+            let wired = i < 2 && enabled && (i == 0 || has_door);
+            self.zone_want[i] = if !wired {
                 (self.sim[i], false, false)
             } else {
                 let motion = self.cam_motion[i] || (i == 0 && self.door_open);
@@ -455,15 +542,37 @@ impl Engine {
                     Model::Pc1550 => (motion || self.cam_covered || !self.cam_online, false, false),
                 }
             };
-            let cur = self.panel.zones[i];
-            if cur.open != open || cur.tamper != tamper || cur.fault != fault {
-                self.panel.set_zone(z, open, tamper, fault, now);
-            }
         }
-        for z in 3..=self.panel.n() {
-            let open = self.sim[z - 1];
-            if self.panel.zones[z - 1].open != open {
-                self.panel.set_zone(z, open, false, false, now);
+        self.settle_zones(now);
+    }
+
+    /// Hands zone changes to the panel the way its zone inputs would: a zone
+    /// has to stay open, or closed, for the programmed loop response time
+    /// before the panel believes it (PC1550 500 ms from section [17], or 10
+    /// ms for fast zones; PC1832 400 ms, or 36 ms for fast zones in [030]).
+    /// Tampers and faults go straight through, the camera already debounces
+    /// those over several seconds.
+    fn settle_zones(&mut self, now: Instant) {
+        let n = self.panel.n().min(8);
+        for i in 0..n {
+            let z = i + 1;
+            let (open, tamper, fault) = self.zone_want[i];
+            let cur = self.panel.zones[i];
+            if cur.tamper != tamper || cur.fault != fault {
+                self.panel.set_zone(z, cur.open, tamper, fault, now);
+            }
+            if cur.open == open {
+                self.zone_pend[i] = None;
+                continue;
+            }
+            match self.zone_pend[i] {
+                Some((want, since)) if want == open => {
+                    if now.saturating_duration_since(since).as_millis() as u64 >= self.panel.loop_response_ms(z) {
+                        self.zone_pend[i] = None;
+                        self.panel.set_zone(z, open, tamper, fault, now);
+                    }
+                }
+                _ => self.zone_pend[i] = Some((open, now)),
             }
         }
     }
@@ -498,9 +607,12 @@ impl Engine {
         }
         let model_changed = new.model != self.panel.model;
         let cam_changed = new.camera != self.cfg.camera;
+        let sound_changed = new.sound != self.cfg.sound;
+        let op_changed = new.operator != self.cfg.operator;
         self.cfg = new;
         if model_changed {
             self.save(true);
+            self.zone_pend = [None; 8];
             self.panel = load_panel(self.cfg.model, &self.cfg, now);
             self.last_buzzer = self.panel.buzzer;
             self.last_power = None;
@@ -510,9 +622,31 @@ impl Engine {
         }
         if cam_changed {
             self.grace_until = now + Duration::from_secs(10);
+            self.cam.send(CamCmd::Config(Box::new(self.cfg.camera.clone())));
         }
-        self.push_settings();
-        self.sync_zones(now);
+        if sound_changed || model_changed {
+            self.push_volumes();
+            self.audio.send(AudioCmd::Siren { model: self.cfg.sound.siren_model, warble: self.cfg.sound.wave2_warble });
+            self.audio.send(AudioCmd::Voice(voice_for(self.panel.model)));
+        }
+        if op_changed {
+            self.notify.config(&self.cfg.operator);
+        }
+        let name = self.cfg.display_name();
+        self.panel.labels = self.cfg.labels(self.panel.model).clone();
+        self.panel.owner = name.clone();
+        self.op.owner = name;
+        self.panel.face_disarm = self.cfg.camera.faces && self.cfg.camera.face_disarm;
+        self.panel.inputs.cam_enabled = self.cfg.camera.enabled;
+        self.panel.inputs.cam_online = self.cam_online;
+        self.panel.inputs.cam_covered = self.cam_covered;
+        self.panel.inputs.net_watch = self.cfg.operator.phone_alerts;
+        let cam = self.cfg.camera.enabled;
+        self.panel.camera_zone = [cam, cam && self.cfg.camera.doorway.is_some(), false, false, false, false, false, false];
+        self.panel.dirty = true;
+        if cam_changed || model_changed {
+            self.sync_zones(now);
+        }
     }
 
     fn dial_info(&self, r: &Report) -> DialInfo {
@@ -564,7 +698,8 @@ impl Engine {
     fn tick(&mut self) {
         let now = Instant::now();
         let wall = util::now_ms();
-        if self.last_power.map_or(true, |t| now.saturating_duration_since(t).as_secs() >= 5) {
+        // Reading the cached battery state is instant, so it can be checked often.
+        if self.last_power.map_or(true, |t| now.saturating_duration_since(t).as_millis() >= 1000) {
             self.last_power = Some(now);
             let st = self.power.read();
             self.panel.inputs.ac_ok = st.on_ac;
@@ -575,6 +710,7 @@ impl Engine {
             self.last_cam_check = now;
             self.check_camera(now);
         }
+        self.settle_zones(now);
         self.panel.tick(now, wall);
         if self.panel.buzzer != self.last_buzzer {
             self.last_buzzer = self.panel.buzzer;
@@ -648,6 +784,10 @@ impl Engine {
         if self.chat_cache.0 != self.op.seq {
             self.chat_cache = (self.op.seq, Arc::new(self.op.chat.clone()));
         }
+        let fp = prog_fingerprint(&self.panel);
+        if self.prog_cache.0 != fp {
+            self.prog_cache = (fp, Arc::new(prog_view(&self.panel)));
+        }
         let p = &self.panel;
         let (status, title, detail) = p.status(now);
         let (lcd, lcd_cursor) = if p.model == Model::Pc1832 {
@@ -663,7 +803,11 @@ impl Engine {
             lcd,
             lcd_cursor,
             lcd_leds: if p.model == Model::Pc1832 { p.leds_5500(now) } else { [Led::Off; 4] },
-            backlight: p.brightness as f32 / 9.0,
+            backlight: if p.model == Model::Pc1832 && !p.ee.toggle(Model::Pc1832, "016", 5) {
+                0.0
+            } else {
+                p.brightness as f32 / 9.0
+            },
             contrast: p.contrast as f32 / 9.0,
             all_on: p.all_on(now),
             status,
@@ -681,6 +825,8 @@ impl Engine {
             programming: p.is_programming(),
             notify_status: self.notify_status.clone(),
             sim: self.sim,
+            hint: p.hint(),
+            prog: self.prog_cache.1.clone(),
         };
         if let Ok(mut v) = self.view.lock() {
             *v = Arc::new(view);

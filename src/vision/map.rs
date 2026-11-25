@@ -131,7 +131,7 @@ impl RoomMap {
 
     /// Learns from a finished walk through the room.
     pub fn learn(&mut self, f: &Finished) {
-        if f.secs < 0.8 || f.path.len() < 6 {
+        if f.secs < 0.6 || f.path.len() < 5 {
             return;
         }
         self.ensure();
@@ -445,7 +445,7 @@ impl DoorWatch {
         let still = *self.still_since.get_or_insert(now);
         let patch = signature(gray, w, h, rect)?;
         if self.reference.is_none() {
-            if now.saturating_duration_since(still).as_secs_f32() > 6.0 {
+            if now.saturating_duration_since(still).as_secs_f32() > 4.0 {
                 self.reference = Some(patch);
                 self.learned = true;
                 self.open = false;

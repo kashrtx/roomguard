@@ -4,6 +4,7 @@
 //! fair way to try RoomGuard without a webcam.
 
 use super::frame::Rgb;
+use super::pose::Person;
 
 const W: usize = 640;
 const H: usize = 480;
@@ -53,6 +54,44 @@ pub fn walker(t: f32) -> Option<(f32, f32)> {
     } else {
         None
     }
+}
+
+/// The visitor as the body tracker would see them: a person box with a full
+/// 17-joint walking skeleton matching the drawn figure.
+pub fn people(t: f32) -> Vec<Person> {
+    let Some((x, f)) = walker(t) else {
+        return Vec::new();
+    };
+    let swing = (t * 7.0).sin() * 9.0;
+    let (wf, hf) = (W as f32, H as f32);
+    let j = |dx: f32, dy: f32| ((x + dx) / wf, (f + dy) / hf, 0.9f32);
+    let kp = [
+        j(0.0, -200.0),
+        j(-6.0, -207.0),
+        j(6.0, -207.0),
+        j(-18.0, -204.0),
+        j(18.0, -204.0),
+        j(-24.0, -176.0),
+        j(24.0, -176.0),
+        j(-27.0, -142.0),
+        j(27.0, -142.0),
+        j(-27.0, -112.0),
+        j(27.0, -112.0),
+        j(-11.0, -90.0),
+        j(11.0, -90.0),
+        j(-9.0 + swing * 0.4, -46.0),
+        j(9.0 - swing * 0.4, -46.0),
+        j(-9.0 + swing * 0.75, -4.0),
+        j(9.0 - swing * 0.75, -4.0),
+    ];
+    vec![Person {
+        x0: (x - 31.0) / wf,
+        y0: (f - 226.0) / hf,
+        x1: (x + 31.0) / wf,
+        y1: f / hf,
+        score: 0.9,
+        kp,
+    }]
 }
 
 pub fn scene(t: f32) -> Rgb {

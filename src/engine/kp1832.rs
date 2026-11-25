@@ -165,24 +165,34 @@ impl Panel {
         match d {
             1 => {
                 if self.armed.is_some() {
-                    self.reactivate_stay();
+                    self.reactivate_stay(now);
                     return KpMode::Normal;
                 }
                 if !disarmed {
                     self.error_tone();
                     return KpMode::Normal;
                 }
-                if self.ee.toggle(self.model, "015", 5) {
+                if self.ee.toggle(self.model, "015", 5) || self.ee.toggle(self.model, "022", 1) {
                     KpMode::NeedCode { purpose: CodeFor::Bypass, buf: String::new() }
                 } else {
                     KpMode::Bypass { buf: String::new(), idx: 0 }
                 }
             }
             2 => {
-                self.ack_troubles();
-                KpMode::Troubles { idx: 0, sub: false, mem: false }
+                if self.ee.toggle(self.model, "022", 1) {
+                    KpMode::NeedCode { purpose: CodeFor::Troubles, buf: String::new() }
+                } else {
+                    self.ack_troubles();
+                    KpMode::Troubles { idx: 0, sub: 0, mem: false }
+                }
             }
-            3 => KpMode::Memory { level: 0, idx: 0 },
+            3 => {
+                if self.ee.toggle(self.model, "022", 1) {
+                    KpMode::NeedCode { purpose: CodeFor::Memory, buf: String::new() }
+                } else {
+                    KpMode::Memory { level: 0, idx: 0 }
+                }
+            }
             4 => {
                 self.toggle_chime();
                 KpMode::Normal
@@ -264,6 +274,37 @@ impl Panel {
                         }
                         KpMode::Bypass { buf: String::new(), idx }
                     }
+                    95 => {
+                        let list: Vec<u8> = (1..=self.n()).filter(|&z| self.zones[z - 1].bypassed).map(|z| z as u8).collect();
+                        if !list.is_empty() {
+                            self.saved_bypass = list;
+                            self.beeps(3);
+                            self.temp("Bypass Group", "Programmed", 1800);
+                            self.log(EvKind::Info, "Bypass group saved ([95])");
+                            self.out.push(Out::Save);
+                        } else {
+                            self.error_tone();
+                        }
+                        KpMode::Bypass { buf: String::new(), idx }
+                    }
+                    91 => {
+                        let mut any = false;
+                        for z in self.saved_bypass.clone() {
+                            let zi = z as usize;
+                            if zi >= 1 && zi <= self.n() && self.cfg(zi).bypassable {
+                                self.zones[zi - 1].bypassed = true;
+                                any = true;
+                            }
+                        }
+                        if any {
+                            self.beeps(3);
+                            self.temp("Bypass Group", "Recalled", 1800);
+                            self.log(EvKind::Info, "Saved bypass group recalled ([91])");
+                        } else {
+                            self.error_tone();
+                        }
+                        KpMode::Bypass { buf: String::new(), idx }
+                    }
                     0 => {
                         for z in self.zones.iter_mut() {
                             z.bypassed = false;
@@ -335,8 +376,23 @@ impl Panel {
         v
     }
 
-    fn k32_troubles(&mut self, idx: usize, sub: bool, key: Key) -> KpMode {
-        let items = if sub { self.service_items() } else { self.trouble_items() };
+    fn trouble_sub_items(&self, sub: u8) -> Vec<(u8, String)> {
+        match sub {
+            1 => self.service_items().into_iter().map(|(n, s)| (n, s.to_string())).collect(),
+            5 => (1..=self.n())
+                .filter(|&z| self.zones[z - 1].fault)
+                .map(|z| (z as u8, self.label(z)))
+                .collect(),
+            6 => (1..=self.n())
+                .filter(|&z| self.zones[z - 1].tamper)
+                .map(|z| (z as u8, self.label(z)))
+                .collect(),
+            _ => self.trouble_items().into_iter().map(|(n, s)| (n, s.to_string())).collect(),
+        }
+    }
+
+    fn k32_troubles(&mut self, idx: usize, sub: u8, key: Key) -> KpMode {
+        let items = self.trouble_sub_items(sub);
         let n = items.len().max(1);
         let current = items.get(idx % n).map(|i| i.0).unwrap_or(0);
         match key {
@@ -348,18 +404,30 @@ impl Panel {
                 self.key_beep();
                 KpMode::Troubles { idx: (idx + 1) % n, sub, mem: false }
             }
-            Key::Star | Key::Digit(1) if !sub && current == 1 => {
+            Key::Star if sub == 0 && matches!(current, 1 | 5 | 6) => {
                 self.key_beep();
-                KpMode::Troubles { idx: 0, sub: true, mem: false }
+                KpMode::Troubles { idx: 0, sub: current, mem: false }
             }
-            Key::Digit(8) if !sub && self.troubles & tb::CLOCK != 0 => {
+            Key::Digit(1) if sub == 0 && self.troubles & (tb::LOW_BATT | tb::BELL) != 0 => {
+                self.key_beep();
+                KpMode::Troubles { idx: 0, sub: 1, mem: false }
+            }
+            Key::Digit(5) if sub == 0 && self.troubles & tb::ZONE_FAULT != 0 => {
+                self.key_beep();
+                KpMode::Troubles { idx: 0, sub: 5, mem: false }
+            }
+            Key::Digit(6) if sub == 0 && self.troubles & tb::ZONE_TAMPER != 0 => {
+                self.key_beep();
+                KpMode::Troubles { idx: 0, sub: 6, mem: false }
+            }
+            Key::Digit(8) if sub == 0 && self.troubles & tb::CLOCK != 0 => {
                 self.key_beep();
                 KpMode::NeedCode { purpose: CodeFor::UserFns, buf: String::new() }
             }
             Key::Hash => {
                 self.key_beep();
-                if sub {
-                    KpMode::Troubles { idx: 0, sub: false, mem: false }
+                if sub != 0 {
+                    KpMode::Troubles { idx: 0, sub: 0, mem: false }
                 } else {
                     self.inputs.ftc = false;
                     self.ack_troubles();
@@ -474,6 +542,10 @@ impl Panel {
                 buf.push(char::from(b'0' + d));
                 if buf.len() < 4 {
                     return stay(Some(s), buf, idx, attrs);
+                }
+                if s == "40" && self.ee.toggle(self.model, "015", 6) {
+                    self.error_tone();
+                    return stay(None, String::new(), idx, attrs);
                 }
                 let taken = self.ee.find_code(&buf).map_or(false, |o| o != s);
                 if taken {
@@ -771,12 +843,17 @@ impl Panel {
                 LcdOut { lines: [l1, pad(&l2)], cursor: None }
             }
             KpMode::Troubles { idx, sub, .. } => {
-                let items = if *sub { self.service_items() } else { self.trouble_items() };
+                let items = self.trouble_sub_items(*sub);
                 if items.is_empty() {
                     return plain("No Troubles", "Present");
                 }
-                let (num, text) = items[*idx % items.len()];
-                let l1 = if *sub { arrows("Service Req'd") } else { arrows("View Trouble") };
+                let (num, text) = &items[*idx % items.len()];
+                let l1 = match *sub {
+                    1 => arrows("Service Req'd"),
+                    5 => arrows("Zone Fault"),
+                    6 => arrows("Zone Tamper"),
+                    _ => arrows("View Trouble"),
+                };
                 LcdOut { lines: [l1, pad(&format!("{} {}", num, text))], cursor: None }
             }
             KpMode::Memory { idx, .. } => {
@@ -832,11 +909,11 @@ impl Panel {
         }
     }
 
-    fn scroll_screen(&self, items: &[(String, String)]) -> LcdOut {
+    fn scroll_screen(&self, items: &[(String, String)], auto_step: i32) -> LcdOut {
         if items.is_empty() {
             return plain("", "");
         }
-        let i = self.lcd_scroll.rem_euclid(items.len() as i32) as usize;
+        let i = (self.lcd_scroll + auto_step).rem_euclid(items.len() as i32) as usize;
         let (a, b) = &items[i];
         if items.len() > 1 && b == "Before Arming" {
             return LcdOut { lines: [pad(a), arrows(b)], cursor: None };
@@ -845,11 +922,48 @@ impl Panel {
         LcdOut { lines: [l1, pad(b)], cursor: None }
     }
 
+    fn clock_lines(&self, wall_ms: i64) -> (String, String) {
+        let t = util::local(wall_ms + self.clock_offset_ms);
+        let time_s = if self.ee.toggle(Model::Pc1832, "kp076", 3) {
+            t.format("%H:%M").to_string()
+        } else {
+            t.format("%-I:%M %p").to_string()
+        };
+        (t.format("%a %b %d").to_string(), time_s)
+    }
+
     fn lcd_idle(&self, now: Instant, wall_ms: i64) -> LcdOut {
+        // Live asterisk feedback while typing a 4-digit code in Normal or Entry Delay mode.
+        if !self.buf.is_empty() {
+            let stars = "*".repeat(self.buf.len());
+            let title = if self.entry.is_some() {
+                "Entry Active"
+            } else if self.armed.is_some() {
+                "Enter Code to"
+            } else {
+                "Enter Access"
+            };
+            return LcdOut {
+                lines: [pad(title), pad(&format!("Code {}", stars))],
+                cursor: Some((1, 5 + self.buf.len().min(4))),
+            };
+        }
+
+        let idle_secs = now.saturating_duration_since(self.last_key_at).as_secs();
+        let show_clock = self.ee.toggle(Model::Pc1832, "kp076", 2);
+        let auto_open = self.ee.toggle(Model::Pc1832, "kp076", 8);
+
         let live: Vec<&AlarmRt> = self.live_alarms(now).filter(|a| a.kind != AlarmKind::Duress).collect();
         if !live.is_empty() {
-            let a = live[self.lcd_scroll.rem_euclid(live.len() as i32) as usize];
-            let top = if a.kind.pulsed() { "Fire Zone" } else { "In Alarm" };
+            let auto = (idle_secs / 3) as i32;
+            let a = live[(self.lcd_scroll + auto).rem_euclid(live.len() as i32) as usize];
+            let top = if a.kind.pulsed() {
+                "Fire Zone"
+            } else if a.kind.is_co() {
+                "CO Alarm"
+            } else {
+                "In Alarm"
+            };
             let l1 = if live.len() > 1 { arrows(top) } else { pad(top) };
             return LcdOut { lines: [l1, pad(&self.label(a.zone as usize))], cursor: None };
         }
@@ -879,15 +993,20 @@ impl Panel {
                     items.push(("Alarm Memory".to_string(), self.label(z as usize)));
                 }
             }
-            return self.scroll_screen(&items);
+            if show_clock {
+                items.push(self.clock_lines(wall_ms));
+            }
+            let auto = if idle_secs >= 4 { ((idle_secs - 4) / 4 + 1) as i32 } else { 0 };
+            return self.scroll_screen(&items, auto);
         }
         let mut items: Vec<(String, String)> = Vec::new();
+        let open = self.open_zones();
         if self.ready() {
             items.push(("System is".to_string(), "Ready to Arm".to_string()));
         } else {
             items.push(("Secure System".to_string(), "Before Arming".to_string()));
         }
-        for z in self.open_zones() {
+        for &z in &open {
             items.push((self.label(z as usize), "Open".to_string()));
         }
         if self.memory_flag && !self.memory[0].is_empty() {
@@ -896,9 +1015,24 @@ impl Panel {
         if self.troubles != 0 {
             items.push(("System Trouble".to_string(), "(*2) to View".to_string()));
         }
-        let t = util::local(wall_ms + self.clock_offset_ms);
-        items.push((t.format("%a %b %d").to_string(), t.format("%-I:%M %p").to_string()));
-        self.scroll_screen(&items)
+        if show_clock {
+            items.push(self.clock_lines(wall_ms));
+        }
+        // Authentic PK5500 auto-scrolling:
+        // - Open zones auto-scroll every 2.5 s when [076] Opt 8 is ON.
+        // - Idle / Ready / Trouble / Clock alternate every 4 s.
+        let auto = if !open.is_empty() && auto_open {
+            if idle_secs >= 3 {
+                (((now.saturating_duration_since(self.last_key_at).as_millis() - 3000) / 2500) + 1) as i32
+            } else {
+                0
+            }
+        } else if items.len() > 1 && idle_secs >= 4 {
+            ((idle_secs - 4) / 4 + 1) as i32
+        } else {
+            0
+        };
+        self.scroll_screen(&items, auto)
     }
 
     fn lcd_program(&self, p: &Prog) -> LcdOut {
@@ -907,7 +1041,13 @@ impl Panel {
             return screen("Enter Installer".into(), format!("Code {}", "*".repeat(p.sel.len())), Some((1, 5 + p.sel.len())));
         }
         if p.reset_stage == 2 {
-            return screen("Enter 999 To".into(), format!("Default {}", p.sel), Some((1, 8 + p.sel.len())));
+            let act = p.confirm_action.unwrap_or("999");
+            let prompt = match act {
+                "990" => "Enter 990 Lock",
+                "991" => "Enter 991 Unlk",
+                _ => "Enter 999 To",
+            };
+            return screen(prompt.into(), format!("Confirm {}", p.sel), Some((1, 8 + p.sel.len())));
         }
         if let Some(parent) = &p.sub_for {
             return screen(format!("Section [{}]", parent), format!("Sub-Sect {}", p.sel), Some((1, 9 + p.sel.len())));

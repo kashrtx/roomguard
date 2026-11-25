@@ -1,24 +1,31 @@
 //! The synthesizer. Each device is modelled from how it physically makes
 //! sound:
 //!
-//! Keypad sounder: a piezo disc is a sharp mechanical resonator. It's driven
-//! with a square wave and rings at its own frequency, so tone, attack and
-//! decay come from the resonance. The PC1500RK's older disc is lower, broader
-//! and buzzier; the PK5500's is higher and cleaner. DSC doesn't publish the
-//! frequencies; these are typical of keypad piezos (2.3 to 3.3 kHz).
+//! Keypad sounder: a ceramic piezoelectric disc is a high-Q mechanical
+//! resonator driven by a microcontroller square wave. The classic PC1500RK
+//! disc is lower, slightly broader and raspier; the GuardSeries PK5500 disc
+//! is higher and cleaner, with 21-step pitch/level control (`00` off,
+//! `01`..`20` sweeping ~2.05 to 3.65 kHz).
 //!
-//! Ademco WAVE-2F: an electronic siren driver into a small horn speaker. Its
-//! steady output on terminal 1 is a repeating rising sweep, its warble on
-//! terminal 2 alternates two tones. The speaker and its cavity colour it.
+//! Ademco WAVE-2F: a 106 dB self-contained 12 V electronic siren driving a
+//! re-entrant exponential plastic horn speaker. Terminal 1 (Steady) emits a
+//! continuous piercing horn tone (~2.36 kHz with rich horn harmonics and
+//! slight power-rail ripple); Terminal 2 (Warble) emits the iconic rapid
+//! asymmetric burglar yelp sweeping ~680 to 1,920 Hz at ~3.2 Hz.
 //!
-//! Klaxon Master Blaster: a motor spins a slotted rotor inside a stator and
-//! chops the air. Pitch is rotor speed (1600 Hz at full speed), so it winds
-//! up when powered and coasts down when the bell output drops.
+//! Klaxon Master Blaster: a 120 dB motor-driven cast-metal siren whose
+//! slotted impeller chops air at ~1,640 Hz at full speed. Spins up under
+//! motor torque with brushed-motor whine and 60/120 Hz mains growl, then
+//! coasts down over ~4.8 seconds with aerodynamic drag and turbulent rush.
 //!
-//! ADT RX-7C: a small self contained piezo sounder that chirps.
+//! ADT RX-7C: a piercing self-contained indoor ceramic piezo sounder that
+//! rapidly sweeps and chirps through its ~3.28 kHz piezo resonance inside a
+//! vented plastic housing.
 //!
-//! Motor bell: a striker hits a steel gong many times a second; each strike
-//! excites the gong's inharmonic vibration modes, which ring and decay.
+//! 10-inch Motor Bell: an eccentric cam drives a steel striker against a
+//! 10-inch steel gong ~16.5 times per second. Each blow injects a sharp
+//! steel-on-steel impact transient that excites 10 inharmonic dome modes
+//! (including natural bolt-asymmetry beating pairs) which shimmer and decay.
 
 use std::collections::VecDeque;
 
@@ -27,6 +34,20 @@ use crate::engine::types::SirenModel;
 
 const TAU: f32 = std::f32::consts::TAU;
 const PI: f32 = std::f32::consts::PI;
+
+/// Flushes inaudibly small values to zero. A resonator ringing down after a
+/// beep shrinks toward zero forever, and once its numbers get tiny enough to
+/// be "denormal" floats, the CPU does that maths dozens of times slower. In an
+/// idle synth that's every filter at once, which can starve the audio callback
+/// and turn into crackles or beeps that arrive late.
+#[inline]
+fn ftz(x: f32) -> f32 {
+    if x.abs() < 1.0e-20 {
+        0.0
+    } else {
+        x
+    }
+}
 
 fn ms(sr: f32, ms: u32) -> u32 {
     (sr * ms as f32 / 1000.0) as u32
@@ -59,7 +80,7 @@ impl Res {
         self.b = (1.0 - r) * 2.0 * self.sw;
     }
     fn tick(&mut self, x: f32) -> f32 {
-        let y = self.a1 * self.y1 + self.a2 * self.y2 + self.b * x;
+        let y = ftz(self.a1 * self.y1 + self.a2 * self.y2 + self.b * x);
         self.y2 = self.y1;
         self.y1 = y;
         y
@@ -81,14 +102,50 @@ struct OnePole {
 
 impl OnePole {
     fn new(sr: f32, f: f32) -> OnePole {
-        OnePole { a: 1.0 - (-TAU * f / sr).exp(), z: 0.0 }
+        OnePole { a: 1.0 - (-TAU * f.clamp(10.0, sr * 0.45) / sr).exp(), z: 0.0 }
     }
     fn lowpass(&mut self, x: f32) -> f32 {
-        self.z += self.a * (x - self.z);
+        self.z = ftz(self.z + self.a * (x - self.z));
         self.z
     }
     fn highpass(&mut self, x: f32) -> f32 {
         x - self.lowpass(x)
+    }
+}
+
+/// Tiny indoor early-reflection network so sirens sound mounted on a wall in a
+/// real room rather than dry synthetic oscillators.
+struct Room {
+    buf: Vec<f32>,
+    idx: usize,
+    t1: usize,
+    t2: usize,
+    t3: usize,
+    damp: OnePole,
+}
+
+impl Room {
+    fn new(sr: f32) -> Room {
+        let len = (sr * 0.028).max(32.0) as usize;
+        let t1 = ((sr * 0.0067) as usize).clamp(1, len - 1);
+        let t2 = ((sr * 0.0139) as usize).clamp(1, len - 1);
+        let t3 = ((sr * 0.0224) as usize).clamp(1, len - 1);
+        Room { buf: vec![0.0; len], idx: 0, t1, t2, t3, damp: OnePole::new(sr, 4200.0) }
+    }
+    fn tick(&mut self, x: f32) -> f32 {
+        let len = self.buf.len();
+        let r1 = self.buf[(self.idx + len - self.t1) % len];
+        let r2 = self.buf[(self.idx + len - self.t2) % len];
+        let r3 = self.buf[(self.idx + len - self.t3) % len];
+        let wet = self.damp.lowpass(r1 * 0.22 + r2 * 0.14 - r3 * 0.09);
+        self.buf[self.idx] = ftz(x + wet * 0.18);
+        self.idx = (self.idx + 1) % len;
+        x * 0.84 + wet * 0.45
+    }
+    fn energy(&self) -> f32 {
+        let len = self.buf.len();
+        self.buf[(self.idx + len - self.t1) % len].abs()
+            + self.buf[(self.idx + len - self.t3) % len].abs()
     }
 }
 
@@ -117,13 +174,13 @@ fn blep(t: f32, dt: f32) -> f32 {
     }
 }
 
-/// Band limited square wave.
-fn square(phase: f32, dt: f32) -> f32 {
-    let mut v = if phase < 0.5 { 1.0 } else { -1.0 };
+/// Band-limited pulse wave with arbitrary duty cycle (0.5 = square).
+fn pulse(phase: f32, dt: f32, duty: f32) -> f32 {
+    let mut v = if phase < duty { 1.0 } else { -1.0 };
     v += blep(phase, dt);
-    let mut p2 = phase + 0.5;
-    if p2 >= 1.0 {
-        p2 -= 1.0;
+    let mut p2 = phase - duty;
+    if p2 < 0.0 {
+        p2 += 1.0;
     }
     v - blep(p2, dt)
 }
@@ -156,40 +213,91 @@ impl Gate {
     }
 }
 
-/// The keypad piezo.
+/// The keypad piezo sounder.
 struct Piezo {
+    voice: KeypadVoice,
     res: Res,
     res2: Res,
+    body: Res,
     phase: f32,
     f0: f32,
     buzz: f32,
     sat: f32,
     second: f32,
+    level: u8,
     sr: f32,
 }
 
 impl Piezo {
-    fn new(sr: f32, voice: KeypadVoice) -> Piezo {
-        let (f0, q, buzz, sat, second) = match voice {
-            KeypadVoice::Classic => (2850.0, 9.0, 0.32, 2.2, 0.35),
-            KeypadVoice::Pk5500 => (3150.0, 16.0, 0.12, 1.5, 0.0),
+    fn new(sr: f32, voice: KeypadVoice, level: u8) -> Piezo {
+        let mut p = Piezo {
+            voice,
+            res: Res::new(sr, 3000.0, 12.0),
+            res2: Res::new(sr, 3060.0, 9.0),
+            body: Res::new(sr, 1420.0, 2.2),
+            phase: 0.0,
+            f0: 3000.0,
+            buzz: 0.15,
+            sat: 1.6,
+            second: 0.0,
+            level: level.min(20),
+            sr,
         };
-        Piezo { res: Res::new(sr, f0, q), res2: Res::new(sr, f0 * 1.021, q * 0.8), phase: 0.0, f0, buzz, sat, second, sr }
+        p.configure();
+        p
     }
+
+    fn set_level(&mut self, level: u8) {
+        let clamped = level.min(20);
+        if clamped != self.level {
+            self.level = clamped;
+            if self.voice == KeypadVoice::Pk5500 {
+                self.configure();
+            }
+        }
+    }
+
+    fn configure(&mut self) {
+        let (f0, q, buzz, sat, second) = match self.voice {
+            KeypadVoice::Classic => (2780.0, 8.5, 0.30, 2.2, 0.36),
+            KeypadVoice::Pk5500 => {
+                // Real PK5500 Buzzer Control: 00 = off, 01..20 shifts the piezo
+                // fundamental tone across ~2.05 to 3.65 kHz (14 ≈ 3.145 kHz).
+                let t = (self.level.saturating_sub(1) as f32) / 19.0;
+                let f = 2050.0 + t * 1600.0;
+                (f, 15.0, 0.11, 1.45, 0.06)
+            }
+        };
+        self.f0 = f0;
+        self.buzz = buzz;
+        self.sat = sat;
+        self.second = second;
+        self.res.tune(self.sr, f0, q);
+        self.res2.tune(self.sr, f0 * 1.023, q * 0.78);
+    }
+
     fn next(&mut self, on: bool, freq: f32, amp: f32) -> f32 {
-        let drive = if on && amp > 0.0 {
-            self.phase += freq / self.sr;
+        let muted = self.voice == KeypadVoice::Pk5500 && self.level == 0;
+        let drive = if on && !muted && amp > 0.0 {
+            let dt = freq / self.sr;
+            self.phase += dt;
             if self.phase >= 1.0 {
                 self.phase -= 1.0;
             }
-            ((TAU * self.phase).sin() * 5.0).tanh() * amp
+            // Slight gain scaling with PK5500 buzzer level (still audible at 01, crisp at 20).
+            let lv = if self.voice == KeypadVoice::Pk5500 {
+                0.42 + 0.58 * (self.level as f32 / 20.0)
+            } else {
+                1.0
+            };
+            pulse(self.phase, dt, 0.48) * amp * lv
         } else {
             0.0
         };
-        let y = self.res.tick(drive) + self.second * self.res2.tick(drive);
-        // Tones away from the disc's resonance (chime notes) are carried by the drive itself.
-        let off = ((freq - self.f0).abs() / self.f0 * 2.5).min(0.8);
-        let v = y * (1.0 - self.buzz) + drive * (self.buzz + off) * 0.4;
+        let y = self.res.tick(drive) + self.second * self.res2.tick(drive) + 0.14 * self.body.tick(drive);
+        // Tones away from the disc's resonance (e.g. Ding-Dong notes) carry cleanly.
+        let off = ((freq - self.f0).abs() / self.f0.max(100.0) * 2.2).min(0.85);
+        let v = y * (1.0 - self.buzz) + drive * (self.buzz + off) * 0.36;
         (v * self.sat).tanh() / self.sat.tanh()
     }
 }
@@ -201,22 +309,39 @@ struct Siren {
     sr: f32,
     phase: f32,
     sweep: f32,
-    glide: f32,
+    ripple: f32,
     amp: f32,
     hp: OnePole,
-    spk: Res,
-    cab: Res,
+    lp: OnePole,
+    // WAVE-2F re-entrant horn formants
+    horn1: Res,
+    horn2: Res,
+    horn3: Res,
+    // Klaxon Master Blaster motor & turbine
     w: f32,
     theta: f32,
+    shaft: f32,
     air: Res,
+    stator1: Res,
+    stator2: Res,
     hum: f32,
+    comm: f32,
     count: u32,
-    lp: OnePole,
+    // ADT RX-7C ceramic piezo
     rx_t: f32,
     rx_res: Res,
-    modes: [Res; 5],
-    weights: [f32; 5],
+    rx_hi: Res,
+    rx_cav: Res,
+    // 10-inch steel gong motor bell (10 inharmonic modes + striker impact)
+    modes: [Res; 10],
+    weights: [f32; 10],
     strike: f32,
+    strike_jitter: f32,
+    clack_left: u32,
+    clack_len: u32,
+    clack_res: Res,
+    bell_motor: f32,
+    room: Room,
     rng: Rng,
 }
 
@@ -224,8 +349,10 @@ impl Siren {
     fn new(sr: f32, model: SirenModel, warble: bool) -> Siren {
         let mode = |f: f32, decay_s: f32| Res::new(sr, f, PI * f * decay_s);
         let (hp_f, lp_f) = match model {
-            SirenModel::MasterBlaster => (140.0, 6500.0),
-            _ => (350.0, 9000.0),
+            SirenModel::MasterBlaster => (95.0, 7600.0),
+            SirenModel::MotorBell => (220.0, 9500.0),
+            SirenModel::Rx7c => (500.0, 9800.0),
+            SirenModel::Wave2F => (320.0, 8200.0),
         };
         Siren {
             model,
@@ -233,158 +360,263 @@ impl Siren {
             sr,
             phase: 0.0,
             sweep: 0.0,
-            glide: 0.0,
+            ripple: 0.0,
             amp: 0.0,
             hp: OnePole::new(sr, hp_f),
-            spk: Res::new(sr, 2400.0, 1.6),
-            cab: Res::new(sr, 900.0, 2.2),
+            lp: OnePole::new(sr, lp_f),
+            // Re-entrant plastic exponential horn throat & mouth resonances
+            horn1: Res::new(sr, 1180.0, 2.4),
+            horn2: Res::new(sr, 2460.0, 2.8),
+            horn3: Res::new(sr, 4450.0, 2.0),
+            // Klaxon Master Blaster
             w: 0.0,
             theta: 0.0,
-            air: Res::new(sr, 1600.0, 4.0),
+            shaft: 0.0,
+            air: Res::new(sr, 1640.0, 3.6),
+            stator1: Res::new(sr, 1620.0, 2.5),
+            stator2: Res::new(sr, 3280.0, 2.2),
             hum: 0.0,
+            comm: 0.0,
             count: 0,
-            lp: OnePole::new(sr, lp_f),
+            // ADT RX-7C
             rx_t: 0.0,
-            rx_res: Res::new(sr, 3300.0, 8.0),
-            modes: [mode(510.0, 1.6), mode(1270.0, 1.0), mode(2110.0, 0.65), mode(3020.0, 0.45), mode(3890.0, 0.3)],
-            weights: [1.0, 0.7, 0.55, 0.35, 0.2],
+            rx_res: Res::new(sr, 3280.0, 10.5),
+            rx_hi: Res::new(sr, 6350.0, 6.5),
+            rx_cav: Res::new(sr, 1240.0, 2.6),
+            // 10-inch steel gong modes (with natural split-mode beating pairs)
+            modes: [
+                mode(538.0, 2.20),
+                mode(544.0, 2.10),
+                mode(1185.0, 1.35),
+                mode(1199.0, 1.25),
+                mode(2040.0, 0.85),
+                mode(2068.0, 0.80),
+                mode(3090.0, 0.55),
+                mode(3940.0, 0.38),
+                mode(4810.0, 0.26),
+                mode(5690.0, 0.18),
+            ],
+            weights: [0.95, 0.82, 0.72, 0.60, 0.56, 0.45, 0.40, 0.30, 0.22, 0.16],
             strike: 0.0,
+            strike_jitter: 1.0,
+            clack_left: 0,
+            clack_len: ms(sr, 2).max(4),
+            clack_res: Res::new(sr, 3450.0, 1.6),
+            bell_motor: 0.0,
+            room: Room::new(sr),
             rng: Rng(0x2545_F491),
         }
     }
 
     fn quiet(&self) -> bool {
+        let room_quiet = self.room.energy() < 1e-4;
         match self.model {
-            SirenModel::MasterBlaster => self.w < 0.001,
-            SirenModel::MotorBell => self.w < 0.01 && self.modes.iter().all(|m| m.energy() < 1e-4),
-            _ => self.amp < 1e-4 && self.spk.energy() < 1e-4,
+            SirenModel::MasterBlaster => self.w < 0.001 && room_quiet,
+            SirenModel::MotorBell => self.w < 0.01 && self.modes.iter().all(|m| m.energy() < 1e-4) && room_quiet,
+            SirenModel::Rx7c => self.amp < 1e-4 && self.rx_res.energy() < 1e-4 && room_quiet,
+            SirenModel::Wave2F => self.amp < 1e-4 && self.horn2.energy() < 1e-4 && room_quiet,
         }
     }
 
     fn next(&mut self, power: bool) -> f32 {
-        match self.model {
+        let raw = match self.model {
             SirenModel::Wave2F => self.wave(power),
             SirenModel::MasterBlaster => self.motor(power),
             SirenModel::Rx7c => self.rx7c(power),
             SirenModel::MotorBell => self.bell(power),
-        }
+        };
+        self.room.tick(raw)
     }
 
+    /// Ademco / Honeywell WAVE-2F (106 dB re-entrant horn siren).
+    /// Terminal 1 (Steady): continuous piercing electronic horn tone (~2.36 kHz).
+    /// Terminal 2 (Warble): rapid asymmetric electronic yelp (~680 <-> 1,920 Hz).
     fn wave(&mut self, power: bool) -> f32 {
+        let dt_s = 1.0 / self.sr;
         let target = if power { 1.0 } else { 0.0 };
-        let rate = if power { 0.004 } else { 0.0025 };
+        let rate = if power { 1.0 - (-dt_s * 180.0).exp() } else { 1.0 - (-dt_s * 95.0).exp() };
         self.amp += (target - self.amp) * rate;
         if !power && self.amp < 1e-4 {
             self.sweep = 0.0;
-            return self.spk.tick(0.0) * 0.5;
+            return (self.horn1.tick(0.0) * 0.4 + self.horn2.tick(0.0) * 0.7) * 0.4;
         }
-        let f = if self.warble {
-            self.sweep += 3.4 / self.sr;
+
+        // Subtle 120 Hz power-rail ripple & organic RC oscillator shimmer.
+        self.ripple = (self.ripple + 120.0 * dt_s).fract();
+        let rip = (TAU * self.ripple).sin();
+
+        let (f, duty) = if self.warble {
+            // Classic WAVE-2F rapid burglar yelp (~3.2 Hz asymmetric RC sweep).
+            self.sweep += 3.22 * dt_s;
             if self.sweep >= 1.0 {
                 self.sweep -= 1.0;
             }
-            let hi = if self.sweep < 0.5 { 1.0 } else { 0.0 };
-            self.glide += (hi - self.glide) * 0.0025;
-            1180.0 + 520.0 * self.glide
+            let k = if self.sweep < 0.52 {
+                let u = self.sweep / 0.52;
+                (1.0 - (-2.8 * u).exp()) / (1.0 - (-2.8f32).exp())
+            } else {
+                let u = (self.sweep - 0.52) / 0.48;
+                1.0 - (1.0 - (-2.2 * u).exp()) / (1.0 - (-2.2f32).exp())
+            };
+            (680.0 + 1240.0 * k + rip * 4.5, 0.44)
         } else {
-            self.sweep += 3.1 / self.sr;
-            if self.sweep >= 1.0 {
-                self.sweep -= 1.0;
-            }
-            let k = (1.0 - (-3.2 * self.sweep).exp()) / (1.0 - (-3.2f32).exp());
-            760.0 + 980.0 * k
+            // Terminal 1 Steady: continuous piercing horn tone with subtle
+            // 120 Hz power-supply micro-modulation and aggressive harmonic bite.
+            let f_steady = 2360.0 + rip * 11.0;
+            (f_steady, 0.42)
         };
-        let dt = f / self.sr;
+
+        let dt = f * dt_s;
         self.phase += dt;
         if self.phase >= 1.0 {
             self.phase -= 1.0;
         }
-        let x = self.hp.highpass(square(self.phase, dt) * self.amp);
-        let y = x * 0.55 + self.spk.tick(x) * 0.9 + self.cab.tick(x) * 0.35;
-        (self.lp.lowpass(y) * 1.4).tanh() * 0.9
+        // Asymmetric pulse excites both odd and even harmonics like a real
+        // single-ended push-pull transistor siren driver.
+        let raw = pulse(self.phase, dt, duty) * self.amp * (0.96 + 0.04 * rip);
+        let x = self.hp.highpass(raw);
+        let y = x * 0.36
+            + self.horn1.tick(x) * 0.42
+            + self.horn2.tick(x) * 0.92
+            + self.horn3.tick(x) * 0.38;
+        (self.lp.lowpass(y) * 1.55).tanh() * 0.92
     }
 
+    /// Klaxon Master Blaster (120 dB cast-metal motor-driven siren, ~1,640 Hz).
     fn motor(&mut self, power: bool) -> f32 {
         let dt = 1.0 / self.sr;
         if power {
-            self.w += (1.0 - self.w) * 2.3 * dt;
+            // Electric motor torque accelerates fast at low speed, tapers near 1.0.
+            let torque = 2.05 * (1.0 - self.w) + 0.25 * (1.0 - self.w * self.w);
+            self.w = (self.w + torque * dt).min(1.0);
         } else {
-            self.w -= (self.w * 0.42 + 0.015) * dt;
-            if self.w < 0.0 {
-                self.w = 0.0;
-            }
+            // Heavy impeller coasts down under aerodynamic drag (w^2) + bearing friction.
+            let drag = 0.34 * self.w * self.w + 0.18 * self.w + 0.011;
+            self.w = (self.w - drag * dt).max(0.0);
         }
         if self.w < 0.001 {
             return 0.0;
         }
-        let f = 1600.0 * self.w;
-        self.theta += f * dt;
-        if self.theta >= 1.0 {
-            self.theta -= 1.0;
-        }
-        let tone = ((TAU * self.theta).sin() * 2.6).tanh() * 0.85 + (TAU * 2.0 * self.theta).sin() * 0.12;
+
+        // Full-speed rotor blade-pass frequency ~1,640 Hz.
+        let f = 1640.0 * self.w;
+        self.theta = (self.theta + f * dt).fract();
+        // Rotor shaft revolution (~1/12 of blade-pass) adds subtle physical impeller wobble.
+        self.shaft = (self.shaft + (f / 12.0) * dt).fract();
+        let wobble = 1.0 + 0.055 * (TAU * self.shaft).sin();
+
+        // Slotted stator air-chopping creates a sharp, harmonic-rich acoustic pulse.
+        let p = TAU * self.theta;
+        let chop = (p.sin() * 2.4).tanh() * 0.72
+            + (2.0 * p).sin() * 0.32
+            + (3.0 * p).sin() * 0.16
+            + (4.0 * p).sin() * 0.07;
+
+        // Turbulent air rush through the rotor slots, tracking rotor frequency.
         self.count = self.count.wrapping_add(1);
-        if self.count % 64 == 0 {
-            self.air.tune(self.sr, f.max(80.0), 4.0);
+        if self.count % 48 == 0 {
+            self.air.tune(self.sr, (f * 1.04).max(90.0), 3.4);
         }
-        let noise = self.air.tick(self.rng.next()) * 2.5;
-        self.hum += 100.0 * dt;
-        if self.hum >= 1.0 {
-            self.hum -= 1.0;
-        }
-        let hum = (TAU * self.hum).sin() * 0.05 * self.w;
-        let y = (tone + noise * 0.35) * self.w.powf(1.5) + hum;
-        let y = self.lp.lowpass(self.hp.highpass(y));
-        (y * 1.2).tanh()
+        let white = self.rng.next();
+        let air_rush = self.air.tick(white) * 2.2 + white * 0.14;
+
+        // Brushed AC/DC motor commutator whine & 100/120 Hz mains growl (only while powered).
+        self.hum = (self.hum + 120.0 * dt).fract();
+        self.comm = (self.comm + (420.0 + 680.0 * self.w) * dt).fract();
+        let motor_drive = if power {
+            ((TAU * self.hum).sin() * 0.08 + (TAU * self.comm).sin() * 0.05) * (0.3 + 0.7 * self.w)
+        } else {
+            0.0
+        };
+
+        let aero = (chop * wobble + air_rush * 0.34) * self.w.powf(1.65);
+        let body = aero * 0.58 + self.stator1.tick(aero) * 0.45 + self.stator2.tick(aero) * 0.25 + motor_drive;
+        let filtered = self.lp.lowpass(self.hp.highpass(body));
+        (filtered * 1.35).tanh() * 0.94
     }
 
+    /// ADT RX-7C flush/surface indoor ceramic piezo sounder (90-106 dB).
     fn rx7c(&mut self, power: bool) -> f32 {
+        let dt_s = 1.0 / self.sr;
         let target = if power { 1.0 } else { 0.0 };
-        self.amp += (target - self.amp) * 0.01;
+        let rate = 1.0 - (-dt_s * 160.0).exp();
+        self.amp += (target - self.amp) * rate;
         if !power && self.amp < 1e-4 {
             self.rx_t = 0.0;
-            return self.rx_res.tick(0.0);
+            return self.rx_res.tick(0.0) * 0.5 + self.rx_hi.tick(0.0) * 0.2;
         }
-        let cycle = 0.075;
-        self.rx_t += 1.0 / self.sr;
+        // Rapid piezo warble/chirp cycle (~8.2 Hz, sharp 88 ms sweep + brief reset snap).
+        let cycle = 0.118;
+        self.rx_t += dt_s;
         if self.rx_t >= cycle {
             self.rx_t -= cycle;
         }
-        let chirp = 0.052;
-        let k = (self.rx_t / chirp).min(1.0);
-        let env = if self.rx_t < chirp { 1.0 - k * 0.35 } else { 0.0 };
-        let f = 2750.0 + 950.0 * k * k;
-        self.phase += f / self.sr;
-        if self.phase >= 1.0 {
-            self.phase -= 1.0;
-        }
-        let drive = ((TAU * self.phase).sin() * 4.0).tanh() * env * self.amp;
-        let y = self.rx_res.tick(drive) + drive * 0.25;
-        (y * 1.6).tanh() * 0.8
+        let active = 0.094;
+        let k = (self.rx_t / active).min(1.0);
+        let env = if self.rx_t < active {
+            // Snappy piezo attack + slight droop before reset
+            let att = (self.rx_t * 350.0).min(1.0);
+            att * (1.0 - 0.22 * k)
+        } else {
+            0.0
+        };
+        let f = 2420.0 + 1260.0 * k.powf(1.35);
+        let dt = f * dt_s;
+        self.phase = (self.phase + dt).fract();
+        let drive = pulse(self.phase, dt, 0.46) * env * self.amp;
+        let x = self.hp.highpass(drive);
+        let y = self.rx_res.tick(x) * 0.85
+            + self.rx_hi.tick(x) * 0.30
+            + self.rx_cav.tick(x) * 0.28
+            + x * 0.22;
+        (self.lp.lowpass(y) * 1.55).tanh() * 0.84
     }
 
+    /// 10-inch steel gong motor bell (Amseco MBL-10 / Potter MB-10 style).
     fn bell(&mut self, power: bool) -> f32 {
         let dt = 1.0 / self.sr;
         if power {
-            self.w += (1.0 - self.w) * 9.0 * dt;
+            self.w += (1.0 - self.w) * 10.5 * dt;
         } else {
-            self.w -= self.w * 5.0 * dt;
+            self.w = (self.w - self.w * 6.5 * dt).max(0.0);
         }
-        if self.w > 0.08 {
-            self.strike += 17.0 * self.w * dt;
+        if self.w > 0.09 {
+            self.strike += 16.5 * self.w * self.strike_jitter * dt;
             if self.strike >= 1.0 {
                 self.strike -= 1.0;
-                let a = (0.6 + 0.4 * self.w) * (0.9 + 0.1 * self.rng.next());
-                for (m, wgt) in self.modes.iter_mut().zip(self.weights.iter()) {
-                    m.strike(a * wgt);
+                // Organic ±4% cam timing jitter + ±10% strike velocity variance.
+                self.strike_jitter = 1.0 + 0.04 * self.rng.next();
+                let vel = (0.58 + 0.42 * self.w) * (0.90 + 0.10 * self.rng.next());
+                for (i, (m, wgt)) in self.modes.iter_mut().zip(self.weights.iter()).enumerate() {
+                    // Slight per-mode phase/strike variation avoids robotic comb ringing.
+                    let var = 1.0 + 0.08 * self.rng.next() * ((i % 3) as f32 * 0.5 + 0.5);
+                    m.strike(vel * wgt * var);
                 }
+                self.clack_left = self.clack_len;
             }
         }
-        let mut y = 0.0;
+        // Steel-on-steel hammer impact transient ("clack") on every blow.
+        let impact = if self.clack_left > 0 {
+            self.clack_left -= 1;
+            let env = self.clack_left as f32 / self.clack_len as f32;
+            let burst = self.rng.next() * env * env * 1.4;
+            self.clack_res.tick(burst) * 1.15
+        } else {
+            self.clack_res.tick(0.0) * 0.6
+        };
+        let mut gong = 0.0;
         for m in self.modes.iter_mut() {
-            y += m.tick(0.0);
+            gong += m.tick(0.0);
         }
-        (y * 1.3).tanh() * 0.85
+        // Subtle DC motor & cam gearbox whirr while powered.
+        self.bell_motor = (self.bell_motor + 185.0 * dt).fract();
+        let mech = if power {
+            ((TAU * self.bell_motor).sin() * 0.025 + self.rng.next() * 0.012) * self.w
+        } else {
+            0.0
+        };
+        let y = self.lp.lowpass(self.hp.highpass(gong * 0.62 + impact * 0.48 + mech));
+        (y * 1.45).tanh() * 0.90
     }
 }
 
@@ -395,11 +627,14 @@ struct Seg {
     freq: f32,
     decay: f32,
     amp: f32,
+    /// Part of a keypress beep, which later sequences queue behind.
+    key: bool,
 }
 
 pub struct Synth {
     sr: f32,
     voice: KeypadVoice,
+    buzzer_level: u8,
     piezo: Piezo,
     sounder: Gate,
     segs: VecDeque<Seg>,
@@ -427,6 +662,7 @@ pub struct Synth {
     click_len: u32,
     click_res: Res,
     rng: Rng,
+    keepalive: f32,
 }
 
 impl Synth {
@@ -435,14 +671,15 @@ impl Synth {
         Synth {
             sr,
             voice: KeypadVoice::Pk5500,
-            piezo: Piezo::new(sr, KeypadVoice::Pk5500),
+            buzzer_level: 14,
+            piezo: Piezo::new(sr, KeypadVoice::Pk5500, 14),
             sounder: Gate { pat: Pattern::Off, pos: 0 },
             segs: VecDeque::new(),
             seg: None,
             bell: BellPattern::Off,
             bell_pos: 0,
             squawks: VecDeque::new(),
-            siren: Siren::new(sr, SirenModel::Wave2F, false),
+            siren: Siren::new(sr, SirenModel::Wave2F, true),
             preview: None,
             vol_master: 0.8,
             vol_siren: 0.45,
@@ -462,6 +699,7 @@ impl Synth {
             click_len: ms(sr, 6).max(1),
             click_res: Res::new(sr, 1700.0, 2.0),
             rng: Rng(0x9E37_79B9),
+            keepalive: 1.0 / 32_000.0,
         }
     }
 
@@ -475,25 +713,25 @@ impl Synth {
         match k {
             ChimeKind::Beeps(n) => {
                 for _ in 0..n.max(1) {
-                    self.segs.push_back(Seg { on: ms(sr, 70), off: ms(sr, 70), freq: f0, decay: 1.0, amp: 1.0 });
+                    self.segs.push_back(Seg { on: ms(sr, 68), off: ms(sr, 68), freq: f0, decay: 1.0, amp: 1.0, key: false });
                 }
             }
             ChimeKind::BingBing => {
-                let d = self.decay_for(0.22);
+                let d = self.decay_for(0.20);
                 for _ in 0..2 {
-                    self.segs.push_back(Seg { on: ms(sr, 260), off: ms(sr, 110), freq: 2600.0, decay: d, amp: 1.0 });
+                    self.segs.push_back(Seg { on: ms(sr, 250), off: ms(sr, 105), freq: 2793.0, decay: d, amp: 1.0, key: false });
                 }
             }
             ChimeKind::DingDong => {
-                let d1 = self.decay_for(0.30);
-                let d2 = self.decay_for(0.42);
-                self.segs.push_back(Seg { on: ms(sr, 380), off: ms(sr, 40), freq: 2600.0, decay: d1, amp: 1.0 });
-                self.segs.push_back(Seg { on: ms(sr, 650), off: 0, freq: 2050.0, decay: d2, amp: 1.0 });
+                let d1 = self.decay_for(0.28);
+                let d2 = self.decay_for(0.44);
+                self.segs.push_back(Seg { on: ms(sr, 360), off: ms(sr, 35), freq: 2637.0, decay: d1, amp: 1.0, key: false });
+                self.segs.push_back(Seg { on: ms(sr, 640), off: 0, freq: 2093.0, decay: d2, amp: 1.0, key: false });
             }
             ChimeKind::AlarmTone => {
                 for i in 0..12 {
-                    let f = if i % 2 == 0 { 3000.0 } else { 2400.0 };
-                    self.segs.push_back(Seg { on: ms(sr, 55), off: 0, freq: f, decay: 1.0, amp: 1.0 });
+                    let f = if i % 2 == 0 { 3200.0 } else { 2450.0 };
+                    self.segs.push_back(Seg { on: ms(sr, 52), off: 0, freq: f, decay: 1.0, amp: 1.0, key: false });
                 }
             }
         }
@@ -504,28 +742,56 @@ impl Synth {
             AudioCmd::Voice(v) => {
                 if v != self.voice {
                     self.voice = v;
-                    self.piezo = Piezo::new(self.sr, v);
+                    self.piezo = Piezo::new(self.sr, v, self.buzzer_level);
                 }
             }
+            AudioCmd::BuzzerLevel(level) => {
+                self.buzzer_level = level.min(20);
+                self.piezo.set_level(self.buzzer_level);
+            }
             AudioCmd::Sounder(p) => self.sounder.set(p),
-            AudioCmd::Beeps { count, on_ms, off_ms } => {
-                // One sounder per keypad: a new beep cuts off the last one.
+            AudioCmd::KeyBeep => {
+                // A keypress is about 80 ms. During a steady tone (entry delay,
+                // a 24 hour alarm) the tone drops out around it, so every digit
+                // you punch in is heard clearly over it, like on the real keypad.
                 self.segs.clear();
                 self.seg = None;
                 let f = self.piezo.f0;
-                for _ in 0..count.max(1) {
+                if matches!(self.sounder.pat, Pattern::Steady) {
+                    self.segs.push_back(Seg { on: 0, off: ms(self.sr, 30).max(1), freq: f, decay: 1.0, amp: 0.0, key: true });
+                    self.segs.push_back(Seg { on: ms(self.sr, 80).max(1), off: ms(self.sr, 40).max(1), freq: f, decay: 1.0, amp: 1.0, key: true });
+                } else {
+                    self.segs.push_back(Seg { on: ms(self.sr, 80).max(1), off: ms(self.sr, 25), freq: f, decay: 1.0, amp: 1.0, key: true });
+                }
+            }
+            AudioCmd::Beeps { count, on_ms, off_ms } => {
+                // One sounder per keypad: a new sequence replaces the last one,
+                // but a keypress beep that's still sounding finishes first. That
+                // way the last digit of a code is heard, then "beep beep beep".
+                self.drop_all_but_keys();
+                let f = self.piezo.f0;
+                let n = count.max(1);
+                for i in 0..n {
+                    // Add a crisp trailing gap on the final beep if the sounder is running.
+                    let off = if off_ms > 0 {
+                        ms(self.sr, off_ms as u32)
+                    } else if i + 1 < n {
+                        ms(self.sr, 60)
+                    } else {
+                        ms(self.sr, 40)
+                    };
                     self.segs.push_back(Seg {
                         on: ms(self.sr, on_ms as u32).max(1),
-                        off: ms(self.sr, off_ms as u32),
+                        off,
                         freq: f,
                         decay: 1.0,
                         amp: 1.0,
+                        key: false,
                     });
                 }
             }
             AudioCmd::Chime(k) => {
-                self.segs.clear();
-                self.seg = None;
+                self.drop_all_but_keys();
                 self.push_chime(k);
             }
             AudioCmd::Bell(b) => {
@@ -537,7 +803,7 @@ impl Synth {
             AudioCmd::Squawk(n) => {
                 self.squawks.clear();
                 for _ in 0..n {
-                    self.squawks.push_back((ms(self.sr, 60), ms(self.sr, 240)));
+                    self.squawks.push_back((ms(self.sr, 65), ms(self.sr, 235)));
                 }
             }
             AudioCmd::Siren { model, warble } => {
@@ -577,6 +843,14 @@ impl Synth {
         }
     }
 
+    /// Clears queued sounds except a keypress beep, which plays out first.
+    fn drop_all_but_keys(&mut self) {
+        self.segs.retain(|s| s.key);
+        if !self.seg.map_or(false, |(s, _, _)| s.key) {
+            self.seg = None;
+        }
+    }
+
     fn seg_next(&mut self) -> Option<(bool, f32, f32)> {
         if self.seg.is_none() {
             self.seg = self.segs.pop_front().map(|s| (s, 0u32, 1.0f32));
@@ -603,8 +877,18 @@ impl Synth {
             BellPattern::Steady => true,
             BellPattern::Pulsed => (pos % (2 * sec)) < sec,
             BellPattern::Temporal3 => {
+                // NFPA 72 Fire: 0.5s ON, 0.5s OFF x3, then 1.5s OFF (4.0s total).
                 let t = pos % (4 * sec);
                 t < 3 * sec && (t % sec) < sec / 2
+            }
+            BellPattern::Temporal4 => {
+                // NFPA 720 Carbon Monoxide: 4x (100ms ON, 100ms OFF), then 5.0s OFF (5.8s total).
+                let unit = ms(self.sr, 200).max(2);
+                let on = ms(self.sr, 100).max(1);
+                let burst = unit * 4;
+                let cycle = burst + ms(self.sr, 5000);
+                let t = pos % cycle.max(1);
+                t < burst && (t % unit) < on
             }
         }
     }
@@ -677,16 +961,14 @@ impl Synth {
     }
 
     pub fn next(&mut self) -> f32 {
-        let mut on = self.sounder.next(self.sr);
-        let mut freq = self.piezo.f0;
-        let mut amp = 1.0;
-        if let Some((gate, f, a)) = self.seg_next() {
-            if gate {
-                on = true;
-                freq = f;
-                amp = a;
-            }
-        }
+        let bg_on = self.sounder.next(self.sr);
+        let (on, freq, amp) = match self.seg_next() {
+            // Active keypress / confirmation / chime sequence takes exclusive
+            // control of the single keypad piezo (including its silent gaps),
+            // so rapid beeps and keypresses cut cleanly through steady tones.
+            Some((gate, f, a)) => (gate, f, a),
+            None => (bg_on, self.piezo.f0, 1.0),
+        };
         let keypad = self.piezo.next(on, freq, amp) * self.vol_keypad;
         let power = self.bell_gate() | self.squawk_next();
         let siren = self.siren.next(power) * self.vol_siren;
@@ -706,6 +988,11 @@ impl Synth {
         let ring = self.ring_next();
         let click = self.click_next() * self.vol_keypad * 0.12;
         let mix = (keypad * 0.8 + siren + preview + line + ring + click) * self.vol_master;
-        mix.clamp(-1.0, 1.0)
+        // Inaudible 1 LSB (16-bit, about -90 dBFS) alternating keep-alive at
+        // Nyquist. Pure digital silence lets many USB, Bluetooth and Realtek
+        // outputs power down their amplifier, which then swallows the first
+        // short keypad beep. This keeps the output awake.
+        self.keepalive = -self.keepalive;
+        mix.clamp(-0.9999, 0.9999) + self.keepalive
     }
 }

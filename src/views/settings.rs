@@ -18,9 +18,17 @@ const TABS: [&str; 6] = ["General", "Camera", "Sound", "Monitoring", "Updates", 
 pub struct SettingsView {
     pub open: bool,
     pub restart: bool,
+    pub rerun_setup: bool,
     pub tab: u8,
     new_pass: String,
     enroll_name: String,
+    face_tex: Option<egui::TextureHandle>,
+    face_seq: u64,
+    version_taps: u8,
+    confirm_wipe: bool,
+    /// Set once you confirm erasing everything; the app does the erasing.
+    pub wipe: bool,
+    inst_filter: String,
 }
 
 /// Draws a QR code for `data`.
@@ -48,7 +56,7 @@ pub fn qr(ui: &mut egui::Ui, data: &str, size: f32) {
 fn section(ui: &mut egui::Ui, title: &str) {
     ui.add_space(8.0);
     ui.label(theme::heading(title));
-    ui.add_space(2.0);
+    ui.add_space(3.0);
 }
 
 impl SettingsView {
@@ -58,30 +66,53 @@ impl SettingsView {
             return;
         }
         let mut open = self.open;
+        let show_installer = cfg.ui.installer_view;
+        if !show_installer && self.tab > 5 {
+            self.tab = 0;
+        }
         egui::Window::new("Settings")
             .open(&mut open)
             .collapsible(false)
             .resizable(true)
-            .default_size([760.0, 560.0])
+            .default_size([780.0, 560.0])
+            .min_size([660.0, 460.0])
             .show(ctx, |ui| {
+                let avail_w = ui.available_width();
+                let body_w = (avail_w - 166.0).max(360.0);
                 ui.horizontal_top(|ui| {
                     ui.vertical(|ui| {
-                        ui.set_width(140.0);
-                        for (i, name) in TABS.iter().enumerate() {
-                            if ui.selectable_label(self.tab == i as u8, *name).clicked() {
+                        ui.set_width(136.0);
+                        let names: Vec<&str> = TABS.iter().copied().chain(if show_installer { Some("Installer") } else { None }).collect();
+                        for (i, name) in names.iter().enumerate() {
+                            let selected = self.tab == i as u8;
+                            let btn = egui::Button::new(
+                                RichText::new(*name)
+                                    .font(if selected { theme::semi(13.5) } else { theme::regular(13.5) })
+                                    .color(if selected { Color32::WHITE } else { theme::MUTED }),
+                            )
+                            .fill(if selected { Color32::from_rgb(0x2C, 0x5A, 0x44) } else { Color32::TRANSPARENT })
+                            .stroke(if selected { egui::Stroke::new(1.0f32, theme::GREEN) } else { egui::Stroke::NONE })
+                            .min_size(egui::vec2(132.0, 28.0));
+                            if ui.add(btn).clicked() {
                                 self.tab = i as u8;
                             }
                         }
                     });
                     ui.separator();
                     ui.vertical(|ui| {
-                        egui::ScrollArea::vertical().id_salt("settings-body").auto_shrink([false, false]).show(ui, |ui| match self.tab {
-                            0 => self.general(ui, cfg, changed, view),
-                            1 => self.camera(ui, cfg, changed, cam),
-                            2 => self.sound(ui, cfg, changed, audio),
-                            3 => self.monitoring(ui, cfg, changed, view, engine),
-                            4 => self.updates(ui, cfg, changed, updater),
-                            _ => self.about(ui),
+                        ui.set_width(body_w);
+                        ui.set_max_width(body_w);
+                        egui::ScrollArea::vertical().id_salt("settings-body").auto_shrink([false, false]).show(ui, |ui| {
+                            ui.set_max_width((body_w - 14.0).max(320.0));
+                            match self.tab {
+                                0 => self.general(ui, cfg, changed, view),
+                                1 => self.camera(ui, cfg, changed, cam),
+                                2 => self.sound(ui, cfg, changed, audio),
+                                3 => self.monitoring(ui, cfg, changed, view, engine),
+                                4 => self.updates(ui, cfg, changed, updater),
+                                6 if show_installer => self.installer(ui, cfg, changed, view),
+                                _ => self.about(ui, cfg, changed),
+                            }
                         });
                     });
                 });
@@ -93,7 +124,7 @@ impl SettingsView {
         section(ui, "You");
         ui.horizontal(|ui| {
             ui.label("Your name");
-            if ui.text_edit_singleline(&mut cfg.admin_name).changed() {
+            if ui.add(egui::TextEdit::singleline(&mut cfg.admin_name).desired_width(220.0)).changed() {
                 *changed = true;
             }
         });
@@ -101,10 +132,10 @@ impl SettingsView {
 
         section(ui, "Keypad");
         ui.add_enabled_ui(!view.armed, |ui| {
-            if ui.radio_value(&mut cfg.model, Model::Pc1550, "LED keypad, works like a DSC PC1550 (six zones, lights only)").changed() {
+            if ui.radio_value(&mut cfg.model, Model::Pc1550, "LED keypad (RmG Classic, PC1550 compatible, 6 zones)").changed() {
                 *changed = true;
             }
-            if ui.radio_value(&mut cfg.model, Model::Pc1832, "LCD keypad, works like a DSC PC1832 (eight zones, messages on screen)").changed() {
+            if ui.radio_value(&mut cfg.model, Model::Pc1832, "LCD keypad (GuardSeries, PC1832 compatible, 8 zones)").changed() {
                 *changed = true;
             }
         });
@@ -116,20 +147,23 @@ impl SettingsView {
         section(ui, "Zone names");
         let model = cfg.model;
         let labels = cfg.labels_mut(model);
-        for (i, label) in labels.iter_mut().enumerate() {
-            ui.horizontal(|ui| {
+        egui::Grid::new("settings-zones").num_columns(3).spacing([10.0, 6.0]).show(ui, |ui| {
+            for (i, label) in labels.iter_mut().enumerate() {
                 ui.label(RichText::new(format!("Zone {}", i + 1)).color(theme::MUTED));
-                if ui.add(egui::TextEdit::singleline(label).char_limit(24).desired_width(220.0)).changed() {
+                if ui.add_sized([210.0, 24.0], egui::TextEdit::singleline(label).char_limit(24)).changed() {
                     *changed = true;
                 }
                 if i == 0 {
-                    ui.label(theme::muted("the doorway (or the whole camera view)"));
+                    ui.label(theme::muted("Doorway / whole view"));
                 } else if i == 1 {
-                    ui.label(theme::muted("the rest of the room, once a doorway is marked"));
+                    ui.label(theme::muted("Rest of room"));
+                } else {
+                    ui.label("");
                 }
-            });
-        }
-        ui.label(theme::muted("The LCD keypad shows the first 14 letters."));
+                ui.end_row();
+            }
+        });
+        ui.label(theme::muted("The LCD keypad displays the first 14 characters of each zone name."));
 
         section(ui, "Camera view");
         if ui.checkbox(&mut cfg.ui.show_motion, "Show motion").changed() {
@@ -159,18 +193,49 @@ impl SettingsView {
             "Codes, faces, the room map and history are saved in {}. Deleting or updating the app never touches this folder.",
             dir.display()
         )));
-        if ui.button("Open the data folder").clicked() {
-            let _ = std::fs::create_dir_all(&dir);
-            let _ = open::that(&dir);
+        ui.horizontal(|ui| {
+            if ui.button("Open the data folder").clicked() {
+                let _ = std::fs::create_dir_all(&dir);
+                let _ = open::that(&dir);
+            }
+            if ui.button("Run setup wizard again").clicked() {
+                self.rerun_setup = true;
+                self.open = false;
+            }
+        });
+        ui.label(theme::muted("Running the setup again keeps your codes, faces and history and lets you pick everything else over."));
+
+        section(ui, "Start over");
+        ui.label(theme::muted(
+            "Erases everything RoomGuard saved on this computer: codes, panel programming, faces, room maps, history and settings. Then it restarts with the setup wizard, like the day you installed it.",
+        ));
+        if view.armed {
+            ui.label(theme::muted("Disarm first to start over."));
+        } else if !self.confirm_wipe {
+            if ui.button("Erase everything and start over").clicked() {
+                self.confirm_wipe = true;
+            }
+        } else {
+            ui.label(RichText::new("This can't be undone. Your codes, faces, room maps and history will be gone.").color(theme::AMBER));
+            ui.horizontal(|ui| {
+                if super::accent_button(ui, "Erase and start over", theme::RED).clicked() {
+                    self.confirm_wipe = false;
+                    self.wipe = true;
+                    self.open = false;
+                }
+                if ui.button("Cancel").clicked() {
+                    self.confirm_wipe = false;
+                }
+            });
         }
     }
 
     fn camera(&mut self, ui: &mut egui::Ui, cfg: &mut AppConfig, changed: &mut bool, cam: &CameraHandle) {
         let c = &mut cfg.camera;
-        let (devices, people, enroll) = cam
+        let (devices, people, enroll, preview) = cam
             .shared
             .lock()
-            .map(|s| (s.devices.clone(), s.people.clone(), s.enroll.clone()))
+            .map(|s| (s.devices.clone(), s.people.clone(), s.enroll.clone(), s.preview.clone()))
             .unwrap_or_default();
         section(ui, "Camera");
         if ui.checkbox(&mut c.enabled, "Use the camera as the room's sensors").changed() {
@@ -197,7 +262,7 @@ impl SettingsView {
         if ui.checkbox(&mut c.mirror, "Mirror the picture").changed() {
             *changed = true;
         }
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label("Lens");
             for lens in [Lens::Normal, Lens::Wide, Lens::Fisheye] {
                 if ui.radio_value(&mut c.lens, lens, lens.label()).changed() {
@@ -213,7 +278,7 @@ impl SettingsView {
         });
 
         section(ui, "Pan and tilt");
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             for kind in [PtzKind::Fixed, PtzKind::Uvc, PtzKind::Obsbot] {
                 if ui.radio_value(&mut c.ptz.kind, kind, kind.label()).changed() {
                     *changed = true;
@@ -239,7 +304,7 @@ impl SettingsView {
                 }
             });
             if c.ptz.kind == PtzKind::Obsbot {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label("OBSBOT Center address");
                     if ui.add(egui::TextEdit::singleline(&mut c.ptz.obsbot_host).desired_width(130.0)).changed() {
                         *changed = true;
@@ -271,7 +336,7 @@ impl SettingsView {
             if ui.checkbox(&mut c.liveness, "Only accept a face that moves (blocks a photo held still)").changed() {
                 *changed = true;
             }
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label("Matching");
                 for (v, name) in [(1u8, "Relaxed"), (2, "Balanced"), (3, "Strict")] {
                     if ui.radio_value(&mut c.strictness, v, name).changed() {
@@ -288,10 +353,52 @@ impl SettingsView {
                     }
                 });
             }
+            if let Some(pv) = &preview {
+                if pv.seq != self.face_seq && pv.rgb.len() == pv.w * pv.h * 3 {
+                    self.face_seq = pv.seq;
+                    let img = egui::ColorImage::from_rgb([pv.w, pv.h], &pv.rgb);
+                    match &mut self.face_tex {
+                        Some(t) => t.set(img, egui::TextureOptions::LINEAR),
+                        None => self.face_tex = Some(ui.ctx().load_texture("settings-face-preview", img, egui::TextureOptions::LINEAR)),
+                    }
+                }
+            }
+            let enrolling_now = matches!(&enroll, Some(e) if !e.done && e.error.is_none());
+            if c.enabled && (enrolling_now || self.face_tex.is_some()) {
+                if let (Some(tex), Some(pv)) = (&self.face_tex, &preview) {
+                    ui.add_space(4.0);
+                    let pw = 240.0;
+                    let ph = (pw * pv.h as f32 / pv.w.max(1) as f32).clamp(120.0, 180.0);
+                    let (rect, _) = ui.allocate_exact_size(egui::vec2(pw, ph), Sense::hover());
+                    let p = ui.painter_at(rect);
+                    let uv = Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::new(1.0, 1.0));
+                    p.image(tex.id(), rect, uv, Color32::WHITE);
+                    for f in &pv.ov.faces {
+                        let rr = Rect::from_two_pos(
+                            egui::Pos2::new(rect.left() + f.x * rect.width(), rect.top() + f.y * rect.height()),
+                            egui::Pos2::new(rect.left() + (f.x + f.w) * rect.width(), rect.top() + (f.y + f.h) * rect.height()),
+                        );
+                        let col = if f.known || enrolling_now { theme::GREEN } else { theme::AMBER };
+                        p.rect_stroke(rr, 3.0, egui::Stroke::new(2.0f32, col));
+                        if !f.label.is_empty() {
+                            p.text(rr.left_top() - egui::vec2(0.0, 2.0), egui::Align2::LEFT_BOTTOM, &f.label, theme::semi(11.0), col);
+                        }
+                    }
+                    let status_txt = if !pv.ov.faces.is_empty() {
+                        ("Face detected", theme::GREEN)
+                    } else {
+                        ("No face in view", theme::AMBER)
+                    };
+                    let pill = Rect::from_min_size(rect.left_bottom() + egui::vec2(6.0, -22.0), egui::vec2(104.0, 18.0));
+                    p.rect_filled(pill, 4.0, Color32::from_black_alpha(175));
+                    p.text(pill.center(), egui::Align2::CENTER_CENTER, status_txt.0, theme::semi(10.5), status_txt.1);
+                    ui.add_space(4.0);
+                }
+            }
             match &enroll {
                 Some(e) if !e.done && e.error.is_none() => {
                     ui.label(RichText::new(&e.prompt).font(theme::semi(14.0)).color(theme::GREEN));
-                    ui.add(egui::ProgressBar::new(e.progress).desired_width(260.0));
+                    ui.add(egui::ProgressBar::new(e.progress).show_percentage().desired_width(260.0));
                     if ui.button("Stop").clicked() {
                         cam.send(CamCmd::CancelEnroll);
                     }
@@ -331,27 +438,34 @@ impl SettingsView {
     fn sound(&mut self, ui: &mut egui::Ui, cfg: &mut AppConfig, changed: &mut bool, audio: &AudioHandle) {
         let s = &mut cfg.sound;
         section(ui, "Volume");
-        for (label, v) in [("Everything", &mut s.master), ("Siren", &mut s.siren), ("Keypad", &mut s.keypad)] {
-            ui.horizontal(|ui| {
+        egui::Grid::new("settings-volume").num_columns(3).spacing([12.0, 6.0]).show(ui, |ui| {
+            for (label, v) in [("Everything", &mut s.master), ("Siren", &mut s.siren), ("Keypad", &mut s.keypad)] {
                 ui.label(RichText::new(label).color(theme::MUTED));
                 if ui.add(egui::Slider::new(v, 0.0..=1.0).show_value(false)).changed() {
                     *changed = true;
                 }
-            });
-        }
+                ui.label(theme::muted(format!("{}%", (*v * 100.0).round() as i32)));
+                ui.end_row();
+            }
+        });
         section(ui, "Siren");
         for m in SirenModel::ALL {
             ui.horizontal(|ui| {
                 if ui.radio_value(&mut s.siren_model, m, m.label()).changed() {
                     *changed = true;
                 }
-                ui.label(theme::muted(m.blurb()));
-                if ui.small_button("Test").clicked() {
-                    audio.send(AudioCmd::Preview { model: m, warble: s.wave2_warble, ms: 3000 });
-                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("Test").clicked() {
+                        audio.send(AudioCmd::Preview { model: m, warble: s.wave2_warble, ms: 3000 });
+                    }
+                });
             });
+            ui.indent(egui::Id::new(("siren-blurb", m)), |ui| {
+                ui.label(theme::muted(m.blurb()));
+            });
+            ui.add_space(2.0);
         }
-        if s.siren_model == SirenModel::Wave2F && ui.checkbox(&mut s.wave2_warble, "Wire the WAVE-2F to its warble terminal instead of steady").changed() {
+        if s.siren_model == SirenModel::Wave2F && ui.checkbox(&mut s.wave2_warble, "Wire the WAVE-2F to its warble (yelp) terminal instead of steady").changed() {
             *changed = true;
         }
         section(ui, "Communicator");
@@ -359,7 +473,7 @@ impl SettingsView {
             *changed = true;
         }
         ui.label(theme::muted(
-            "Every sound is synthesized from how the real device makes it. DSC doesn't publish its keypad buzzer frequencies, so those two are close estimates.",
+            "Every sound is synthesized live from physical models of the real acoustic hardware (re-entrant horn, motor impeller, ceramic piezo, and 10-inch steel gong).",
         ));
     }
 
@@ -369,20 +483,22 @@ impl SettingsView {
         if ui.checkbox(&mut o.enabled, "Simulate a monitoring center that messages and calls you about alarms").changed() {
             *changed = true;
         }
-        ui.horizontal(|ui| {
+        egui::Grid::new("settings-operator").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
             ui.label("Operator's name");
-            if ui.add(egui::TextEdit::singleline(&mut o.operator_name).desired_width(140.0)).changed() {
+            if ui.add_sized([180.0, 24.0], egui::TextEdit::singleline(&mut o.operator_name)).changed() {
                 *changed = true;
             }
-        });
-        ui.horizontal(|ui| {
+            ui.end_row();
             ui.label("Passcode");
-            ui.add(egui::TextEdit::singleline(&mut self.new_pass).password(true).hint_text(if o.has_passcode() { "set, type to change" } else { "not set" }).desired_width(160.0));
-            if ui.add_enabled(self.new_pass.trim().len() >= 3, egui::Button::new("Save")).clicked() {
-                o.set_passcode(&self.new_pass);
-                self.new_pass.clear();
-                *changed = true;
-            }
+            ui.horizontal(|ui| {
+                ui.add_sized([180.0, 24.0], egui::TextEdit::singleline(&mut self.new_pass).password(true).hint_text(if o.has_passcode() { "set, type to change" } else { "not set" }));
+                if ui.add_enabled(self.new_pass.trim().len() >= 3, egui::Button::new("Save")).clicked() {
+                    o.set_passcode(&self.new_pass);
+                    self.new_pass.clear();
+                    *changed = true;
+                }
+            });
+            ui.end_row();
         });
         ui.label(theme::muted("The operator asks for it on the call, like a real monitoring company, to make sure it's really you."));
 
@@ -393,37 +509,44 @@ impl SettingsView {
         ui.label(theme::muted(
             "Alerts go through ntfy, a free push notification service. Install the ntfy app on your phone and subscribe to your private topic below.",
         ));
-        ui.horizontal(|ui| {
+        ui.add_space(4.0);
+        egui::Grid::new("settings-ntfy").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
             ui.label("Topic");
-            if ui.add(egui::TextEdit::singleline(&mut o.ntfy_topic).desired_width(240.0)).changed() {
-                *changed = true;
-            }
-            if ui.button("New topic").clicked() {
-                o.ntfy_topic = format!("roomguard-{}", util::random_token(14));
-                *changed = true;
-            }
-        });
-        ui.horizontal(|ui| {
+            ui.horizontal(|ui| {
+                if ui.add_sized([220.0, 24.0], egui::TextEdit::singleline(&mut o.ntfy_topic)).changed() {
+                    *changed = true;
+                }
+                if ui.button("New topic").clicked() {
+                    o.ntfy_topic = format!("roomguard-{}", util::random_token(14));
+                    *changed = true;
+                }
+            });
+            ui.end_row();
             ui.label("Server");
-            if ui.add(egui::TextEdit::singleline(&mut o.ntfy_server).desired_width(240.0)).changed() {
+            if ui.add_sized([220.0, 24.0], egui::TextEdit::singleline(&mut o.ntfy_server)).changed() {
                 *changed = true;
             }
-        });
-        ui.horizontal(|ui| {
+            ui.end_row();
             ui.label("Access token");
-            if ui.add(egui::TextEdit::singleline(&mut o.ntfy_token).password(true).hint_text("only for a private server").desired_width(200.0)).changed() {
+            if ui.add_sized([220.0, 24.0], egui::TextEdit::singleline(&mut o.ntfy_token).password(true).hint_text("only for a private server")).changed() {
                 *changed = true;
             }
+            ui.end_row();
         });
+        ui.add_space(6.0);
         let url = NtfyCfg::from(o).topic_url();
-        ui.horizontal(|ui| {
+        let avail = ui.available_width();
+        ui.horizontal_top(|ui| {
             qr(ui, &url, 132.0);
+            ui.add_space(8.0);
             ui.vertical(|ui| {
+                ui.set_max_width((avail - 150.0).max(180.0));
                 ui.label("Scan this with your phone, or subscribe in the ntfy app to:");
-                ui.label(RichText::new(&o.ntfy_topic).font(theme::semi(13.5)));
+                ui.label(RichText::new(&o.ntfy_topic).font(theme::semi(13.5)).color(theme::GREEN));
                 ui.label(theme::muted("Anyone who knows the topic name can read your alerts, so keep it private."));
             });
         });
+        ui.add_space(6.0);
         for (v, label) in [
             (&mut o.send_photos, "Attach the camera snapshot"),
             (&mut o.heads_up_on_entry, "Heads up when an entry delay starts"),
@@ -434,7 +557,8 @@ impl SettingsView {
                 *changed = true;
             }
         }
-        ui.horizontal(|ui| {
+        ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
             if ui.button("Send a test alert").clicked() {
                 engine.send(EngineMsg::TestNotify);
             }
@@ -496,13 +620,34 @@ impl SettingsView {
         }
     }
 
-    fn about(&mut self, ui: &mut egui::Ui) {
+    fn installer(&mut self, ui: &mut egui::Ui, cfg: &mut AppConfig, changed: &mut bool, view: &View) {
+        super::installer::ui(ui, &view.prog, &mut self.inst_filter);
+        ui.add_space(10.0);
+        if ui.button("Hide this tab").clicked() {
+            cfg.ui.installer_view = false;
+            *changed = true;
+            self.tab = 5;
+        }
+    }
+
+    fn about(&mut self, ui: &mut egui::Ui, cfg: &mut AppConfig, changed: &mut bool) {
         section(ui, "RoomGuard");
-        ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
+        // Tapping the version five times shows the installer tab, like a
+        // hidden service menu.
+        let r = ui.add(egui::Label::new(format!("Version {}", env!("CARGO_PKG_VERSION"))).sense(Sense::click()));
+        if r.clicked() && !cfg.ui.installer_view {
+            self.version_taps += 1;
+            if self.version_taps >= 5 {
+                self.version_taps = 0;
+                cfg.ui.installer_view = true;
+                *changed = true;
+                self.tab = 6;
+            }
+        }
         ui.label("Copyright 2026 Kaushal Bhingaradia. Licensed under the Apache License 2.0.");
         ui.add_space(6.0);
         ui.label(theme::muted(
-            "RoomGuard emulates how the DSC PC1550 and PC1832 alarm panels behave. It isn't made by, endorsed by or affiliated with DSC. The keypads drawn here are original designs.",
+            "RoomGuard emulates how the classic PC1550 (RmG Classic) and PC1832 (GuardSeries) alarm panels behave. It isn't made by, endorsed by or affiliated with any hardware manufacturer. All keypad graphics are rendered procedurally in code.",
         ));
         section(ui, "Built with");
         for line in [
@@ -516,6 +661,13 @@ impl SettingsView {
         ui.add_space(6.0);
         if ui.button("Open the log file").clicked() {
             let _ = open::that(util::data_dir().join("roomguard.log"));
+        }
+        if cfg.ui.installer_view {
+            ui.add_space(6.0);
+            if ui.button("Hide the installer tab").clicked() {
+                cfg.ui.installer_view = false;
+                *changed = true;
+            }
         }
     }
 }

@@ -8,6 +8,7 @@ pub mod faces;
 pub mod frame;
 pub mod map;
 pub mod motion;
+pub mod pose;
 pub mod ptz;
 pub mod track;
 
@@ -87,6 +88,8 @@ pub struct TrackView {
     pub path: Vec<(f32, f32)>,
     pub predicted: Vec<(f32, f32)>,
     pub lost: bool,
+    /// 17 COCO body joints (x, y, confidence) in view coordinates.
+    pub keypoints: Vec<(f32, f32, f32)>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -114,6 +117,12 @@ pub struct Overlay {
     pub focus: Option<NRect>,
     pub ptz_line: String,
     pub zone_active: [bool; 2],
+    /// People are confirmed by body and skeleton detection, not raw motion.
+    pub body_mode: bool,
+    /// pose::POSE_LOADING, POSE_READY or POSE_FAILED.
+    pub pose_state: u8,
+    /// How long the last body tracking round took.
+    pub pose_ms: f32,
 }
 
 pub struct Preview {
@@ -168,26 +177,38 @@ pub struct CamShared {
 pub struct CameraHandle {
     pub tx: Sender<CamCmd>,
     pub shared: Arc<Mutex<CamShared>>,
+    done: Arc<Mutex<Option<Receiver<()>>>>,
 }
 
 impl CameraHandle {
     pub fn send(&self, c: CamCmd) {
         let _ = self.tx.send(c);
     }
+
+    /// Waits (briefly) for the camera thread to save its room map and stop.
+    pub fn wait_stopped(&self, max: Duration) {
+        if let Ok(mut g) = self.done.lock() {
+            if let Some(rx) = g.take() {
+                let _ = rx.recv_timeout(max);
+            }
+        }
+    }
 }
 
 pub fn start(cfg: CameraCfg, engine: Sender<EngineMsg>, ctx: egui::Context) -> CameraHandle {
     let (tx, rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel::<()>();
     let shared = Arc::new(Mutex::new(CamShared::default()));
     let s2 = shared.clone();
     let spawned = std::thread::Builder::new().name("camera".into()).spawn(move || {
         let worker = Worker::new(cfg, engine, ctx, s2);
         worker.run(rx);
+        let _ = done_tx.send(());
     });
     if let Err(e) = spawned {
         util::log(&format!("could not start the camera thread: {}", e));
     }
-    CameraHandle { tx, shared }
+    CameraHandle { tx, shared, done: Arc::new(Mutex::new(Some(done_rx))) }
 }
 
 struct Enroll {
@@ -242,8 +263,15 @@ struct Worker {
     permission_ok: bool,
     last_faces: Vec<FaceView>,
     last_faces_at: Option<Instant>,
+    last_frame_at: Option<Instant>,
+    last_repaint_at: Option<Instant>,
     snap_queue: Vec<String>,
     demo_t: f32,
+    pose: Option<pose::PoseWorker>,
+    people: Vec<pose::Person>,
+    people_at: Option<Instant>,
+    pose_sent_at: Option<Instant>,
+    pose_ms: f32,
 }
 
 impl Worker {
@@ -299,8 +327,15 @@ impl Worker {
             permission_ok: false,
             last_faces: Vec::new(),
             last_faces_at: None,
+            last_frame_at: None,
+            last_repaint_at: None,
             snap_queue: Vec::new(),
             demo_t: 0.0,
+            pose: pose::PoseWorker::start(),
+            people: Vec::new(),
+            people_at: None,
+            pose_sent_at: None,
+            pose_ms: 0.0,
         };
         w.publish_people();
         if let Ok(mut s) = w.shared.lock() {
@@ -358,9 +393,20 @@ impl Worker {
             match result {
                 Ok(buf) => {
                     self.fails = 0;
+                    // Cap camera processing to ~15 FPS so high-framerate webcams never
+                    // saturate CPU/GPU or freeze the UI thread.
+                    let now = Instant::now();
+                    if let Some(prev) = self.last_frame_at {
+                        let elapsed = now.saturating_duration_since(prev);
+                        if elapsed < Duration::from_millis(62) {
+                            std::thread::sleep(Duration::from_millis(62).saturating_sub(elapsed).min(Duration::from_millis(25)));
+                            continue;
+                        }
+                    }
+                    self.last_frame_at = Some(now);
                     let res = buf.resolution();
                     let hint = hint_of(buf.source_frame_format());
-                    let decoded = frame::decode(buf.buffer(), res.width() as usize, res.height() as usize, hint, 640);
+                    let decoded = frame::decode(buf.buffer(), res.width() as usize, res.height() as usize, hint, 480);
                     match decoded {
                         Some(mut rgb) => {
                             self.bad_decodes = 0;
@@ -418,14 +464,49 @@ impl Worker {
             }
             CamCmd::Armed(a) => self.armed = a,
             CamCmd::Enroll(name) => {
-                self.enroll = Some(Enroll {
-                    name,
-                    samples: Vec::new(),
-                    last_at: None,
-                    last_center: (0.5, 0.5),
-                    started: Instant::now(),
-                    candidate: None,
-                });
+                let err = if !self.cfg.enabled {
+                    Some("Turn on the camera above before learning a face.")
+                } else if self.cfg.device == DEMO_DEVICE {
+                    Some("Switch from the Demo camera to a real webcam to learn a face.")
+                } else if self.cam.is_none() {
+                    Some("The camera isn't ready yet. Wait for the live picture and try again.")
+                } else if self.cascade.is_none() {
+                    Some("Face detector didn't load on this build.")
+                } else {
+                    None
+                };
+                if let Some(msg) = err {
+                    self.enroll = None;
+                    if let Ok(mut s) = self.shared.lock() {
+                        s.enroll = Some(EnrollView {
+                            name,
+                            prompt: String::new(),
+                            progress: 0.0,
+                            done: false,
+                            error: Some(msg.to_string()),
+                        });
+                    }
+                    self.ctx.request_repaint();
+                } else {
+                    if let Ok(mut s) = self.shared.lock() {
+                        s.enroll = Some(EnrollView {
+                            name: name.clone(),
+                            prompt: "Look straight at the camera".to_string(),
+                            progress: 0.0,
+                            done: false,
+                            error: None,
+                        });
+                    }
+                    self.enroll = Some(Enroll {
+                        name,
+                        samples: Vec::new(),
+                        last_at: None,
+                        last_center: (0.5, 0.5),
+                        started: Instant::now(),
+                        candidate: None,
+                    });
+                    self.ctx.request_repaint();
+                }
             }
             CamCmd::CancelEnroll => {
                 self.enroll = None;
@@ -680,24 +761,106 @@ impl Worker {
         }
         self.check_cover(&m, now);
 
-        let min_px = ((motion::MW * mh) / 250).max(12) as u32;
-        let mut blobs: Vec<track::Blob> = if m.valid {
+        let enrolling = self.enroll.is_some();
+        let recent_motion = self
+            .last_motion_at
+            .map_or(false, |t| now.saturating_duration_since(t).as_secs_f32() < 3.0);
+        let following = self.ptz.mode == ptz::Mode::Following || self.ptz.mode == ptz::Mode::Searching;
+
+        // Humanoid body + skeleton detection. Only a real human body counts as
+        // a person; raw pixel motion only decides how often and where to look.
+        let demo = self.cfg.device == DEMO_DEVICE;
+        let mut fresh: Option<Vec<pose::Person>> = None;
+        if demo {
+            fresh = Some(demo::people(self.demo_t));
+        } else {
+            let active = recent_motion || !self.tracker.tracks.is_empty() || enrolling || following;
+            // About ten looks a second while anything is going on, about one
+            // a second in a still, empty room. That keeps one CPU core from
+            // being pinned while still catching anyone the moment they move.
+            let gap = if active { 0.1 } else { 0.9 };
+            let due = self.pose_sent_at.map_or(true, |t| now.saturating_duration_since(t).as_secs_f32() >= gap);
+            let zooms = if due && self.pose.is_some() { self.zoom_targets(&m, w, h) } else { Vec::new() };
+            let mut dead = false;
+            if let Some(pw) = self.pose.as_ref() {
+                loop {
+                    match pw.rx.try_recv() {
+                        Ok(r) => {
+                            self.pose_ms = r.ms;
+                            fresh = Some(r.people);
+                        }
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => {
+                            dead = true;
+                            break;
+                        }
+                    }
+                }
+                if !dead && due && pw.submit(pose::PoseJob { img: Arc::new(frame::Rgb { w, h, data: rgb.data.clone() }), zooms }) {
+                    self.pose_sent_at = Some(now);
+                }
+            }
+            if dead {
+                util::log("body tracking is unavailable, falling back to motion tracking");
+                self.pose = None;
+            }
+        }
+        let body_mode = demo || self.pose.is_some();
+        self.tracker.confirm_hits = if body_mode { 3 } else { 5 };
+        self.tracker.body_mode = body_mode;
+        let det_thr = [0.55f32, 0.50, 0.45, 0.42, 0.38][(self.cfg.sensitivity.clamp(1, 5) - 1) as usize];
+        let got_fresh = fresh.is_some();
+        if let Some(list) = fresh {
+            let ignore = &ignore_view;
+            self.people = list
+                .into_iter()
+                .filter(|p| p.evidence(det_thr) >= pose::Evidence::Weak)
+                // Someone on a TV or in a mirror inside an ignored area isn't in the room.
+                .filter(|p| !ignore.iter().any(|r| r.contains(p.cx(), p.cy())))
+                .collect();
+            self.people_at = Some(now);
+        } else if self.people_at.map_or(false, |t| now.saturating_duration_since(t).as_secs_f32() > 1.5) {
+            self.people.clear();
+        }
+
+        let mut blobs: Vec<track::Blob> = if body_mode {
+            if got_fresh {
+                let motion_ok = m.valid && !m.light_change;
+                self.people
+                    .iter()
+                    .map(|p| {
+                        let strength = match p.evidence(det_thr) {
+                            pose::Evidence::Strong => 3,
+                            pose::Evidence::Normal => 2,
+                            _ => 1,
+                        };
+                        let motion = if motion_ok { mask_frac(&self.motion.mask, self.motion.w, self.motion.h, p) } else { 0.0 };
+                        track::Blob { cx: p.cx(), cy: p.cy(), w: p.w(), h: p.h(), px: 100, strength, motion }
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        } else if m.valid {
+            let min_px = ((motion::MW * mh) / 140).max(20) as u32;
             track::find_blobs(&self.motion.mask, motion::MW, mh, min_px)
         } else {
             Vec::new()
         };
 
-        let enrolling = self.enroll.is_some();
-        let recent_motion = self
-            .last_motion_at
-            .map_or(false, |t| now.saturating_duration_since(t).as_secs_f32() < 4.0);
-        let following = self.ptz.mode == ptz::Mode::Following || self.ptz.mode == ptz::Mode::Searching;
-        let want_faces = self.cfg.faces && self.cascade.is_some() && (enrolling || recent_motion || following);
-        let every = if enrolling { 1 } else { 3 };
+        let want_faces = self.cfg.faces
+            && self.cascade.is_some()
+            && (enrolling || if body_mode { !self.people.is_empty() } else { recent_motion || following });
+        let every = if enrolling { 2 } else { 4 };
         if want_faces && self.frame_no % every == 0 {
-            self.last_faces = self.detect_faces(&gray, w, h, now);
+            let regions: Option<Vec<NRect>> = if body_mode && !enrolling {
+                Some(self.people.iter().map(|p| p.head_region()).collect())
+            } else {
+                None
+            };
+            self.last_faces = self.detect_faces(&gray, w, h, now, regions.as_deref());
             self.last_faces_at = Some(now);
-            if !m.valid {
+            if !m.valid && !body_mode {
                 // The picture is moving, so motion can't be trusted. Faces keep the track alive.
                 for f in &self.last_faces {
                     blobs.push(track::Blob {
@@ -706,6 +869,8 @@ impl Worker {
                         w: f.w * 2.6,
                         h: f.h * 6.0,
                         px: 100,
+                        strength: 0,
+                        motion: 1.0,
                     });
                 }
             }
@@ -717,14 +882,16 @@ impl Worker {
         }
 
         let (sx, sy) = xf.view_scale();
-        let blobs_map: Vec<track::Blob> = blobs
-            .iter()
-            .map(|b| {
-                let (u, v) = xf.view_to_map(b.cx, b.cy);
-                track::Blob { cx: u, cy: v, w: b.w * sx, h: b.h * sy, px: b.px }
-            })
-            .collect();
-        self.tracker.update(&blobs_map, now);
+        if !body_mode || got_fresh {
+            let blobs_map: Vec<track::Blob> = blobs
+                .iter()
+                .map(|b| {
+                    let (u, v) = xf.view_to_map(b.cx, b.cy);
+                    track::Blob { cx: u, cy: v, w: b.w * sx, h: b.h * sy, ..*b }
+                })
+                .collect();
+            self.tracker.update(&blobs_map, now);
+        }
         for t in self.tracker.tracks.iter_mut() {
             let (tx, ty) = t.pos();
             for f in &self.last_faces {
@@ -776,7 +943,7 @@ impl Worker {
             }
         }
 
-        self.update_zones(&m, now);
+        self.update_zones(&m, now, body_mode);
         self.recognition(now);
         self.enroll_step(now);
         self.drive_ptz(&rgb, &small, mh, now);
@@ -791,6 +958,46 @@ impl Worker {
             self.save_map();
         }
         self.publish(rgb, &m, &xf, now);
+    }
+
+    /// Where a closer look could find someone the whole frame can't: moving
+    /// areas that no body explains yet (someone far away arriving), then small
+    /// people already being followed, so they stay followed.
+    fn zoom_targets(&self, m: &motion::MotionOut, fw: usize, fh: usize) -> Vec<NRect> {
+        let mut out: Vec<NRect> = Vec::new();
+        let explained = |cx: f32, cy: f32| {
+            self.people
+                .iter()
+                .any(|p| cx >= p.x0 - 0.02 && cx <= p.x1 + 0.02 && cy >= p.y0 - 0.02 && cy <= p.y1 + 0.02)
+        };
+        if m.valid && !m.light_change {
+            let (mw, mh) = (self.motion.w, self.motion.h);
+            let min_px = ((mw * mh) / 900).max(4) as u32;
+            let mut moving = track::components(&self.motion.mask, mw, mh, min_px);
+            moving.sort_by(|a, b| b.px.cmp(&a.px));
+            for b in &moving {
+                if out.len() >= pose::MAX_ZOOMS {
+                    break;
+                }
+                if explained(b.cx, b.cy) || out.iter().any(|o| o.contains(b.cx, b.cy)) {
+                    continue;
+                }
+                if let Some(r) = zoom_rect(b.cx, b.cy, b.w, b.h, fw, fh) {
+                    out.push(r);
+                }
+            }
+        }
+        for p in &self.people {
+            if out.len() >= pose::MAX_ZOOMS {
+                break;
+            }
+            if p.h() < 0.5 && !out.iter().any(|o| o.contains(p.cx(), p.cy())) {
+                if let Some(r) = zoom_rect(p.cx(), p.cy(), p.w(), p.h(), fw, fh) {
+                    out.push(r);
+                }
+            }
+        }
+        out
     }
 
     fn check_cover(&mut self, m: &motion::MotionOut, now: Instant) {
@@ -819,12 +1026,14 @@ impl Worker {
         }
     }
 
-    fn update_zones(&mut self, m: &motion::MotionOut, now: Instant) {
+    fn update_zones(&mut self, m: &motion::MotionOut, now: Instant, body_mode: bool) {
         let thr = [0.012f32, 0.008, 0.005, 0.0035, 0.002][(self.cfg.sensitivity.clamp(1, 5) - 1) as usize];
         let door_rect = self.cfg.doorway;
         let mut door_active = false;
         let mut room_active = false;
-        if m.valid {
+        // With body tracking, raw pixel motion never trips a zone on its own:
+        // only a confirmed human body (or the door watcher) does.
+        if m.valid && !body_mode {
             if door_rect.is_some() {
                 door_active |= m.door_frac > thr * 1.5;
                 room_active |= m.room_frac > thr;
@@ -832,15 +1041,21 @@ impl Worker {
                 door_active |= m.total_frac > thr;
             }
         }
+        let max_unseen = if body_mode { 0.6 } else { 0.3 };
         for t in &self.tracker.tracks {
-            if !t.confirmed || t.unseen(now) > 0.3 {
+            if !t.confirmed || t.unseen(now) > max_unseen {
                 continue;
             }
             let (fx, fy) = t.foot();
+            // The room works like a real interior motion detector: it sees
+            // people moving, not people sitting still. That's what lets you
+            // stand at the keypad and get a Ready light, just like with a PIR.
+            // Someone in the doorway holds the door zone open like a door would.
+            let moving = !body_mode || t.moved_within(now, 1.2);
             match door_rect {
                 Some(d) if d.contains(fx, fy) || d.contains(t.pos().0, t.pos().1) => door_active = true,
-                Some(_) => room_active = true,
-                None => door_active = true,
+                Some(_) => room_active |= moving,
+                None => door_active |= moving,
             }
         }
         if self.door.open && self.cfg.door_contact {
@@ -858,7 +1073,7 @@ impl Worker {
             let want_open = if self.zone_open[i] {
                 self.zone_last[i].map_or(false, |t| now.saturating_duration_since(t).as_secs_f32() < hold)
             } else {
-                self.zone_hits[i] >= 2
+                self.zone_hits[i] >= 3
             };
             if want_open != self.zone_open[i] {
                 self.zone_open[i] = want_open;
@@ -867,24 +1082,33 @@ impl Worker {
         }
     }
 
-    fn detect_faces(&mut self, gray: &[u8], w: usize, h: usize, now: Instant) -> Vec<FaceView> {
-        let rects = match self.cascade.as_ref() {
+    fn detect_faces(&mut self, gray: &[u8], w: usize, h: usize, now: Instant, regions: Option<&[NRect]>) -> Vec<FaceView> {
+        let mut rects = match self.cascade.as_ref() {
             Some(c) => {
-                let dw = w.min(480).max(1);
+                // 320px pyramid with 1.22 scale step runs ~3.5x faster than 480px/1.15
+                // while keeping full frontal face detection reliability.
+                let dw = w.min(320).max(1);
                 let scale = w as f32 / dw as f32;
                 let dh = ((h as f32) / scale).max(1.0) as usize;
                 let det = if dw == w { gray.to_vec() } else { frame::resize_bilinear(gray, w, h, dw, dh) };
-                c.detect(&det, dw, dh, 28.0, 1.15, 3)
+                c.detect(&det, dw, dh, 24.0, 1.22, 3)
                     .into_iter()
                     .map(|r| faces::FaceRect { x: r.x * scale, y: r.y * scale, w: r.w * scale, h: r.h * scale, votes: r.votes })
                     .collect::<Vec<_>>()
             }
             None => return Vec::new(),
         };
-        let single = rects.len() == 1;
+        // Sort largest face first so enrollment always picks the primary person in front of the camera.
+        rects.sort_by(|a, b| (b.w * b.h).partial_cmp(&(a.w * a.h)).unwrap_or(std::cmp::Ordering::Equal));
         let mut out = Vec::new();
-        for full in rects.iter().take(4) {
+        for (idx, full) in rects.iter().take(4).enumerate() {
             let center = ((full.x + full.w * 0.5) / w as f32, (full.y + full.h * 0.5) / h as f32);
+            // A face only counts where a real body's head can be.
+            if let Some(rs) = regions {
+                if !rs.iter().any(|r| r.contains(center.0, center.1)) {
+                    continue;
+                }
+            }
             let mut label = String::new();
             let mut known = false;
             if let Some(desc) = faces::describe(gray, w, h, full) {
@@ -903,7 +1127,7 @@ impl Worker {
                         label = "Unknown".to_string();
                     }
                 }
-                if single {
+                if idx == 0 {
                     if let Some(e) = self.enroll.as_mut() {
                         e.candidate = Some((desc.clone(), center, full.w / w as f32));
                     }
@@ -946,7 +1170,7 @@ impl Worker {
             x1 = x1.max(p.0);
             y1 = y1.max(p.1);
         }
-        (x1 - x0).max(y1 - y0) > 0.012
+        (x1 - x0).max(y1 - y0) > 0.009
     }
 
     fn recognition(&mut self, now: Instant) {
@@ -979,34 +1203,48 @@ impl Worker {
             let Some(en) = self.enroll.as_mut() else {
                 return;
             };
+            let mut too_far = false;
             if let Some((desc, center, size)) = en.candidate.take() {
-                let moved = (center.0 - en.last_center.0).abs() + (center.1 - en.last_center.1).abs();
-                let gap = en.last_at.map_or(f32::MAX, |t| now.saturating_duration_since(t).as_secs_f32());
-                if size > 0.07 && gap > 0.25 && (en.samples.is_empty() || moved > 0.008 || gap > 0.6) {
-                    en.samples.push(desc);
-                    en.last_at = Some(now);
-                    en.last_center = center;
+                if size <= 0.055 {
+                    too_far = true;
+                } else {
+                    let moved = (center.0 - en.last_center.0).abs() + (center.1 - en.last_center.1).abs();
+                    let gap = en.last_at.map_or(f32::MAX, |t| now.saturating_duration_since(t).as_secs_f32());
+                    if gap > 0.22 && (en.samples.is_empty() || moved > 0.007 || gap > 0.5) {
+                        en.samples.push(desc);
+                        en.last_at = Some(now);
+                        en.last_center = center;
+                    }
                 }
             }
             let n = en.samples.len();
-            let prompt = if n < 6 {
-                "Look straight at the camera"
+            let idle_s = en
+                .last_at
+                .unwrap_or(en.started)
+                .elapsed()
+                .as_secs_f32();
+            let prompt = if too_far {
+                "Move a little closer to the camera".to_string()
+            } else if n == 0 && idle_s > 3.5 {
+                "Face the camera in good light (waiting for a clear face)".to_string()
+            } else if n < 6 {
+                format!("Look straight at the camera ({}/{})", n, ENROLL_TARGET)
             } else if n < 12 {
-                "Turn your head a little to your left"
+                format!("Turn your head a little to your left ({}/{})", n, ENROLL_TARGET)
             } else if n < 18 {
-                "Now a little to your right"
+                format!("Now a little to your right ({}/{})", n, ENROLL_TARGET)
             } else {
-                "Tilt your chin up a bit, then relax"
+                format!("Tilt your chin slightly, then relax ({}/{})", n, ENROLL_TARGET)
             };
-            let stalled = n == 0 && now.saturating_duration_since(en.started).as_secs_f32() > 25.0;
+            let stalled = idle_s > 25.0;
             let error = if stalled {
-                Some("I can't see a face clearly. Move closer and make sure your face is lit.".to_string())
+                Some("I couldn't see a clear face for 25 seconds. Move closer, face the light, and try again.".to_string())
             } else {
                 None
             };
             let view = EnrollView {
                 name: en.name.clone(),
-                prompt: prompt.to_string(),
+                prompt,
                 progress: n as f32 / ENROLL_TARGET as f32,
                 done: n >= ENROLL_TARGET,
                 error,
@@ -1159,21 +1397,42 @@ impl Worker {
             light_change: m.light_change,
             focus: self.focus,
             zone_active: self.zone_open,
+            body_mode: self.cfg.device == DEMO_DEVICE || self.pose.is_some(),
+            pose_state: if self.cfg.device == DEMO_DEVICE {
+                pose::POSE_READY
+            } else {
+                self.pose.as_ref().map_or(pose::POSE_FAILED, |p| p.state())
+            },
+            pose_ms: self.pose_ms,
             ..Default::default()
         };
+        let people_fresh = self.people_at.map_or(false, |t| now.saturating_duration_since(t).as_secs_f32() < 0.8);
         for t in self.tracker.tracks.iter().filter(|t| t.confirmed) {
             let (x, y) = xf.map_to_view(t.pos().0, t.pos().1);
+            let (tw, th) = (t.w / sx, t.h / sy);
+            let keypoints = if people_fresh {
+                self.people
+                    .iter()
+                    .map(|p| (p, (p.cx() - x).abs() + (p.cy() - y).abs()))
+                    .filter(|(_, d)| *d < tw.max(th).max(0.08))
+                    .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|(p, _)| p.kp.to_vec())
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
             ov.tracks.push(TrackView {
                 id: t.id,
                 x,
                 y,
-                w: t.w / sx,
-                h: t.h / sy,
+                w: tw,
+                h: th,
                 label: t.label.clone().unwrap_or_default(),
                 known: t.known,
                 path: t.path.iter().rev().take(40).map(|p| xf.map_to_view(p.0, p.1)).collect(),
                 predicted: t.predicted_path(5, 1.2).into_iter().map(|p| xf.map_to_view(p.0, p.1)).collect(),
                 lost: t.unseen(now) > 0.25,
+                keypoints,
             });
         }
         if self.ptz.active() {
@@ -1201,13 +1460,51 @@ impl Worker {
             s.ptz_status = self.ptz.status.clone();
             s.door_learned = self.door.learned;
             if let Some(mv) = map_view {
-                if mv.version != s.map.version || self.frame_no % 300 == 0 {
+                if mv.version != s.map.version || self.cfg.learn_map {
                     s.map = mv;
                 }
             }
         }
-        self.ctx.request_repaint();
+        if self.last_repaint_at.map_or(true, |t| now.saturating_duration_since(t) >= Duration::from_millis(66)) {
+            self.last_repaint_at = Some(now);
+            self.ctx.request_repaint();
+        }
     }
+}
+
+/// A square close look around a target, in normalized frame coordinates,
+/// or None when the target is already big enough for the whole frame look.
+fn zoom_rect(cx: f32, cy: f32, tw: f32, th: f32, fw: usize, fh: usize) -> Option<NRect> {
+    let (fw, fh) = (fw.max(1) as f32, fh.max(1) as f32);
+    let short = fw.min(fh);
+    let side = ((th * fh).max(tw * fw) * 2.2).clamp(short * 0.25, short);
+    if side >= short * 0.95 {
+        return None;
+    }
+    let (sw, sh) = (side / fw, side / fh);
+    let x = (cx - sw * 0.5).clamp(0.0, (1.0 - sw).max(0.0));
+    let y = (cy - sh * 0.5).clamp(0.0, (1.0 - sh).max(0.0));
+    Some(NRect::new(x, y, sw, sh))
+}
+
+/// Share of a person's box where the motion mask saw change this frame.
+fn mask_frac(mask: &[u8], mw: usize, mh: usize, p: &pose::Person) -> f32 {
+    if mw == 0 || mh == 0 || mask.len() < mw * mh {
+        return 0.0;
+    }
+    let gx0 = ((p.x0.clamp(0.0, 1.0) * mw as f32) as usize).min(mw - 1);
+    let gy0 = ((p.y0.clamp(0.0, 1.0) * mh as f32) as usize).min(mh - 1);
+    let gx1 = ((p.x1.clamp(0.0, 1.0) * mw as f32).ceil() as usize).clamp(gx0 + 1, mw);
+    let gy1 = ((p.y1.clamp(0.0, 1.0) * mh as f32).ceil() as usize).clamp(gy0 + 1, mh);
+    let mut n = 0u32;
+    for y in gy0..gy1 {
+        for x in gx0..gx1 {
+            if mask[y * mw + x] != 0 {
+                n += 1;
+            }
+        }
+    }
+    n as f32 / ((gx1 - gx0) * (gy1 - gy0)).max(1) as f32
 }
 
 fn prune_snapshots(dir: &std::path::Path, keep: usize) {

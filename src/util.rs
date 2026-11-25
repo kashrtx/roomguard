@@ -5,8 +5,9 @@ use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::{Datelike, Timelike};
 
@@ -173,6 +174,97 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
+/// Saving happens on one background thread, so a slow disk (antivirus
+/// scanning every write, a synced folder, a drive waking up) can never stall
+/// the keypad, the panel clock or the camera. A file saved several times in a
+/// row is written once with its newest contents, a load sees a save the
+/// moment it's queued, and anything still waiting is written before exit.
+struct SaveQueue {
+    state: Mutex<SaveState>,
+    wake: Condvar,
+    idle: Condvar,
+    threaded: AtomicBool,
+}
+
+#[derive(Default)]
+struct SaveState {
+    pending: Vec<(PathBuf, Arc<Vec<u8>>)>,
+    writing: Option<(PathBuf, Arc<Vec<u8>>)>,
+}
+
+static SAVES: OnceLock<&'static SaveQueue> = OnceLock::new();
+
+fn lock_saves(q: &SaveQueue) -> MutexGuard<'_, SaveState> {
+    q.state.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+fn save_queue() -> &'static SaveQueue {
+    SAVES.get_or_init(|| {
+        let q: &'static SaveQueue = Box::leak(Box::new(SaveQueue {
+            state: Mutex::new(SaveState::default()),
+            wake: Condvar::new(),
+            idle: Condvar::new(),
+            threaded: AtomicBool::new(false),
+        }));
+        match std::thread::Builder::new().name("saver".into()).spawn(move || save_worker(q)) {
+            Ok(_) => q.threaded.store(true, Ordering::SeqCst),
+            Err(e) => log(&format!("could not start the save thread, saving directly instead: {}", e)),
+        }
+        q
+    })
+}
+
+fn save_worker(q: &'static SaveQueue) {
+    loop {
+        let (path, bytes) = {
+            let mut st = lock_saves(q);
+            while st.pending.is_empty() {
+                st = q.wake.wait(st).unwrap_or_else(|p| p.into_inner());
+            }
+            let (path, bytes) = st.pending.remove(0);
+            st.writing = Some((path.clone(), bytes.clone()));
+            (path, bytes)
+        };
+        write_now(&path, &bytes);
+        let mut st = lock_saves(q);
+        st.writing = None;
+        if st.pending.is_empty() {
+            q.idle.notify_all();
+        }
+    }
+}
+
+/// The newest bytes queued for `path` that may not be on disk yet.
+fn queued_bytes(path: &Path) -> Option<Arc<Vec<u8>>> {
+    let q = SAVES.get().copied()?;
+    let st = lock_saves(q);
+    if let Some(slot) = st.pending.iter().find(|slot| slot.0.as_path() == path) {
+        return Some(slot.1.clone());
+    }
+    st.writing.as_ref().filter(|w| w.0.as_path() == path).map(|w| w.1.clone())
+}
+
+/// Waits until every queued save is on disk, for at most `max`. Returns
+/// false if time ran out first.
+pub fn flush_saves(max: Duration) -> bool {
+    let Some(q) = SAVES.get().copied() else {
+        return true;
+    };
+    let deadline = Instant::now() + max;
+    let mut st = lock_saves(q);
+    while !st.pending.is_empty() || st.writing.is_some() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return false;
+        }
+        st = match q.idle.wait_timeout(st, left) {
+            Ok((g, _)) => g,
+            Err(p) => p.into_inner().0,
+        };
+    }
+    true
+}
+
 pub fn save_json<T: serde::Serialize>(path: &Path, value: &T) -> bool {
     let bytes = match serde_json::to_vec_pretty(value) {
         Ok(b) => b,
@@ -181,6 +273,22 @@ pub fn save_json<T: serde::Serialize>(path: &Path, value: &T) -> bool {
             return false;
         }
     };
+    let q = save_queue();
+    if !q.threaded.load(Ordering::SeqCst) {
+        return write_now(path, &bytes);
+    }
+    let bytes = Arc::new(bytes);
+    let mut st = lock_saves(q);
+    if let Some(slot) = st.pending.iter_mut().find(|slot| slot.0.as_path() == path) {
+        slot.1 = bytes;
+    } else {
+        st.pending.push((path.to_path_buf(), bytes));
+    }
+    q.wake.notify_one();
+    true
+}
+
+fn write_now(path: &Path, bytes: &[u8]) -> bool {
     // Once per run, keep the last known good copy as a backup.
     let first_save = BACKED_UP
         .lock()
@@ -196,7 +304,7 @@ pub fn save_json<T: serde::Serialize>(path: &Path, value: &T) -> bool {
     if first_save && path.exists() {
         let _ = std::fs::copy(path, path.with_extension("bak"));
     }
-    match write_atomic(path, &bytes) {
+    match write_atomic(path, bytes) {
         Ok(()) => true,
         Err(e) => {
             log(&format!("could not save {}: {}", path.display(), e));
@@ -205,7 +313,34 @@ pub fn save_json<T: serde::Serialize>(path: &Path, value: &T) -> bool {
     }
 }
 
+/// Deletes everything RoomGuard has saved, except its log, for a fresh
+/// start. Anything still queued is written first so nothing lands after.
+pub fn wipe_data() {
+    flush_saves(Duration::from_secs(4));
+    let dir = data_dir();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.starts_with("roomguard") && name.ends_with(".log") {
+                continue;
+            }
+            let p = e.path();
+            let _ = if p.is_dir() { std::fs::remove_dir_all(&p) } else { std::fs::remove_file(&p) };
+        }
+    }
+    if let Ok(mut list) = BACKED_UP.lock() {
+        list.clear();
+    }
+    log("everything saved was erased for a fresh start");
+}
+
 pub fn load_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
+    // A save that's queued but not written yet is the newest copy.
+    if let Some(bytes) = queued_bytes(path) {
+        if let Ok(v) = serde_json::from_slice::<T>(&bytes) {
+            return Some(v);
+        }
+    }
     for candidate in [path.to_path_buf(), path.with_extension("bak")] {
         let Ok(bytes) = std::fs::read(&candidate) else {
             continue;

@@ -187,7 +187,7 @@ impl Default for SoundCfg {
             siren: 0.45,
             keypad: 0.7,
             siren_model: SirenModel::Wave2F,
-            wave2_warble: false,
+            wave2_warble: true,
             line_audio: false,
         }
     }
@@ -254,6 +254,8 @@ pub struct UiCfg {
     pub right_tab: u8,
     pub show_motion: bool,
     pub show_tracks: bool,
+    /// The hidden installer tab in Settings has been unlocked.
+    pub installer_view: bool,
 }
 
 impl Default for UiCfg {
@@ -265,6 +267,7 @@ impl Default for UiCfg {
             right_tab: 0,
             show_motion: true,
             show_tracks: true,
+            installer_view: false,
         }
     }
 }

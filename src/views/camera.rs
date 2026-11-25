@@ -54,6 +54,13 @@ fn full_uv() -> Rect {
     Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0))
 }
 
+fn draw_centered_wrapped(p: &Painter, rect: Rect, text: String, size: f32, color: Color32) {
+    let wrap_w = (rect.width() - 28.0).max(80.0);
+    let galley = p.fonts(|f| f.layout(text, theme::regular(size), color, wrap_w));
+    let pos = rect.center() - galley.size() * 0.5;
+    p.galley(pos, galley, color);
+}
+
 impl CameraView {
     pub fn ui(&mut self, ui: &mut egui::Ui, cam: &CameraHandle, cfg: &mut CameraCfg, changed: &mut bool, show_motion: bool, show_tracks: bool) {
         let snap = match cam.shared.lock() {
@@ -155,7 +162,7 @@ impl CameraView {
                 CamStatus::Failed(e) => format!("The camera couldn't start: {}", e),
                 CamStatus::NoPermission => "RoomGuard needs camera access. On a Mac, allow it in System Settings, Privacy and Security, Camera, then reopen RoomGuard.".to_string(),
             };
-            p.text(rect.center(), Align2::CENTER_CENTER, msg, theme::regular(13.0), theme::MUTED);
+            draw_centered_wrapped(&p, rect, msg, 12.5, theme::MUTED);
         }
 
         if self.draw != Draw::Off {
@@ -163,13 +170,16 @@ impl CameraView {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
             }
             let hint = if self.draw == Draw::Doorway { "Drag a box around the doorway" } else { "Drag a box around the area to ignore" };
-            p.text(rect.left_top() + Vec2::new(10.0, 10.0), Align2::LEFT_TOP, hint, theme::semi(12.5), theme::BLUE);
+            let g = p.fonts(|f| f.layout_no_wrap(hint.to_string(), theme::semi(12.0), theme::BLUE));
+            let pill = Rect::from_min_size(rect.left_top() + Vec2::new(8.0, 8.0), g.size() + Vec2::new(14.0, 6.0));
+            p.rect_filled(pill, 5.0, Color32::from_black_alpha(165));
+            p.galley(pill.min + Vec2::new(7.0, 3.0), g, theme::BLUE);
             if resp.drag_started() {
                 self.drag_from = resp.interact_pointer_pos();
             }
             if let (Some(a), Some(b)) = (self.drag_from, resp.interact_pointer_pos()) {
                 if resp.dragged() {
-                    p.rect_stroke(Rect::from_two_pos(a, b), 0.0, Stroke::new(2.0, theme::BLUE));
+                    p.rect_stroke(Rect::from_two_pos(a, b), 0.0, Stroke::new(2.0f32, theme::BLUE));
                 }
             }
             if resp.drag_stopped() {
@@ -215,6 +225,15 @@ impl CameraView {
         let mut info = if snap.name.is_empty() { "No camera".to_string() } else { snap.name.clone() };
         if running {
             info.push_str(&format!("  \u{00b7}  {:.0} fps", snap.fps));
+            if let Some(pv) = &snap.preview {
+                let body = match pv.ov.pose_state {
+                    vision::pose::POSE_READY if pv.ov.pose_ms > 0.5 => format!("Body tracking on, {:.0} ms", pv.ov.pose_ms),
+                    vision::pose::POSE_READY => "Body tracking on".to_string(),
+                    vision::pose::POSE_LOADING => "Starting body tracking".to_string(),
+                    _ => "Body tracking unavailable, using motion only".to_string(),
+                };
+                info.push_str(&format!("  \u{00b7}  {}", body));
+            }
         }
         if cfg.doorway.is_none() {
             info.push_str("  \u{00b7}  Without a doorway the whole view is zone 1");
@@ -243,7 +262,7 @@ impl CameraView {
                 let band = Rect::from_min_max(Pos2::new(rect.left(), rect.top() + rect.height() * 0.25), Pos2::new(rect.right(), rect.top() + rect.height() * 0.75));
                 p.image(t.id(), band, full_uv(), Color32::from_gray(150));
             } else {
-                p.text(rect.center(), Align2::CENTER_CENTER, "Press \"Map the room\" and the camera will sweep the room", theme::regular(12.5), theme::MUTED);
+                draw_centered_wrapped(&p, rect, "Press \"Map the room\" and the camera will sweep the room".to_string(), 12.5, theme::MUTED);
             }
         } else if let Some(t) = &self.tex {
             p.image(t.id(), rect, full_uv(), Color32::from_gray(105));
@@ -285,12 +304,12 @@ impl CameraView {
                 continue;
             }
             let rr = Rect::from_two_pos(to(portal.x, portal.y), to(portal.x + portal.w, portal.y + portal.h));
-            paint::dashed_rect(&p, rr, Stroke::new(1.5, theme::BLUE), 5.0);
+            paint::dashed_rect(&p, rr, Stroke::new(1.5f32, theme::BLUE), 5.0);
             p.text(rr.left_top() + Vec2::new(4.0, 3.0), Align2::LEFT_TOP, format!("{}", i + 1), theme::semi(12.0), theme::BLUE);
         }
         if let Some(d) = cfg.doorway {
             let rr = Rect::from_two_pos(to(d.x, d.y), to(d.x + d.w, d.y + d.h));
-            paint::dashed_rect(&p, rr, Stroke::new(2.0, theme::GREEN), 7.0);
+            paint::dashed_rect(&p, rr, Stroke::new(2.0f32, theme::GREEN), 7.0);
             p.text(rr.left_bottom() + Vec2::new(4.0, -3.0), Align2::LEFT_BOTTOM, "Doorway", theme::semi(12.0), theme::GREEN);
         }
         for r in &cfg.ignore {
@@ -314,46 +333,75 @@ impl CameraView {
         }
         if cfg.doorway.is_none() {
             if let Some(hint) = m.doorway_hint {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("This looks like your doorway.").color(theme::TEXT));
-                    if super::accent_button(ui, "Use it", theme::GREEN).clicked() {
-                        cfg.doorway = Some(hint);
-                        *changed = true;
-                    }
-                });
+                ui.add_space(4.0);
+                egui::Frame::none()
+                    .fill(theme::GREEN.gamma_multiply(0.10))
+                    .stroke(Stroke::new(1.0f32, theme::GREEN.gamma_multiply(0.35)))
+                    .rounding(6.0)
+                    .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("This looks like your doorway.").color(theme::TEXT).size(12.5));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if super::accent_button(ui, "Use it", theme::GREEN).clicked() {
+                                    cfg.doorway = Some(hint);
+                                    *changed = true;
+                                }
+                            });
+                        });
+                    });
             }
         }
         for (i, portal) in m.portals.iter().enumerate() {
             if portal.dismissed {
                 continue;
             }
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(format!("{}.", i + 1)).color(theme::BLUE).strong());
-                ui.label(format!("{} ({} trips)", portal.describe(), portal.uses));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button("Dismiss").clicked() {
-                        cam.send(CamCmd::DismissPortal(i));
-                    }
-                    if ui.small_button("Use as doorway").clicked() {
-                        cfg.doorway = Some(portal.rect());
-                        *changed = true;
-                    }
+            ui.add_space(4.0);
+            egui::Frame::none()
+                .fill(theme::CARD_HI)
+                .rounding(6.0)
+                .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(
+                        RichText::new(format!("{}.  {} ({} trips)", i + 1, portal.describe(), portal.uses))
+                            .size(12.5)
+                            .color(theme::TEXT),
+                    );
+                    ui.add_space(3.0);
+                    ui.horizontal(|ui| {
+                        if ui.small_button("Use as doorway").clicked() {
+                            cfg.doorway = Some(portal.rect());
+                            *changed = true;
+                        }
+                        if ui.small_button("Dismiss").clicked() {
+                            cam.send(CamCmd::DismissPortal(i));
+                        }
+                    });
                 });
-            });
         }
         for r in &m.ignore_hints {
             let already = cfg.ignore.iter().any(|q| q.overlap(r) > 0.5);
             if already {
                 continue;
             }
-            ui.horizontal(|ui| {
-                ui.label("Something keeps moving here with nobody near it.");
-                if ui.small_button("Ignore that spot").clicked() {
-                    cfg.ignore.push(*r);
-                    *changed = true;
-                }
-            });
+            ui.add_space(4.0);
+            egui::Frame::none()
+                .fill(theme::CARD_HI)
+                .rounding(6.0)
+                .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(RichText::new("Something keeps moving here with nobody near it.").size(12.5).color(theme::MUTED));
+                    ui.add_space(3.0);
+                    if ui.small_button("Ignore that spot").clicked() {
+                        cfg.ignore.push(*r);
+                        *changed = true;
+                    }
+                });
         }
+        ui.add_space(6.0);
         ui.horizontal_wrapped(|ui| {
             if ptz {
                 let mapping = snap.mapping.is_some();
@@ -377,6 +425,42 @@ impl CameraView {
     }
 }
 
+/// Kinect style skeleton: glowing bones and joints over the tracked body.
+fn draw_skeleton(p: &Painter, t: &vision::TrackView, to: &dyn Fn(f32, f32) -> Pos2) {
+    use vision::pose::{BONES, JOINTS, KP_THR};
+    if t.keypoints.len() < JOINTS {
+        return;
+    }
+    let col = if t.known { theme::GREEN } else { Color32::from_rgb(0x5C, 0xD6, 0xFF) };
+    let col = if t.lost { col.gamma_multiply(0.45) } else { col };
+    let k = &t.keypoints;
+    let seen = |i: usize| k[i].2 >= KP_THR;
+    let pt = |i: usize| to(k[i].0, k[i].1);
+    let glow = Stroke::new(5.0f32, col.gamma_multiply(0.22));
+    let bone = Stroke::new(2.0f32, col);
+    let mut lines: Vec<[Pos2; 2]> = BONES.iter().filter(|(a, b)| seen(*a) && seen(*b)).map(|(a, b)| [pt(*a), pt(*b)]).collect();
+    // Neck: shoulder midpoint to the nose.
+    if seen(5) && seen(6) && seen(0) {
+        let mid = pt(5) + (pt(6) - pt(5)) * 0.5;
+        lines.push([mid, pt(0)]);
+    }
+    for l in &lines {
+        p.line_segment(*l, glow);
+    }
+    for l in &lines {
+        p.line_segment(*l, bone);
+    }
+    for i in 0..JOINTS {
+        if seen(i) {
+            let c = pt(i);
+            let r = if i < 5 { 2.2 } else { 3.0 };
+            p.circle_filled(c, r + 2.0, col.gamma_multiply(0.25));
+            p.circle_filled(c, r, Color32::WHITE);
+            p.circle_stroke(c, r, Stroke::new(1.2f32, col));
+        }
+    }
+}
+
 fn draw_overlay(p: &Painter, rect: Rect, o: &Overlay, to: &dyn Fn(f32, f32) -> Pos2, show_motion: bool, show_tracks: bool) {
     if show_motion && o.mgw > 0 && o.motion.len() == o.mgw * o.mgh {
         for gy in 0..o.mgh {
@@ -393,7 +477,7 @@ fn draw_overlay(p: &Painter, rect: Rect, o: &Overlay, to: &dyn Fn(f32, f32) -> P
     for r in &o.ignore {
         let rr = Rect::from_two_pos(to(r.x, r.y), to(r.x + r.w, r.y + r.h));
         p.rect_filled(rr, 2.0, Color32::from_rgba_unmultiplied(15, 15, 15, 120));
-        paint::dashed_rect(p, rr, Stroke::new(1.0, theme::FAINT), 5.0);
+        paint::dashed_rect(p, rr, Stroke::new(1.0f32, theme::FAINT), 5.0);
         p.text(rr.left_top() + Vec2::new(4.0, 3.0), Align2::LEFT_TOP, "Ignored", theme::regular(11.0), theme::MUTED);
     }
     if let Some(d) = o.doorway {
@@ -405,7 +489,7 @@ fn draw_overlay(p: &Painter, rect: Rect, o: &Overlay, to: &dyn Fn(f32, f32) -> P
         } else {
             theme::GREEN
         };
-        paint::dashed_rect(p, rr, Stroke::new(2.0, col), 7.0);
+        paint::dashed_rect(p, rr, Stroke::new(2.0f32, col), 7.0);
         let label = if o.door_open { "Doorway (door open)" } else { "Doorway" };
         p.text(rr.left_bottom() + Vec2::new(4.0, -3.0), Align2::LEFT_BOTTOM, label, theme::semi(12.0), col);
     }
@@ -413,7 +497,7 @@ fn draw_overlay(p: &Painter, rect: Rect, o: &Overlay, to: &dyn Fn(f32, f32) -> P
         for f in &o.faces {
             let rr = Rect::from_two_pos(to(f.x, f.y), to(f.x + f.w, f.y + f.h));
             let col = if f.known { theme::GREEN } else { theme::AMBER };
-            p.rect_stroke(rr, 3.0, Stroke::new(1.6, col));
+            p.rect_stroke(rr, 3.0, Stroke::new(1.6f32, col));
             if !f.label.is_empty() {
                 p.text(rr.left_top() - Vec2::new(0.0, 3.0), Align2::LEFT_BOTTOM, &f.label, theme::semi(12.0), col);
             }
@@ -426,19 +510,20 @@ fn draw_overlay(p: &Painter, rect: Rect, o: &Overlay, to: &dyn Fn(f32, f32) -> P
             let col = if t.lost { col.gamma_multiply(0.45) } else { col };
             let c = rr.width().min(rr.height()) * 0.22;
             for (corner, dx, dy) in [(rr.left_top(), 1.0, 1.0), (rr.right_top(), -1.0, 1.0), (rr.left_bottom(), 1.0, -1.0), (rr.right_bottom(), -1.0, -1.0)] {
-                p.line_segment([corner, corner + Vec2::new(c * dx, 0.0)], Stroke::new(2.0, col));
-                p.line_segment([corner, corner + Vec2::new(0.0, c * dy)], Stroke::new(2.0, col));
+                p.line_segment([corner, corner + Vec2::new(c * dx, 0.0)], Stroke::new(2.0f32, col));
+                p.line_segment([corner, corner + Vec2::new(0.0, c * dy)], Stroke::new(2.0f32, col));
             }
             if t.path.len() > 1 {
                 let pts: Vec<Pos2> = t.path.iter().map(|q| to(q.0, q.1)).collect();
-                p.add(egui::Shape::line(pts, Stroke::new(1.5, col.gamma_multiply(0.5))));
+                p.add(egui::Shape::line(pts, Stroke::new(1.5f32, col.gamma_multiply(0.5))));
             }
+            draw_skeleton(p, t, to);
             if !t.predicted.is_empty() {
                 let mut pts = vec![to(t.x, t.y)];
                 pts.extend(t.predicted.iter().map(|q| to(q.0, q.1)));
-                p.extend(egui::Shape::dashed_line(&pts, Stroke::new(1.8, theme::BLUE), 6.0, 4.0));
+                p.extend(egui::Shape::dashed_line(&pts, Stroke::new(1.8f32, theme::BLUE), 6.0, 4.0));
                 if let Some(end) = pts.last() {
-                    p.circle_stroke(*end, 5.0, Stroke::new(1.5, theme::BLUE));
+                    p.circle_stroke(*end, 5.0, Stroke::new(1.5f32, theme::BLUE));
                 }
             }
             let name = if t.label.is_empty() { format!("Person {}", t.id) } else { t.label.clone() };
@@ -446,17 +531,19 @@ fn draw_overlay(p: &Painter, rect: Rect, o: &Overlay, to: &dyn Fn(f32, f32) -> P
             p.text(rr.left_top() - Vec2::new(0.0, 3.0), Align2::LEFT_BOTTOM, tag, theme::semi(11.5), col);
         }
     }
-    let mut y = rect.top() + 10.0;
+    let mut y = rect.top() + 8.0;
     for (on, text, col) in [
         (o.covered, "Camera view blocked", theme::RED),
         (o.light_change, "Lighting changed, relearning the room", theme::AMBER),
     ] {
         if on {
-            let pos = Pos2::new(rect.right() - 10.0, y);
-            let galley_rect = Rect::from_min_size(Pos2::new(rect.right() - 250.0, y - 2.0), Vec2::new(240.0, 20.0));
-            p.rect_filled(galley_rect, 5.0, Color32::from_black_alpha(150));
-            p.text(pos, Align2::RIGHT_TOP, text, theme::semi(12.0), col);
-            y += 24.0;
+            let g = p.fonts(|f| f.layout_no_wrap(text.to_string(), theme::semi(11.5), col));
+            let pill_w = g.size().x + 14.0;
+            let pill_h = g.size().y + 6.0;
+            let pill = Rect::from_min_size(Pos2::new(rect.right() - 8.0 - pill_w, y), Vec2::new(pill_w, pill_h));
+            p.rect_filled(pill, 5.0, Color32::from_black_alpha(165));
+            p.galley(pill.min + Vec2::new(7.0, 3.0), g, col);
+            y += pill_h + 5.0;
         }
     }
 }

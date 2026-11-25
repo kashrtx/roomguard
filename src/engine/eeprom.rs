@@ -60,48 +60,90 @@ pub const PC1550: &[Spec] = &[
     Spec { key: "21", name: "New Master Code", kind: Kind::Code("1"), default: "1234" },
     Spec { key: "22", name: "2nd Master Code", kind: Kind::Code("m2"), default: "" },
     Spec { key: "23", name: "Communication Formats", kind: d(2, 1), default: "11" },
-    Spec { key: "24", name: "PGM Output Options", kind: d(1, 2), default: "00" },
-    Spec { key: "25", name: "Communicator Call Directions", kind: d(6, 1), default: "111111" },
+    Spec { key: "24", name: "PGM Output Options", kind: d(1, 2), default: "04" },
+    Spec { key: "25", name: "Communicator Call Directions", kind: d(4, 1), default: "1111" },
     Spec { key: "26", name: "Downloading Telephone Number", kind: Kind::Phone(16), default: "" },
-    Spec { key: "27", name: "Downloading Access Code", kind: d(1, 4), default: "1550" },
-    Spec { key: "28", name: "Panel Identification Code", kind: d(1, 4), default: "1550" },
-    Spec { key: "29", name: "Rings Before Answering", kind: d(1, 2), default: "08" },
+    Spec { key: "27", name: "Downloading Access Code", kind: d(1, 4), default: "1515" },
+    Spec { key: "28", name: "Panel Identification Code", kind: d(1, 4), default: "1501" },
+    Spec { key: "29", name: "Rings Before Answering", kind: d(1, 2), default: "12" },
     Spec { key: "30", name: "Reset to Factory Default", kind: Kind::Action, default: "" },
     Spec { key: "31", name: "4th System Option Code", kind: Kind::Toggle(6), default: "" },
     Spec { key: "32", name: "5th System Option Code", kind: Kind::Toggle(6), default: "36" },
     Spec { key: "33", name: "Answering Machine Double Call Timer", kind: d(1, 3), default: "060" },
     Spec { key: "34", name: "6th System Option Code", kind: Kind::Toggle(6), default: "" },
-    Spec { key: "35", name: "LINKS1000 Test Reporting Code", kind: d(1, 2), default: "00" },
-    Spec { key: "36", name: "Keypad Lockout Control", kind: d(2, 2), default: "0505" },
+    Spec { key: "35", name: "LINKS1000 Test Reporting Code", kind: d(1, 2), default: "FF" },
+    Spec { key: "36", name: "Keypad Lockout Control", kind: d(2, 2), default: "0000" },
     Spec { key: "90", name: "Installer's Lockout Enable", kind: Kind::Action, default: "" },
     Spec { key: "91", name: "Installer's Lockout Disable", kind: Kind::Action, default: "" },
 ];
 
 pub const PC1832: &[Spec] = &[
+    Spec { key: "000", name: "Kp Enrollment", kind: Kind::Sub, default: "" },
+    Spec { key: "000.0", name: "Part/Slot Asgn", kind: d(1, 2), default: "11" },
+    Spec { key: "000.1", name: "Func Key 1", kind: d(1, 2), default: "03" },
+    Spec { key: "000.2", name: "Func Key 2", kind: d(1, 2), default: "04" },
+    Spec { key: "000.3", name: "Func Key 3", kind: d(1, 2), default: "06" },
+    Spec { key: "000.4", name: "Func Key 4", kind: d(1, 2), default: "14" },
+    Spec { key: "000.5", name: "Func Key 5", kind: d(1, 2), default: "16" },
     Spec { key: "001", name: "Zone Defs", kind: d(16, 2), default: "01050301050802040000000000000000" },
     Spec { key: "005", name: "Sys Times", kind: Kind::Sub, default: "" },
     Spec { key: "005.01", name: "Part 1 Times", kind: d(3, 3), default: "030045120" },
+    Spec { key: "005.02", name: "Part 2 Times", kind: d(3, 3), default: "030045120" },
     Spec { key: "005.09", name: "Bell Cutoff", kind: d(1, 3), default: "004" },
     Spec { key: "006", name: "Installer", kind: Kind::Code("inst"), default: "5555" },
     Spec { key: "007", name: "Master Code", kind: Kind::Code("40"), default: "1234" },
     Spec { key: "008", name: "Maint Code", kind: Kind::Code("maint"), default: "" },
-    Spec { key: "012", name: "Kp Lockout", kind: d(2, 3), default: "005005" },
-    Spec { key: "013", name: "1st Sys Opt", kind: Kind::Toggle(8), default: "8" },
-    Spec { key: "014", name: "2nd Sys Opt", kind: Kind::Toggle(8), default: "67" },
-    Spec { key: "015", name: "3rd Sys Opt", kind: Kind::Toggle(8), default: "1247" },
+    Spec { key: "009", name: "PGM 1-2 Opts", kind: d(2, 2), default: "1910" },
+    Spec { key: "010", name: "PGM 3-10 Opt", kind: d(8, 2), default: "0101010101010101" },
+    Spec { key: "011", name: "PGM 11-14", kind: d(4, 2), default: "01010101" },
+    Spec { key: "012", name: "Kp Lockout", kind: d(2, 3), default: "000000" },
+    Spec { key: "013", name: "1st Sys Opt", kind: Kind::Toggle(8), default: "3567" },
+    Spec { key: "014", name: "2nd Sys Opt", kind: Kind::Toggle(8), default: "6" },
+    Spec { key: "015", name: "3rd Sys Opt", kind: Kind::Toggle(8), default: "147" },
     Spec { key: "016", name: "4th Sys Opt", kind: Kind::Toggle(8), default: "15" },
+    Spec { key: "017", name: "5th Sys Opt", kind: Kind::Toggle(8), default: "1" },
+    Spec { key: "018", name: "6th Sys Opt", kind: Kind::Toggle(8), default: "" },
+    Spec { key: "019", name: "7th Sys Opt", kind: Kind::Toggle(8), default: "" },
+    Spec { key: "020", name: "Kp Zone Asgn", kind: d(8, 2), default: "0000000000000000" },
+    Spec { key: "021", name: "8th Sys Opt", kind: Kind::Toggle(8), default: "" },
+    Spec { key: "022", name: "9th Sys Opt", kind: Kind::Toggle(8), default: "" },
+    Spec { key: "023", name: "10th Sys Opt", kind: Kind::Toggle(8), default: "" },
+    Spec { key: "030", name: "Fast Loop", kind: Kind::Toggle(8), default: "" },
     Spec { key: "101", name: "Zone 1 Attr", kind: Kind::Toggle(8), default: "12346" },
-    Spec { key: "102", name: "Zone 2 Attr", kind: Kind::Toggle(8), default: "1246" },
+    Spec { key: "102", name: "Zone 2 Attr", kind: Kind::Toggle(8), default: "12456" },
     Spec { key: "103", name: "Zone 3 Attr", kind: Kind::Toggle(8), default: "12346" },
     Spec { key: "104", name: "Zone 4 Attr", kind: Kind::Toggle(8), default: "12346" },
-    Spec { key: "105", name: "Zone 5 Attr", kind: Kind::Toggle(8), default: "1246" },
-    Spec { key: "106", name: "Zone 6 Attr", kind: Kind::Toggle(8), default: "16" },
+    Spec { key: "105", name: "Zone 5 Attr", kind: Kind::Toggle(8), default: "12456" },
+    Spec { key: "106", name: "Zone 6 Attr", kind: Kind::Toggle(8), default: "1" },
     Spec { key: "107", name: "Zone 7 Attr", kind: Kind::Toggle(8), default: "12346" },
     Spec { key: "108", name: "Zone 8 Attr", kind: Kind::Toggle(8), default: "1246" },
+    Spec { key: "170", name: "PGM Timer", kind: d(1, 3), default: "005" },
+    Spec { key: "176", name: "Cross Zn Tmr", kind: d(1, 3), default: "060" },
+    Spec { key: "199", name: "AutoArm PrAl", kind: d(1, 3), default: "004" },
+    Spec { key: "201", name: "Part Mask", kind: Kind::Toggle(8), default: "1" },
+    Spec { key: "202", name: "Part 1 Zones", kind: Kind::Toggle(8), default: "12345678" },
     Spec { key: "301", name: "1st Phone No", kind: Kind::Phone(32), default: "5551234" },
+    Spec { key: "302", name: "2nd Phone No", kind: Kind::Phone(32), default: "" },
+    Spec { key: "303", name: "3rd Phone No", kind: Kind::Phone(32), default: "" },
     Spec { key: "310", name: "Acct Code", kind: d(1, 4), default: "1234" },
+    Spec { key: "311", name: "Part 1 Acct", kind: d(1, 4), default: "1234" },
+    Spec { key: "350", name: "Comm Formats", kind: d(2, 2), default: "0303" },
+    Spec { key: "377", name: "Comm Vars", kind: d(9, 3), default: "003003003000030010030030007" },
+    Spec { key: "380", name: "1st Comm Opt", kind: Kind::Toggle(8), default: "1" },
+    Spec { key: "381", name: "2nd Comm Opt", kind: Kind::Toggle(8), default: "56" },
+    Spec { key: "382", name: "3rd Comm Opt", kind: Kind::Toggle(8), default: "" },
+    Spec { key: "701", name: "1st Intl Opt", kind: Kind::Toggle(8), default: "" },
+    Spec { key: "702", name: "2nd Intl Opt", kind: Kind::Toggle(8), default: "2" },
+    Spec { key: "900", name: "Panel Ver", kind: Kind::Action, default: "" },
+    Spec { key: "901", name: "Walk Test", kind: Kind::Action, default: "" },
+    Spec { key: "902", name: "Supv Reset", kind: Kind::Action, default: "" },
+    Spec { key: "903", name: "View Supv", kind: Kind::Action, default: "" },
+    Spec { key: "989", name: "Dflt Master", kind: Kind::Action, default: "" },
+    Spec { key: "990", name: "Inst Lock On", kind: Kind::Action, default: "" },
+    Spec { key: "991", name: "Inst Lock Of", kind: Kind::Action, default: "" },
     Spec { key: "999", name: "Factory Dflt", kind: Kind::Action, default: "" },
     Spec { key: "kp074", name: "Key Options", kind: Kind::Toggle(8), default: "123" },
+    Spec { key: "kp076", name: "Kp Options 1", kind: Kind::Toggle(8), default: "1248" },
     Spec { key: "kp077", name: "Kp Options 2", kind: Kind::Toggle(8), default: "124567" },
     Spec { key: "kp201", name: "Zn 1 Chime", kind: Kind::Toggle(8), default: "1" },
     Spec { key: "kp202", name: "Zn 2 Chime", kind: Kind::Toggle(8), default: "1" },
@@ -142,12 +184,18 @@ pub struct CodeSlot {
     pub attrs: u8,
 }
 
+/// Bumped whenever a factory default is corrected, so saved panels can be
+/// brought up to date once (see `Eeprom::migrate`).
+pub const EEPROM_REV: u32 = 1;
+
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct Eeprom {
     pub sections: BTreeMap<String, String>,
     pub codes: BTreeMap<String, CodeSlot>,
     pub installer_lockout: bool,
+    /// Which set of default corrections this save already has.
+    pub rev: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -162,7 +210,7 @@ pub struct ZoneCfg {
 
 impl Eeprom {
     pub fn factory(model: Model) -> Eeprom {
-        let mut e = Eeprom::default();
+        let mut e = Eeprom { rev: EEPROM_REV, ..Eeprom::default() };
         for s in table(model) {
             match s.kind {
                 Kind::Code(slot) => {
@@ -177,6 +225,44 @@ impl Eeprom {
             }
         }
         e
+    }
+
+    /// Brings a panel saved by an earlier RoomGuard up to the real factory
+    /// defaults from the manuals. A section only changes if it still holds
+    /// exactly what the earlier version shipped with, so anything you
+    /// programmed yourself is left alone. Returns the sections it changed.
+    pub fn migrate(&mut self, model: Model) -> Vec<&'static str> {
+        let mut changed: Vec<&'static str> = Vec::new();
+        if self.rev < 1 {
+            // (section, what RoomGuard 2.0.0 shipped, the manual's factory value)
+            let fixes: &[(&'static str, &'static str, &'static str)] = match model {
+                Model::Pc1550 => &[("29", "08", "12"), ("36", "0505", "0000")],
+                Model::Pc1832 => &[
+                    ("012", "005005", "000000"),
+                    ("013", "8", "3567"),
+                    ("014", "67", "6"),
+                    ("015", "1247", "147"),
+                    ("017", "", "1"),
+                    ("018", "7", ""),
+                    ("102", "1246", "12456"),
+                    ("105", "1246", "12456"),
+                    ("106", "16", "1"),
+                    ("199", "001", "004"),
+                    ("377", "003003003030030003030001000", "003003003000030010030030007"),
+                    ("380", "156", "1"),
+                    ("381", "", "56"),
+                    ("702", "7", "2"),
+                ],
+            };
+            for (key, old, new) in fixes.iter() {
+                if self.sections.get(*key).map_or(false, |v| v.as_str() == *old) {
+                    self.sections.insert(key.to_string(), new.to_string());
+                    changed.push(*key);
+                }
+            }
+            self.rev = 1;
+        }
+        changed
     }
 
     pub fn raw(&self, model: Model, key: &str) -> String {
@@ -336,6 +422,15 @@ impl Eeprom {
                     19 => ZoneKind::H24(H24::Water),
                     20 => ZoneKind::H24(H24::Freeze),
                     21 => ZoneKind::H24(H24::Tamper),
+                    25 => ZoneKind::InteriorDelay,
+                    26 => ZoneKind::NonAlarm,
+                    30 => ZoneKind::H24(H24::FireSupervisory),
+                    31 => ZoneKind::DayZone,
+                    32 => ZoneKind::InstantStayAway,
+                    35 => ZoneKind::H24(H24::BellBuzzer),
+                    36 => ZoneKind::H24(H24::NonLatchTamper),
+                    37 => ZoneKind::NightZone,
+                    41 | 81 => ZoneKind::H24(H24::CarbonMonoxide),
                     _ => ZoneKind::Null,
                 };
                 let t = self.toggles(model, &format!("{:03}", 100 + zone));
@@ -348,6 +443,32 @@ impl Eeprom {
                     force_arm: t[4],
                 }
             }
+        }
+    }
+
+    /// Default PC1832 zone attributes (Section [101]-[108]) for a given zone
+    /// definition code, applied automatically when Section [001] changes.
+    /// Straight from the v4.6 manual's attribute table: 1 audible, 2 steady,
+    /// 3 chime, 4 bypass, 5 force arm, 6 swinger shutdown, 7 transmission
+    /// delay, 8 wireless.
+    pub fn default_zone_attrs(def_code: u32) -> &'static str {
+        match def_code {
+            0 => "",
+            1 | 2 | 3 => "12346",
+            4 | 25 | 35 => "1246",
+            5 | 6 | 37 => "12456",
+            7 | 8 | 13 | 14 | 29 | 41 => "1",
+            9 => "25",
+            10 => "24",
+            11 | 32 => "124",
+            12 => "2",
+            15 | 16 | 17 | 18 | 19 | 20 | 21 => "12",
+            22 | 23 | 26 => "5",
+            30 => "",
+            31 => "124567",
+            36 => "26",
+            81 | 87 | 88 => "18",
+            _ => "12346",
         }
     }
 
@@ -364,8 +485,9 @@ pub fn user_slots(model: Model) -> Vec<String> {
     match model {
         Model::Pc1550 => (1..=6).map(|n| n.to_string()).collect(),
         Model::Pc1832 => {
-            let mut v: Vec<String> = (1..=32).map(|n| format!("{:02}", n)).collect();
+            let mut v: Vec<String> = (1..=39).map(|n| format!("{:02}", n)).collect();
             v.push("40".to_string());
+            v.extend((41..=71).map(|n| format!("{:02}", n)));
             v
         }
     }
