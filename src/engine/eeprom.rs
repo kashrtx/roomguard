@@ -155,10 +155,40 @@ pub const PC1832: &[Spec] = &[
     Spec { key: "kp208", name: "Zn 8 Chime", kind: Kind::Toggle(8), default: "1" },
 ];
 
+/// VistaGuard 20P (VISTA-20P compatible) programming fields.
+pub const VISTA20P: &[Spec] = &[
+    Spec { key: "20", name: "Installer Code", kind: Kind::Code("inst"), default: "4112" },
+    Spec { key: "02", name: "Master Code", kind: Kind::Code("02"), default: "1234" },
+    Spec { key: "21", name: "Quick Arm Enable", kind: d(1, 1), default: "1" },
+    Spec { key: "23", name: "Quick/Forced Bypass", kind: d(1, 1), default: "1" },
+    Spec { key: "26", name: "Chime By Zone", kind: d(1, 1), default: "0" },
+    Spec { key: "33", name: "Bell Timeout (x4 min)", kind: d(1, 1), default: "1" },
+    Spec { key: "34", name: "Exit Delay (sec)", kind: d(1, 2), default: "60" },
+    Spec { key: "35", name: "Entry Delay 1 (sec)", kind: d(1, 2), default: "30" },
+    Spec { key: "36", name: "Entry Delay 2 (sec)", kind: d(1, 2), default: "45" },
+    Spec { key: "37", name: "Audible Exit Warning", kind: d(1, 1), default: "1" },
+    Spec { key: "38", name: "Confirmation of Arming Ding", kind: d(1, 1), default: "0" },
+    Spec { key: "41", name: "Primary Phone Number", kind: Kind::Phone(20), default: "5551234" },
+    Spec { key: "42", name: "Secondary Phone Number", kind: Kind::Phone(20), default: "" },
+    Spec { key: "43", name: "Partition 1 Account Code", kind: d(1, 4), default: "1234" },
+    Spec { key: "56", name: "Zone Types (01-08)", kind: d(8, 2), default: "0104030104090210" },
+    Spec { key: "57", name: "Function Keys A-D", kind: d(4, 2), default: "00000003" },
+    Spec { key: "59", name: "Exit Error Alarm", kind: d(1, 1), default: "1" },
+    Spec { key: "84", name: "Auto-Stay Arming", kind: d(1, 1), default: "1" },
+    Spec { key: "86", name: "Cancel Verify Display", kind: d(1, 1), default: "1" },
+    Spec { key: "91", name: "Option Selection", kind: d(1, 1), default: "8" },
+    Spec { key: "197", name: "Exit Time Display Interval", kind: d(1, 1), default: "1" },
+    Spec { key: "resp", name: "Zone Response Times (0-3)", kind: d(8, 1), default: "11111111" },
+    Spec { key: "97", name: "Reset Factory Defaults", kind: Kind::Action, default: "" },
+    Spec { key: "98", name: "Exit Programming (Lockout)", kind: Kind::Action, default: "" },
+    Spec { key: "99", name: "Exit Programming", kind: Kind::Action, default: "" },
+];
+
 pub fn table(model: Model) -> &'static [Spec] {
     match model {
         Model::Pc1550 => PC1550,
         Model::Pc1832 => PC1832,
+        Model::Vista20p => VISTA20P,
     }
 }
 
@@ -253,6 +283,7 @@ impl Eeprom {
                     ("381", "", "56"),
                     ("702", "7", "2"),
                 ],
+                Model::Vista20p => &[],
             };
             for (key, old, new) in fixes.iter() {
                 if self.sections.get(*key).map_or(false, |v| v.as_str() == *old) {
@@ -443,6 +474,34 @@ impl Eeprom {
                     force_arm: t[4],
                 }
             }
+            Model::Vista20p => {
+                let raw = self.raw(model, "56");
+                let i = zone.saturating_sub(1) * 2;
+                let code: u32 = raw.get(i..i + 2).and_then(|s| s.parse().ok()).unwrap_or(0);
+                let (kind, audible, steady, chime) = match code {
+                    1 => (ZoneKind::Delay1, true, true, true),
+                    2 => (ZoneKind::Delay2, true, true, true),
+                    3 => (ZoneKind::Instant, true, true, true),
+                    4 => (ZoneKind::StayAway, true, true, false),
+                    5 => (ZoneKind::DayZone, true, true, true),
+                    6 => (ZoneKind::H24(H24::Holdup), false, true, false),
+                    7 => (ZoneKind::H24(H24::Panic), true, true, false),
+                    8 => (ZoneKind::H24(H24::Medical), false, true, false),
+                    9 => (ZoneKind::Fire, true, false, false),
+                    10 => (ZoneKind::DelayStayAway, true, true, false),
+                    14 => (ZoneKind::H24(H24::CarbonMonoxide), true, false, false),
+                    16 => (ZoneKind::FireDelayed, true, false, false),
+                    _ => (ZoneKind::Null, false, true, false),
+                };
+                ZoneCfg {
+                    kind,
+                    audible,
+                    steady,
+                    chime,
+                    bypassable: !kind.is_fire() && !kind.is_24h(),
+                    force_arm: false,
+                }
+            }
         }
     }
 
@@ -490,6 +549,7 @@ pub fn user_slots(model: Model) -> Vec<String> {
             v.extend((41..=71).map(|n| format!("{:02}", n)));
             v
         }
+        Model::Vista20p => (2..=49).map(|n| format!("{:02}", n)).collect(),
     }
 }
 
@@ -504,5 +564,6 @@ pub fn is_master(model: Model, ee: &Eeprom, slot: &str) -> bool {
     match model {
         Model::Pc1550 => slot == "1" || slot == "m2",
         Model::Pc1832 => slot == "40" || (ee.attrs(slot) & 1) != 0,
+        Model::Vista20p => slot == "02",
     }
 }

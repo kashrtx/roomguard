@@ -135,6 +135,9 @@ impl SettingsView {
             if ui.radio_value(&mut cfg.model, Model::Pc1832, "LCD keypad (GuardSeries, PC1832 compatible, 8 zones)").changed() {
                 *changed = true;
             }
+            if ui.radio_value(&mut cfg.model, Model::Vista20p, "Voice LCD keypad (VistaGuard 20P, 6160V compatible, 8 zones)").changed() {
+                *changed = true;
+            }
         });
         if view.armed {
             ui.label(theme::muted("Disarm first to switch panels."));

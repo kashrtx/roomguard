@@ -56,7 +56,8 @@ impl SetupView {
             ui.allocate_rect(screen, egui::Sense::click());
         });
         let mut finished = false;
-        let win_w = (screen.width() - 64.0).clamp(480.0, 600.0);
+        let max_w = if self.step == 1 { 820.0 } else { 620.0 };
+        let win_w = (screen.width() - 64.0).clamp(480.0, max_w);
         egui::Window::new("setup")
             .title_bar(false)
             .collapsible(false)
@@ -175,7 +176,7 @@ impl SetupView {
 
     fn keypad(&mut self, ui: &mut egui::Ui) -> bool {
         title(ui, "Pick your keypad");
-        ui.label(theme::muted("Both behave like the real panels they're modelled on. You can switch any time in Settings."));
+        ui.label(theme::muted("Each behaves like the real panel it's modelled on. You can switch any time in Settings."));
         ui.add_space(12.0);
         let options = [
             (
@@ -198,8 +199,18 @@ impl SetupView {
                     "Bottom-hinged flip cover with guide",
                 ],
             ),
+            (
+                Model::Vista20p,
+                "Voice LCD (VistaGuard 20P)",
+                "6160V Voice style · 8 zones",
+                [
+                    "Speaks status & alarms with 6160V voice",
+                    "[Code]+Action keys & 2-step alarm clear",
+                    "Flip cover with exposed A–D quick keys",
+                ],
+            ),
         ];
-        ui.columns(2, |cols| {
+        ui.columns(3, |cols| {
             for (idx, (model, name, subtitle, lines)) in options.iter().enumerate() {
                 let col_ui = &mut cols[idx];
                 let selected = self.model == *model;

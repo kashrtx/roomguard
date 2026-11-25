@@ -11,7 +11,9 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use super::eeprom::{self, Eeprom, Kind, ZoneCfg};
+use super::kp_vista::VistaKp;
 use super::types::*;
+use crate::audio::voice;
 use crate::audio::{AudioCmd, BellPattern, ChimeKind, Pattern};
 use crate::util;
 
@@ -226,6 +228,7 @@ pub struct PanelSave {
     pub brightness: u8,
     pub contrast: u8,
     pub buzzer: u8,
+    pub voice_level: u8,
     pub clean_exit: bool,
 }
 
@@ -247,6 +250,7 @@ impl Default for PanelSave {
             brightness: 7,
             contrast: 5,
             buzzer: 12,
+            voice_level: 5,
             clean_exit: true,
         }
     }
@@ -314,6 +318,14 @@ pub struct Panel {
     pub fire_reset_until: Option<Instant>,
     pub owner: String,
     pub face_disarm: bool,
+    pub vista_mode: VistaKp,
+    pub vista_armed_by_inst: bool,
+    pub vista_sounder_mute_until: Option<Instant>,
+    pub vista_last_voice_alarm: Option<Instant>,
+    pub vista_exit_voice_done: bool,
+    pub vista_fault_idx: usize,
+    pub vista_voice_level: u8,
+    pub vista_alarm_mem_zone: Option<(u8, AlarmKind)>,
 }
 
 impl Panel {
@@ -322,6 +334,7 @@ impl Panel {
         let master = match model {
             Model::Pc1550 => "1",
             Model::Pc1832 => "40",
+            Model::Vista20p => "02",
         };
         if !ee.has_code(master) {
             ee.set_code(master, "1234");
@@ -389,6 +402,14 @@ impl Panel {
             fire_reset_until: None,
             owner,
             face_disarm: true,
+            vista_mode: VistaKp::Normal,
+            vista_armed_by_inst: false,
+            vista_sounder_mute_until: None,
+            vista_last_voice_alarm: None,
+            vista_exit_voice_done: false,
+            vista_fault_idx: 0,
+            vista_voice_level: save.voice_level.min(7),
+            vista_alarm_mem_zone: None,
         };
         // Like a real panel after a power cut, come back armed if it was armed.
         if let Some(a) = save.armed {
@@ -447,6 +468,7 @@ impl Panel {
             brightness: self.brightness,
             contrast: self.contrast,
             buzzer: self.buzzer,
+            voice_level: self.vista_voice_level,
             clean_exit,
         }
     }
@@ -470,6 +492,7 @@ impl Panel {
         let master = match self.model {
             Model::Pc1550 => user == 1,
             Model::Pc1832 => user == 40,
+            Model::Vista20p => user == 2,
         };
         if user == 0 {
             "quick arm".to_string()
@@ -497,7 +520,7 @@ impl Panel {
     /// tone"; the PC1550 gives "one long beep".
     pub fn long_beep(&mut self) {
         let ms = match self.model {
-            Model::Pc1550 => 1000,
+            Model::Pc1550 | Model::Vista20p => 1000,
             Model::Pc1832 => 2000,
         };
         self.audio(AudioCmd::Beeps { count: 1, on_ms: ms, off_ms: 0 });
@@ -506,6 +529,7 @@ impl Panel {
         let ms = match self.model {
             Model::Pc1550 => 1500,
             Model::Pc1832 => 2000,
+            Model::Vista20p => 1000,
         };
         self.audio(AudioCmd::Beeps { count: 1, on_ms: ms, off_ms: 0 });
     }
@@ -529,6 +553,7 @@ impl Panel {
         match self.model {
             Model::Pc1550 => !self.ee.toggle(self.model, "12", 1),
             Model::Pc1832 => self.ee.toggle(self.model, "380", 1),
+            Model::Vista20p => !self.ee.raw(self.model, "41").is_empty(),
         }
     }
 
@@ -565,7 +590,7 @@ impl Panel {
     // ----- state queries -----
 
     pub fn is_programming(&self) -> bool {
-        matches!(self.kp, KpMode::Program(_))
+        matches!(self.kp, KpMode::Program(_)) || matches!(self.vista_mode, VistaKp::Program { .. })
     }
 
     pub fn violated(&self, z: usize) -> bool {
@@ -626,6 +651,19 @@ impl Panel {
                     self.ee.entry_or(m, "005.01", 0, 30)
                 }
             }
+            Model::Vista20p => {
+                let raw = if kind == ZoneKind::Delay2 {
+                    self.ee.entry_or(m, "36", 0, 45)
+                } else {
+                    self.ee.entry_or(m, "35", 0, 30)
+                };
+                match raw {
+                    97 => 120,
+                    98 => 180,
+                    99 => 240,
+                    other => other,
+                }
+            }
         };
         v.max(1) as u64
     }
@@ -635,6 +673,10 @@ impl Panel {
         let v = match m {
             Model::Pc1550 => self.ee.entry_or(m, "17", 1, 120),
             Model::Pc1832 => self.ee.entry_or(m, "005.01", 2, 120),
+            Model::Vista20p => match self.ee.entry_or(m, "34", 0, 60) {
+                97 => 120,
+                other => other,
+            },
         };
         v.max(1) as u64
     }
@@ -644,6 +686,10 @@ impl Panel {
         let v = match m {
             Model::Pc1550 => self.ee.entry_or(m, "17", 2, 4),
             Model::Pc1832 => self.ee.entry_or(m, "005.09", 0, 4),
+            Model::Vista20p => match self.ee.entry_or(m, "33", 0, 1) {
+                0 => 60,
+                n => n * 4,
+            },
         };
         v.max(1) as u64
     }
@@ -652,6 +698,7 @@ impl Panel {
         match self.model {
             Model::Pc1550 => self.ee.entry_or(self.model, "15", 0, 3).min(99) as u8,
             Model::Pc1832 => self.ee.entry_or(self.model, "377", 0, 3).min(99) as u8,
+            Model::Vista20p => 2,
         }
     }
 
@@ -659,6 +706,7 @@ impl Panel {
         match self.model {
             Model::Pc1550 => self.ee.entry_or(self.model, "15", 1, 0),
             Model::Pc1832 => self.ee.entry_or(self.model, "377", 3, 30),
+            Model::Vista20p => 15,
         }
     }
 
@@ -666,6 +714,7 @@ impl Panel {
         match self.model {
             Model::Pc1550 => self.ee.entry_or(self.model, "17", 3, 30) as u64,
             Model::Pc1832 => self.ee.entry_or(self.model, "377", 4, 30) as u64,
+            Model::Vista20p => 15,
         }
     }
 
@@ -674,6 +723,7 @@ impl Panel {
         match m {
             Model::Pc1550 => (self.ee.entry_or(m, "36", 0, 0), self.ee.entry_or(m, "36", 1, 0)),
             Model::Pc1832 => (self.ee.entry_or(m, "012", 0, 0), self.ee.entry_or(m, "012", 1, 0)),
+            Model::Vista20p => (0, 0),
         }
     }
 
@@ -681,6 +731,7 @@ impl Panel {
         match self.model {
             Model::Pc1550 => self.ee.toggle(self.model, "13", 3),
             Model::Pc1832 => self.ee.toggle(self.model, "014", 1),
+            Model::Vista20p => self.ee.entry_or(self.model, "38", 0, 0) != 0,
         }
     }
 
@@ -688,6 +739,7 @@ impl Panel {
         match self.model {
             Model::Pc1550 => self.quick_arm,
             Model::Pc1832 => self.ee.toggle(self.model, "015", 4),
+            Model::Vista20p => self.ee.entry_or(self.model, "21", 0, 1) != 0,
         }
     }
 
@@ -695,6 +747,7 @@ impl Panel {
         match self.model {
             Model::Pc1550 => self.ee.toggle(self.model, "32", 4),
             Model::Pc1832 => self.ee.toggle(self.model, "015", 3),
+            Model::Vista20p => false,
         }
     }
 
@@ -785,7 +838,19 @@ impl Panel {
             return;
         };
         let mode = match ex.how {
-            ArmHow::AwayKey | ArmHow::Auto => ArmMode::Away,
+            ArmHow::AwayKey => {
+                // VISTA-20P Auto-Stay (*84 = 1): if armed Away from keypad and
+                // no Entry/Exit door opened during exit delay, auto-convert to Stay.
+                if self.model == Model::Vista20p
+                    && self.ee.entry_or(Model::Vista20p, "84", 0, 1) != 0
+                    && !ex.delay_seen
+                {
+                    ArmMode::Stay
+                } else {
+                    ArmMode::Away
+                }
+            }
+            ArmHow::Auto => ArmMode::Away,
             ArmHow::StayKey | ArmHow::NoEntry => ArmMode::Stay,
             _ => {
                 if ex.delay_seen {
@@ -823,7 +888,11 @@ impl Panel {
         let exit_fault = match self.model {
             Model::Pc1550 => self.ee.toggle(self.model, "34", 3),
             Model::Pc1832 => self.ee.toggle(self.model, "013", 6),
+            Model::Vista20p => self.ee.entry_or(self.model, "59", 0, 1) != 0,
         };
+        if self.model == Model::Vista20p && self.squawk_on() {
+            self.squawk(1);
+        }
         for z in 1..=self.n() {
             if !self.violated(z) || self.zones[z - 1].bypassed {
                 continue;
@@ -870,6 +939,7 @@ impl Panel {
                     self.temp("Alarm Occurred", "While Armed  <>", 4000);
                     self.pending_kp = Some(KpMode::Memory { level: 0, idx: 0 });
                 }
+                Model::Vista20p => {}
             }
         }
         let user_squawk = self.model == Model::Pc1832
@@ -881,7 +951,11 @@ impl Panel {
         if had_alarm && self.model == Model::Pc1832 && self.ee.toggle(self.model, "381", 1) {
             self.beeps(8);
         } else if was_on {
-            self.beeps(3);
+            if self.model == Model::Vista20p {
+                self.vista_confirm_beep();
+            } else {
+                self.beeps(3);
+            }
         }
         self.log(EvKind::Disarm, format!("Disarmed by {}", self.who(user)));
         self.report(ReportKind::Opening, 401, user as u16, format!("Opening by {}", self.who(user)), 0);
@@ -903,6 +977,9 @@ impl Panel {
         self.report(ReportKind::EntryStarted, 0, zone as u16, format!("Entry delay, zone {}", zone), 0);
         if self.model == Model::Pc1550 && self.ee.toggle(self.model, "34", 5) {
             self.squawk(1);
+        }
+        if self.model == Model::Vista20p {
+            self.vista_speak(vec!["disarm_system_now".into()]);
         }
         self.dirty = true;
     }
@@ -943,6 +1020,10 @@ impl Panel {
             self.out.push(Out::Snapshot(kind.label().to_lowercase()));
         }
         self.log(EvKind::Alarm, text);
+        if self.model == Model::Vista20p && kind != AlarmKind::Duress {
+            self.vista_last_voice_alarm = Some(now);
+            self.vista_speak_alarm(kind, zone);
+        }
         self.out.push(Out::Save);
         self.dirty = true;
     }
@@ -952,7 +1033,11 @@ impl Panel {
         for a in self.alarms.iter_mut() {
             a.silenced = true;
         }
-        self.beeps(3);
+        if self.model == Model::Vista20p {
+            self.vista_confirm_beep();
+        } else {
+            self.beeps(3);
+        }
         self.log(EvKind::Disarm, format!("Alarm silenced by {}", self.who(user)));
         self.out.push(Out::Disarmed { after_alarm: true });
         self.dirty = true;
@@ -966,7 +1051,7 @@ impl Panel {
                     self.memory.truncate(3);
                 }
             }
-            Model::Pc1832 => self.memory[0].clear(),
+            Model::Pc1832 | Model::Vista20p => self.memory[0].clear(),
         }
     }
 
@@ -979,7 +1064,7 @@ impl Panel {
     pub fn reactivate_stay(&mut self, now: Instant) {
         let any = (1..=self.n()).any(|z| self.zones[z - 1].auto_bypass && self.cfg(z).kind != ZoneKind::NightZone);
         let delayed = match self.model {
-            Model::Pc1832 => true,
+            Model::Pc1832 | Model::Vista20p => true,
             Model::Pc1550 => self.ee.toggle(self.model, "32", 3),
         };
         let secs = self.exit_secs();
@@ -1043,6 +1128,16 @@ impl Panel {
                     36
                 } else {
                     400
+                }
+            }
+            Model::Vista20p => {
+                let raw = self.ee.raw(self.model, "resp");
+                let ch = raw.chars().nth(z.saturating_sub(1)).unwrap_or('1');
+                match ch {
+                    '0' => 10,
+                    '2' => 700,
+                    '3' => 1200,
+                    _ => 350,
                 }
             }
         }
@@ -1409,7 +1504,7 @@ impl Panel {
             return self.k_section(p, key);
         }
         let digits = match self.model {
-            Model::Pc1550 => 2,
+            Model::Pc1550 | Model::Vista20p => 2,
             Model::Pc1832 => 3,
         };
         match key {
@@ -1876,6 +1971,19 @@ impl Panel {
                 };
                 self.audio(AudioCmd::Chime(kind));
             }
+            Model::Vista20p => {
+                if !opened {
+                    return;
+                }
+                // 6160V Chime: 3 rapid beeps + voice announcing the zone!
+                self.beeps(3);
+                let words = voice::filter_zone_words(&self.label(z));
+                if words.is_empty() {
+                    self.vista_speak(vec!["fault".into()]);
+                } else {
+                    self.vista_speak(words);
+                }
+            }
         }
     }
 
@@ -2039,6 +2147,7 @@ impl Panel {
         match self.model {
             Model::Pc1550 => self.press_1550(key, now),
             Model::Pc1832 => self.press_1832(key, now),
+            Model::Vista20p => self.press_vista(key, now),
         }
         // PowerSeries keypads: "These buttons can also be activated by
         // pressing and holding numbers [1] through [5] respectively for 2
@@ -2055,6 +2164,20 @@ impl Panel {
             if !self.is_programming() {
                 self.kp = KpMode::Normal;
                 self.buf.clear();
+            }
+            return;
+        }
+        if self.model == Model::Vista20p {
+            // Vista Function Key D (mapped to Key::Away): check field *57 entry 3
+            if key == Key::Away {
+                let code = self.ee.entry_or(Model::Vista20p, "57", 3, 3);
+                match code {
+                    3 => self.fn_arm(ArmHow::AwayKey, now),
+                    4 => self.fn_arm(ArmHow::StayKey, now),
+                    2 => self.vista_speak_status(),
+                    _ => self.vista_speak_status(),
+                }
+                return;
             }
             return;
         }
@@ -2149,9 +2272,15 @@ impl Panel {
         let m = self.model;
         match key {
             Key::Fire => {
+                if m == Model::Vista20p {
+                    self.beeps(2);
+                    self.trigger(AlarmKind::Fire, 95, true, false, now);
+                    return;
+                }
                 let enabled = match m {
                     Model::Pc1550 => !self.ee.toggle(m, "34", 6),
                     Model::Pc1832 => self.ee.toggle(m, "015", 1) && self.ee.toggle(m, "kp074", 1),
+                    Model::Vista20p => true,
                 };
                 if !enabled {
                     self.error_tone();
@@ -2166,6 +2295,11 @@ impl Panel {
                 self.trigger(AlarmKind::Fire, 0, true, false, now);
             }
             Key::Aux => {
+                if m == Model::Vista20p {
+                    self.beeps(2);
+                    self.trigger(AlarmKind::Medical, 96, false, false, now);
+                    return;
+                }
                 if m == Model::Pc1832 && !self.ee.toggle(m, "kp074", 2) {
                     self.error_tone();
                     return;
@@ -2174,17 +2308,22 @@ impl Panel {
                 self.trigger(AlarmKind::Medical, 0, false, false, now);
             }
             Key::Panic => {
+                if m == Model::Vista20p {
+                    self.beeps(2);
+                    self.trigger(AlarmKind::Panic, 99, true, false, now);
+                    return;
+                }
                 if m == Model::Pc1832 && !self.ee.toggle(m, "kp074", 3) {
                     self.error_tone();
                     return;
                 }
                 let audible = match m {
                     Model::Pc1550 => self.ee.toggle(m, "12", 6),
-                    Model::Pc1832 => self.ee.toggle(m, "015", 2),
+                    Model::Pc1832 | Model::Vista20p => self.ee.toggle(m, "015", 2),
                 };
                 let feedback = match m {
                     Model::Pc1550 => self.ee.toggle(m, "14", 5),
-                    Model::Pc1832 => audible,
+                    Model::Pc1832 | Model::Vista20p => audible,
                 };
                 if feedback {
                     self.beeps(3);
@@ -2207,6 +2346,7 @@ impl Panel {
         let master = match self.model {
             Model::Pc1550 => 1,
             Model::Pc1832 => 40,
+            Model::Vista20p => 2,
         };
         self.log(EvKind::Disarm, format!("Recognized {} at the camera", name));
         self.disarm(master, now);
@@ -2216,6 +2356,7 @@ impl Panel {
     // ----- the clock tick -----
 
     pub fn tick(&mut self, now: Instant, wall_ms: i64) {
+        self.tick_vista(now);
         if self.armed.map_or(false, |a| a.reactivate_at.map_or(false, |t| now >= t)) {
             self.finish_reactivate(now);
         }
@@ -2390,7 +2531,21 @@ impl Panel {
             }
         }
         if fire {
+            if self.model == Model::Vista20p {
+                // 6160V Fire alarm: loud pulsing Temporal-3 on keypad speaker.
+                return Pattern::Beeps { on_ms: 500, off_ms: 500, count: 3, period_ms: 4000 };
+            }
             return Pattern::Beeps { on_ms: 500, off_ms: 500, count: 1, period_ms: 1000 };
+        }
+        // Vista 6160V burglary alarm speaker: continuous slow alternating
+        // two-tone hi-lo "dee-doo dee-doo" (~1960 Hz <-> ~1040 Hz, ~420 ms per tone),
+        // muted for 10s if any key is pressed while external bell keeps ringing.
+        if self.model == Model::Vista20p {
+            let muted = self.vista_sounder_mute_until.map_or(false, |t| now < t);
+            let burg = self.live_alarms(now).any(|a| a.audible && !a.kind.pulsed());
+            if burg && !muted {
+                return Pattern::HiLo { hi_hz: 1960, lo_hz: 1040, step_ms: 420 };
+            }
         }
         if buzzer_alarm {
             return Pattern::Steady;
@@ -2403,9 +2558,17 @@ impl Panel {
         }
         if let Some(e) = &self.entry {
             let left = (e.started + e.dur).saturating_duration_since(now).as_secs_f32();
+            if self.model == Model::Vista20p {
+                // Vista Entry Delay: 1 Hz slow beeps (NOT continuous!), ramping
+                // to rapid ~4.5 Hz beeps in the final 10 seconds.
+                if left <= 10.0 {
+                    return Pattern::Beeps { on_ms: 100, off_ms: 120, count: 1, period_ms: 220 };
+                }
+                return Pattern::Beeps { on_ms: 200, off_ms: 800, count: 1, period_ms: 1000 };
+            }
             let urgency = match self.model {
                 Model::Pc1550 => self.ee.toggle(self.model, "34", 4),
-                Model::Pc1832 => true,
+                Model::Pc1832 | Model::Vista20p => true,
             };
             if urgency && left <= 10.0 {
                 return Pattern::Beeps { on_ms: 250, off_ms: 250, count: 1, period_ms: 500 };
@@ -2434,6 +2597,16 @@ impl Panel {
                             return Pattern::Beeps { on_ms: 90, off_ms: 0, count: 1, period_ms: 333 };
                         }
                         return Pattern::Beeps { on_ms: 100, off_ms: 0, count: 1, period_ms: 1000 };
+                    }
+                }
+                Model::Vista20p => {
+                    // Vista *37 Audible Exit Warning: 1 Hz single beeps (150ms ON / 850ms OFF),
+                    // ramping to ~4 Hz urgency (100ms ON / 150ms OFF) in final 10s.
+                    if !ex.silent && self.ee.entry_or(self.model, "37", 0, 1) != 0 {
+                        if left <= 10.0 {
+                            return Pattern::Beeps { on_ms: 100, off_ms: 150, count: 1, period_ms: 250 };
+                        }
+                        return Pattern::Beeps { on_ms: 150, off_ms: 850, count: 1, period_ms: 1000 };
                     }
                 }
             }
@@ -2486,6 +2659,7 @@ impl Panel {
                         BellPattern::Temporal3
                     }
                 }
+                Model::Vista20p => BellPattern::Temporal3,
             };
         }
         if co {
@@ -2514,7 +2688,7 @@ impl Panel {
                     Some(((v / 100) as u8, (v % 100) as u8))
                 }
             }
-            Model::Pc1832 => self.auto_arm_hm,
+            Model::Pc1832 | Model::Vista20p => self.auto_arm_hm,
         };
         let Some((hh, mm)) = time else {
             return;
@@ -2527,6 +2701,7 @@ impl Panel {
             let bell_bursts = match self.model {
                 Model::Pc1550 => !self.ee.toggle(self.model, "32", 2),
                 Model::Pc1832 => self.ee.toggle(self.model, "014", 2),
+                Model::Vista20p => false,
             };
             if bell_bursts && self.auto_last_squawk.map_or(true, |t| now.saturating_duration_since(t).as_secs() >= 10) {
                 self.auto_last_squawk = Some(now);
@@ -2612,6 +2787,13 @@ impl Panel {
             };
             return (StatusKind::Program, "Installer programming".into(), what);
         }
+        if let VistaKp::Program { field, .. } = &self.vista_mode {
+            let what = match field {
+                Some(f) => format!("Field *{}", f),
+                None => "Enter *field or *99 to exit".to_string(),
+            };
+            return (StatusKind::Program, "Installer programming".into(), what);
+        }
         if let Some(a) = self.live_alarms(now).next() {
             let where_ = if a.zone == 0 { "Keypad".to_string() } else { format!("Zone {} {}", a.zone, self.label(a.zone as usize)) };
             return (StatusKind::Alarm, format!("{} alarm", a.kind.label()), where_);
@@ -2677,7 +2859,7 @@ pub fn trouble_names(model: Model) -> Vec<(u32, &'static str)> {
             (tb::ZONE_FAULT, "Camera offline"),
             (tb::ZONE_TAMPER, "Camera view blocked"),
         ],
-        Model::Pc1832 => vec![
+        Model::Pc1832 | Model::Vista20p => vec![
             (tb::LOW_BATT, "Low battery"),
             (tb::BELL, "Bell circuit"),
             (tb::AC, "AC failure"),

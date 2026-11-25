@@ -3,6 +3,7 @@
 
 pub mod classic;
 pub mod lcd;
+pub mod vista;
 
 use std::collections::HashSet;
 
@@ -74,6 +75,8 @@ pub struct KeyInput {
     pub door_anim_1550: f32,
     /// 0.0 = closed (up, over keys), 1.0 = open (flipped down).
     pub door_anim_5500: f32,
+    /// 0.0 = closed (up, over numeric keys), 1.0 = open (flipped down).
+    pub door_anim_6160: f32,
     doors_init: bool,
     /// When the sound output was last nudged awake.
     last_wake: f64,
@@ -87,6 +90,7 @@ impl Default for KeyInput {
             flash: Vec::new(),
             door_anim_1550: 1.0,
             door_anim_5500: 1.0,
+            door_anim_6160: 1.0,
             doors_init: false,
             last_wake: -10.0,
         }
@@ -95,19 +99,25 @@ impl Default for KeyInput {
 
 impl KeyInput {
     /// Smoothly advances the open/close cover animations toward the saved config.
-    pub fn sync_doors(&mut self, ctx: &egui::Context, open_1550: bool, open_5500: bool) {
+    pub fn sync_doors(&mut self, ctx: &egui::Context, open_1550: bool, open_5500: bool, open_6160: bool) {
         let t1550 = if open_1550 { 1.0 } else { 0.0 };
         let t5500 = if open_5500 { 1.0 } else { 0.0 };
+        let t6160 = if open_6160 { 1.0 } else { 0.0 };
         if !self.doors_init {
             self.door_anim_1550 = t1550;
             self.door_anim_5500 = t5500;
+            self.door_anim_6160 = t6160;
             self.doors_init = true;
             return;
         }
         let dt = ctx.input(|i| i.unstable_dt).clamp(0.001, 0.05);
         let speed = 1.0 - (-dt * 11.0).exp();
         let mut moving = false;
-        for (cur, tgt) in [(&mut self.door_anim_1550, t1550), (&mut self.door_anim_5500, t5500)] {
+        for (cur, tgt) in [
+            (&mut self.door_anim_1550, t1550),
+            (&mut self.door_anim_5500, t5500),
+            (&mut self.door_anim_6160, t6160),
+        ] {
             if (*cur - tgt).abs() > 0.002 {
                 *cur += (tgt - *cur) * speed;
                 moving = true;

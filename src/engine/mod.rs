@@ -6,6 +6,7 @@
 pub mod eeprom;
 mod kp1550;
 mod kp1832;
+pub mod kp_vista;
 pub mod operator;
 pub mod panel;
 pub mod types;
@@ -46,6 +47,7 @@ pub enum PanelEdit {
     SetQuickArm(bool),
     SetAutoArm { enabled: bool, hm: Option<(u8, u8)> },
     SetKeypadLevels { brightness: u8, contrast: u8, buzzer: u8 },
+    SetVoiceLevel(u8),
     SetInstallerLockout(bool),
     FactoryDefault,
 }
@@ -116,6 +118,7 @@ pub struct ProgView {
     pub brightness: u8,
     pub contrast: u8,
     pub buzzer: u8,
+    pub voice_level: u8,
 }
 
 impl Default for ProgView {
@@ -134,6 +137,7 @@ impl Default for ProgView {
             brightness: 7,
             contrast: 5,
             buzzer: 12,
+            voice_level: 5,
         }
     }
 }
@@ -159,6 +163,7 @@ fn prog_fingerprint(p: &Panel) -> u64 {
     p.brightness.hash(&mut h);
     p.contrast.hash(&mut h);
     p.buzzer.hash(&mut h);
+    p.vista_voice_level.hash(&mut h);
     h.finish()
 }
 
@@ -177,6 +182,7 @@ fn prog_view(p: &Panel) -> ProgView {
         brightness: p.brightness,
         contrast: p.contrast,
         buzzer: p.buzzer,
+        voice_level: p.vista_voice_level,
     }
 }
 
@@ -275,6 +281,7 @@ fn master_slot(model: Model) -> &'static str {
     match model {
         Model::Pc1550 => "1",
         Model::Pc1832 => "40",
+        Model::Vista20p => "02",
     }
 }
 
@@ -282,6 +289,7 @@ fn voice_for(model: Model) -> KeypadVoice {
     match model {
         Model::Pc1550 => KeypadVoice::Classic,
         Model::Pc1832 => KeypadVoice::Pk5500,
+        Model::Vista20p => KeypadVoice::Vista6160,
     }
 }
 
@@ -384,6 +392,7 @@ impl Engine {
     fn push_volumes(&mut self) {
         let s = &self.cfg.sound;
         self.audio.send(AudioCmd::BuzzerLevel(if self.panel.model == Model::Pc1832 { self.panel.buzzer } else { 20 }));
+        self.audio.send(AudioCmd::VoiceLevel(self.panel.vista_voice_level));
         self.audio.send(AudioCmd::Volumes {
             master: s.master,
             siren: s.siren,
@@ -530,13 +539,14 @@ impl Engine {
                 let model = self.panel.model;
                 self.panel.ee.set_code(master_slot(model), &code);
                 self.panel.log(EvKind::Program, "Master code set during setup");
-                let other = match model {
-                    Model::Pc1550 => Model::Pc1832,
-                    Model::Pc1832 => Model::Pc1550,
-                };
-                let mut save = util::load_json::<PanelSave>(&panel_path(other)).unwrap_or_else(|| PanelSave::fresh(other));
-                save.ee.set_code(master_slot(other), &code);
-                util::save_json(&panel_path(other), &save);
+                for other in [Model::Pc1550, Model::Pc1832, Model::Vista20p] {
+                    if other == model {
+                        continue;
+                    }
+                    let mut save = util::load_json::<PanelSave>(&panel_path(other)).unwrap_or_else(|| PanelSave::fresh(other));
+                    save.ee.set_code(master_slot(other), &code);
+                    util::save_json(&panel_path(other), &save);
+                }
                 self.save(false);
             }
             EngineMsg::EditPanel(edit) => self.apply_panel_edit(edit, now),
@@ -583,6 +593,10 @@ impl Engine {
                     self.push_volumes();
                 }
             }
+            PanelEdit::SetVoiceLevel(level) => {
+                self.panel.vista_voice_level = level.min(7);
+                self.audio.send(AudioCmd::VoiceLevel(self.panel.vista_voice_level));
+            }
             PanelEdit::SetChime(on) => {
                 self.panel.chime = on;
                 self.panel.log(EvKind::Program, if on { "Door chime enabled (Settings)" } else { "Door chime disabled (Settings)" });
@@ -593,6 +607,8 @@ impl Engine {
                 }
                 if m == Model::Pc1550 {
                     self.panel.quick_arm = on;
+                } else if m == Model::Vista20p {
+                    self.panel.ee.sections.insert("21".to_string(), if on { "1" } else { "0" }.to_string());
                 } else {
                     let mut t = self.panel.ee.toggles(m, "015");
                     t[3] = on;
@@ -810,7 +826,7 @@ impl Engine {
             } else {
                 let motion = self.cam_motion[i] || (i == 0 && self.door_open);
                 match self.panel.model {
-                    Model::Pc1832 => (motion, self.cam_covered, !self.cam_online),
+                    Model::Pc1832 | Model::Vista20p => (motion, self.cam_covered, !self.cam_online),
                     Model::Pc1550 => (motion || self.cam_covered || !self.cam_online, false, false),
                 }
             };
@@ -927,13 +943,14 @@ impl Engine {
         let (phone, account) = match m {
             Model::Pc1550 => (ee.raw(m, "01"), ee.raw(m, "02")),
             Model::Pc1832 => (ee.raw(m, "301"), ee.raw(m, "310")),
+            Model::Vista20p => (ee.raw(m, "41"), ee.raw(m, "43")),
         };
         let code42 = if m == Model::Pc1550 && r.zone_or_user > 0 && matches!(r.kind, ReportKind::Alarm(_)) {
             ee.entry_digits(m, "05", r.zone_or_user as usize - 1)
         } else {
             format!("{:02}", r.cid % 100)
         };
-        DialInfo { phone, account, contact_id: m == Model::Pc1832, code42 }
+        DialInfo { phone, account, contact_id: m != Model::Pc1550, code42 }
     }
 
     fn handle_op(&mut self, outs: Vec<OpOut>) {
@@ -1070,11 +1087,34 @@ impl Engine {
         }
         let p = &self.panel;
         let (status, title, detail) = p.status(now);
-        let (lcd, lcd_cursor) = if p.model == Model::Pc1832 {
-            let l = p.lcd_1832(now, wall);
-            (l.lines, l.cursor)
-        } else {
-            ([String::new(), String::new()], None)
+        let (lcd, lcd_cursor) = match p.model {
+            Model::Pc1832 => {
+                let l = p.lcd_1832(now, wall);
+                (l.lines, l.cursor)
+            }
+            Model::Vista20p => {
+                let l = p.lcd_vista(now, wall);
+                (l.lines, l.cursor)
+            }
+            Model::Pc1550 => ([String::new(), String::new()], None),
+        };
+        let lcd_leds = match p.model {
+            Model::Pc1832 => p.leds_5500(now),
+            Model::Vista20p => p.leds_vista(),
+            Model::Pc1550 => [Led::Off; 4],
+        };
+        let backlight = match p.model {
+            Model::Pc1832 if !p.ee.toggle(Model::Pc1832, "016", 5) => 0.0,
+            Model::Vista20p => {
+                // 6160V dims backlight after ~30s idle; wakes on keypress, alarm, delay, or fault.
+                let awake = now.saturating_duration_since(p.last_key_at).as_secs() < 30
+                    || p.alarm_sounding(now)
+                    || p.entry.is_some()
+                    || p.exit.is_some()
+                    || !p.open_zones().is_empty();
+                if awake { 1.0 } else { 0.30 }
+            }
+            _ => p.brightness as f32 / 9.0,
         };
         let view = View {
             seq: self.seq,
@@ -1082,12 +1122,8 @@ impl Engine {
             leds: if p.model == Model::Pc1550 { p.leds_1550(now) } else { [Led::Off; 11] },
             lcd,
             lcd_cursor,
-            lcd_leds: if p.model == Model::Pc1832 { p.leds_5500(now) } else { [Led::Off; 4] },
-            backlight: if p.model == Model::Pc1832 && !p.ee.toggle(Model::Pc1832, "016", 5) {
-                0.0
-            } else {
-                p.brightness as f32 / 9.0
-            },
+            lcd_leds,
+            backlight,
             contrast: p.contrast as f32 / 9.0,
             all_on: p.all_on(now),
             status,

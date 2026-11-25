@@ -251,6 +251,7 @@ pub struct UiCfg {
     pub lights_on: bool,
     pub door_open_1550: bool,
     pub door_open_5500: bool,
+    pub door_open_6160: bool,
     pub right_tab: u8,
     pub show_motion: bool,
     pub show_tracks: bool,
@@ -266,6 +267,7 @@ impl Default for UiCfg {
             lights_on: true,
             door_open_1550: true,
             door_open_5500: true,
+            door_open_6160: true,
             right_tab: 0,
             show_motion: true,
             show_tracks: true,
@@ -287,6 +289,7 @@ pub struct AppConfig {
     pub ui: UiCfg,
     pub labels_1550: Vec<String>,
     pub labels_1832: Vec<String>,
+    pub labels_vista: Vec<String>,
     pub check_updates: bool,
     pub skipped_version: String,
     /// Closing the app while armed needs your code.
@@ -309,6 +312,7 @@ impl Default for AppConfig {
             ui: UiCfg::default(),
             labels_1550: default_labels(Model::Pc1550),
             labels_1832: default_labels(Model::Pc1832),
+            labels_vista: default_labels(Model::Vista20p),
             check_updates: true,
             skipped_version: String::new(),
             close_needs_code: true,
@@ -331,6 +335,16 @@ pub fn default_labels(model: Model) -> Vec<String> {
             "Garage Door",
             "Basement",
         ],
+        Model::Vista20p => &[
+            "Room Door",
+            "Room Motion",
+            "Window",
+            "Front Door",
+            "Hall Motion",
+            "Smoke Detector",
+            "Garage Door",
+            "Basement",
+        ],
     };
     names.iter().map(|s| s.to_string()).collect()
 }
@@ -342,7 +356,7 @@ impl AppConfig {
 
     pub fn load() -> AppConfig {
         let mut cfg = util::load_json::<AppConfig>(&Self::path()).unwrap_or_default();
-        for model in [Model::Pc1550, Model::Pc1832] {
+        for model in [Model::Pc1550, Model::Pc1832, Model::Vista20p] {
             let want = model.zone_count();
             let defaults = default_labels(model);
             let labels = cfg.labels_mut(model);
@@ -364,6 +378,7 @@ impl AppConfig {
         match model {
             Model::Pc1550 => &self.labels_1550,
             Model::Pc1832 => &self.labels_1832,
+            Model::Vista20p => &self.labels_vista,
         }
     }
 
@@ -371,6 +386,7 @@ impl AppConfig {
         match model {
             Model::Pc1550 => &mut self.labels_1550,
             Model::Pc1832 => &mut self.labels_1832,
+            Model::Vista20p => &mut self.labels_vista,
         }
     }
 

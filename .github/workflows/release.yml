@@ -69,7 +69,9 @@ jobs:
           sed "s/__VERSION__/$VERSION/g" assets/macos/Info.plist > "$APP/Contents/Info.plist"
           cp assets/icon/icon.icns "$APP/Contents/Resources/RoomGuard.icns"
           codesign --force --deep --sign - "$APP"
-          hdiutil create -volname RoomGuard -srcfolder "$APP" -ov -format UDZO "dist/${{ matrix.asset }}"
+          # Explicit DMG staging size avoids macOS 15 hdiutil auto-size ENOSPC on large universal binaries.
+          SIZE_MB=$(( $(du -sm "$APP" | cut -f1) + 64 ))
+          hdiutil create -volname RoomGuard -srcfolder "$APP" -size "${SIZE_MB}m" -fs HFS+ -ov -format UDZO "dist/${{ matrix.asset }}"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset }}

@@ -17,6 +17,7 @@ use crate::theme;
 
 #[derive(Default)]
 pub struct InstallerState {
+    pub last_model: Option<Model>,
     pub filter: String,
     pub master_code: String,
     pub installer_code: String,
@@ -588,10 +589,12 @@ fn installer_code(m: Model) -> &'static str {
 
 /// The keys that open this section at the keypad.
 fn how_to(m: Model, key: &str, code: &str) -> String {
+    if m == Model::Vista20p {
+        return format!("[{}][8][0][0] then [*][{}] (or [#][{}] to view)", code, key, key);
+    }
     if let Some(kp) = key.strip_prefix("kp") {
         return format!("[*][8][{}] then [*] for keypad programming, then [{}]", code, kp);
     }
-    let _ = m;
     match key.split_once('.') {
         Some((sec, sub)) => format!("[*][8][{}] then [{}] then [{}]", code, sec, sub),
         None => format!("[*][8][{}] then [{}]", code, key),
@@ -692,9 +695,40 @@ const ZONE_CHOICES_1550: &[(char, &str)] = &[
     ('8', "24h Fire"),
 ];
 
+const ZONE_CHOICES_VISTA: &[(&str, &str)] = &[
+    ("00", "Not Used"),
+    ("01", "Entry/Exit #1"),
+    ("02", "Entry/Exit #2"),
+    ("03", "Perimeter (Instant)"),
+    ("04", "Interior Follower"),
+    ("05", "Trouble Day / Alarm Night"),
+    ("06", "24h Silent Alarm"),
+    ("07", "24h Audible Alarm"),
+    ("08", "24h Auxiliary / Medical"),
+    ("09", "Fire"),
+    ("10", "Interior w/ Delay"),
+    ("14", "Carbon Monoxide"),
+];
+
+fn zone_type_vista(code: &str) -> &'static str {
+    ZONE_CHOICES_VISTA
+        .iter()
+        .find(|(c, _)| *c == code)
+        .map(|(_, name)| *name)
+        .unwrap_or("Unknown")
+}
+
 /// Draws the live-editable Panel & Installer Programming tab.
 pub fn ui(ui: &mut egui::Ui, prog: &ProgView, armed: bool, engine: &EngineHandle, st: &mut InstallerState) {
     let m = prog.model;
+    if st.last_model != Some(m) {
+        st.last_model = Some(m);
+        st.raw_drafts.clear();
+        st.master_code.clear();
+        st.installer_code.clear();
+        st.extra_code.clear();
+        st.confirm_default = false;
+    }
     let code = installer_code(m);
 
     section_hdr(
@@ -702,11 +736,13 @@ pub fn ui(ui: &mut egui::Ui, prog: &ProgView, armed: bool, engine: &EngineHandle
         match m {
             Model::Pc1550 => "RmG Classic PC1550  (v4.1)",
             Model::Pc1832 => "GuardSeries PC1832  (v4.6)",
+            Model::Vista20p => "VistaGuard 20P  (VG6160V Voice)",
         },
     );
-    ui.label(theme::muted(
-        "Change installer and keypad programming directly here — no keypad codes required. Everything writes to the same panel EEPROM as [*][8] programming.",
-    ));
+    ui.label(theme::muted(match m {
+        Model::Vista20p => "Change Vista installer programming (*fields) and 6160V voice settings directly here — no 4112+800 sequences required.",
+        _ => "Change installer and keypad programming directly here — no keypad codes required. Everything writes to the same panel EEPROM as [*][8] programming.",
+    }));
     if armed {
         ui.add_space(4.0);
         ui.label(RichText::new("Panel is armed. Disarm first to change programming.").color(theme::AMBER));
@@ -754,6 +790,39 @@ pub fn ui(ui: &mut egui::Ui, prog: &ProgView, armed: bool, engine: &EngineHandle
                     engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: "005.09".into(), value: v }));
                 }
                 ui.label(theme::muted("Section [005][09] — siren auto-silence"));
+                ui.end_row();
+            } else if m == Model::Vista20p {
+                let mut ex = read_entry(&raw_val(prog, "34"), 0, 2, 60);
+                let mut e1 = read_entry(&raw_val(prog, "35"), 0, 2, 30);
+                let mut e2 = read_entry(&raw_val(prog, "36"), 0, 2, 45);
+                let mut bell_step = read_entry(&raw_val(prog, "33"), 0, 1, 1);
+
+                ui.label("Exit delay");
+                if ui.add(egui::DragValue::new(&mut ex).range(15..=96).suffix(" s")).changed() {
+                    engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: "34".into(), value: format!("{:02}", ex) }));
+                }
+                ui.label(theme::muted("Field *34 — time to leave"));
+                ui.end_row();
+
+                ui.label("Entry delay #1");
+                if ui.add(egui::DragValue::new(&mut e1).range(15..=96).suffix(" s")).changed() {
+                    engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: "35".into(), value: format!("{:02}", e1) }));
+                }
+                ui.label(theme::muted("Field *35 — primary doorway"));
+                ui.end_row();
+
+                ui.label("Entry delay #2");
+                if ui.add(egui::DragValue::new(&mut e2).range(15..=96).suffix(" s")).changed() {
+                    engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: "36".into(), value: format!("{:02}", e2) }));
+                }
+                ui.label(theme::muted("Field *36 — secondary entry"));
+                ui.end_row();
+
+                ui.label("Bell timeout");
+                if ui.add(egui::DragValue::new(&mut bell_step).range(1..=4).suffix(" x 4 min")).changed() {
+                    engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: "33".into(), value: format!("{}", bell_step) }));
+                }
+                ui.label(theme::muted("Field *33 — 1=4m, 2=8m, 3=12m, 4=16m"));
                 ui.end_row();
             } else {
                 let raw17 = raw_val(prog, "17");
@@ -842,6 +911,39 @@ pub fn ui(ui: &mut egui::Ui, prog: &ProgView, armed: bool, engine: &EngineHandle
             if ui.checkbox(&mut scroll_open, "Auto-scroll open zones on LCD  ([kp076] opt 3)").changed() {
                 engine.send(EngineMsg::EditPanel(PanelEdit::SetToggle { key: "kp076".into(), opt: 3, on: scroll_open }));
             }
+        } else if m == Model::Vista20p {
+            let mut qa = read_entry(&raw_val(prog, "21"), 0, 1, 1) != 0;
+            if ui.checkbox(&mut qa, "Quick arm with # + Away/Stay/Max/Instant  (*21)").changed() {
+                engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: "21".into(), value: if qa { "1" } else { "0" }.into() }));
+            }
+            let mut qb = read_entry(&raw_val(prog, "23"), 0, 1, 1) != 0;
+            if ui.checkbox(&mut qb, "Quick / forced bypass with [Code] + 6 + #  (*23)").changed() {
+                engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: "23".into(), value: if qb { "1" } else { "0" }.into() }));
+            }
+            let mut aew = read_entry(&raw_val(prog, "37"), 0, 1, 1) != 0;
+            if ui.checkbox(&mut aew, "Audible exit warning beeps with urgency  (*37)").changed() {
+                engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: "37".into(), value: if aew { "1" } else { "0" }.into() }));
+            }
+            let mut ding = read_entry(&raw_val(prog, "38"), 0, 1, 0) != 0;
+            if ui.checkbox(&mut ding, "Confirmation of arming ding on external bell  (*38)").changed() {
+                engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: "38".into(), value: if ding { "1" } else { "0" }.into() }));
+            }
+            let mut astay = read_entry(&raw_val(prog, "84"), 0, 1, 1) != 0;
+            if ui.checkbox(&mut astay, "Auto-Stay: convert Away to Stay if no door opens during exit  (*84)").changed() {
+                engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: "84".into(), value: if astay { "1" } else { "0" }.into() }));
+            }
+            let mut cver = read_entry(&raw_val(prog, "86"), 0, 1, 1) != 0;
+            if ui.checkbox(&mut cver, "Flash 'Alarm Canceled' on LCD when clearing alarm memory  (*86)").changed() {
+                engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: "86".into(), value: if cver { "1" } else { "0" }.into() }));
+            }
+            let mut eerr = read_entry(&raw_val(prog, "59"), 0, 1, 1) != 0;
+            if ui.checkbox(&mut eerr, "Exit error alarm if doorway is left open when exit ends  (*59)").changed() {
+                engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: "59".into(), value: if eerr { "1" } else { "0" }.into() }));
+            }
+            let mut cd = read_entry(&raw_val(prog, "197"), 0, 1, 1) != 0;
+            if ui.checkbox(&mut cd, "Show live exit delay seconds countdown on LCD  (*197)").changed() {
+                engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: "197".into(), value: if cd { "1" } else { "0" }.into() }));
+            }
         } else {
             let mut audible_exit = toggle_on(prog, "34", 1);
             if ui.checkbox(&mut audible_exit, "Audible exit delay with urgency beeps  ([34] opt 1)").changed() {
@@ -869,24 +971,26 @@ pub fn ui(ui: &mut egui::Ui, prog: &ProgView, armed: bool, engine: &EngineHandle
             }
         }
 
-        // Keypad lockout
-        ui.add_space(4.0);
-        ui.horizontal_wrapped(|ui| {
-            let (lock_key, width) = if m == Model::Pc1832 { ("012", 3usize) } else { ("36", 2usize) };
-            let raw_lock = raw_val(prog, lock_key);
-            let mut bad = read_entry(&raw_lock, 0, width, 0);
-            let mut mins = read_entry(&raw_lock, 1, width, 0);
-            ui.label("Keypad lockout after");
-            if ui.add(egui::DragValue::new(&mut bad).range(0..=99)).changed() {
-                let v = replace_entry(&raw_lock, 2, width, 0, bad);
-                engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: lock_key.into(), value: v }));
-            }
-            ui.label("wrong codes (0 = off) for");
-            if ui.add(egui::DragValue::new(&mut mins).range(0..=99).suffix(" min")).changed() {
-                let v = replace_entry(&raw_lock, 2, width, 1, mins);
-                engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: lock_key.into(), value: v }));
-            }
-        });
+        // Keypad lockout (PC1550 [36] & PC1832 [012]; Vista *36 is Entry Delay #2)
+        if m != Model::Vista20p {
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                let (lock_key, width) = if m == Model::Pc1832 { ("012", 3usize) } else { ("36", 2usize) };
+                let raw_lock = raw_val(prog, lock_key);
+                let mut bad = read_entry(&raw_lock, 0, width, 0);
+                let mut mins = read_entry(&raw_lock, 1, width, 0);
+                ui.label("Keypad lockout after");
+                if ui.add(egui::DragValue::new(&mut bad).range(0..=99)).changed() {
+                    let v = replace_entry(&raw_lock, 2, width, 0, bad);
+                    engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: lock_key.into(), value: v }));
+                }
+                ui.label("wrong codes (0 = off) for");
+                if ui.add(egui::DragValue::new(&mut mins).range(0..=99).suffix(" min")).changed() {
+                    let v = replace_entry(&raw_lock, 2, width, 1, mins);
+                    engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: lock_key.into(), value: v }));
+                }
+            });
+        }
 
         // Auto-arm schedule
         ui.horizontal_wrapped(|ui| {
@@ -943,6 +1047,17 @@ pub fn ui(ui: &mut egui::Ui, prog: &ProgView, armed: bool, engine: &EngineHandle
         if lvl_changed {
             engine.send(EngineMsg::EditPanel(PanelEdit::SetKeypadLevels { brightness: br, contrast: co, buzzer: bz }));
         }
+    }
+    if m == Model::Vista20p {
+        section_hdr(ui, "6160V Voice annunciator");
+        let mut vl = prog.voice_level;
+        ui.horizontal(|ui| {
+            ui.label("Voice volume");
+            if ui.add(egui::Slider::new(&mut vl, 0..=7)).changed() {
+                engine.send(EngineMsg::EditPanel(PanelEdit::SetVoiceLevel(vl)));
+            }
+            ui.label(theme::muted(if vl == 0 { "Muted (#+0+2 on keypad)" } else { "0 = mute, 1–7 (#+0+2)" }));
+        });
     }
 
     // --- 4. Zones (Definitions & Chime Sounds) ---
@@ -1005,6 +1120,50 @@ pub fn ui(ui: &mut egui::Ui, prog: &ProgView, armed: bool, engine: &EngineHandle
                     ui.end_row();
                 }
             });
+        } else if m == Model::Vista20p {
+            let raw56 = raw_val(prog, "56");
+            let raw_resp = raw_val(prog, "resp");
+            egui::Grid::new("panel-zones-vista").num_columns(3).spacing([10.0, 6.0]).show(ui, |ui| {
+                ui.label(theme::muted("Zone"));
+                ui.label(theme::muted("Zone Type (*56)"));
+                ui.label(theme::muted("Loop Response"));
+                ui.end_row();
+
+                for z in 1..=8usize {
+                    ui.label(RichText::new(format!("Zone {:02}", z)).font(theme::semi(12.5)));
+                    let cur_code = raw56.get((z - 1) * 2..(z - 1) * 2 + 2).unwrap_or("00");
+                    egui::ComboBox::from_id_salt(("zdefvista", z))
+                        .selected_text(format!("{} {}", cur_code, zone_type_vista(cur_code)))
+                        .width(195.0)
+                        .show_ui(ui, |ui| {
+                            for &(code_str, label) in ZONE_CHOICES_VISTA {
+                                if ui.selectable_label(cur_code == code_str, format!("{} {}", code_str, label)).clicked() {
+                                    let next = replace_entry_str(&raw56, 8, 2, z - 1, code_str);
+                                    engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: "56".into(), value: next }));
+                                }
+                            }
+                        });
+                    let cur_r = raw_resp.chars().nth(z - 1).unwrap_or('1');
+                    let r_lbl = match cur_r {
+                        '0' => "10 ms (Fast)",
+                        '2' => "700 ms",
+                        '3' => "1.2 s",
+                        _ => "350 ms (Normal)",
+                    };
+                    egui::ComboBox::from_id_salt(("zrespvista", z))
+                        .selected_text(r_lbl)
+                        .width(120.0)
+                        .show_ui(ui, |ui| {
+                            for (c, lbl) in [('0', "10 ms (Fast)"), ('1', "350 ms (Normal)"), ('2', "700 ms"), ('3', "1.2 s")] {
+                                if ui.selectable_label(cur_r == c, lbl).clicked() {
+                                    let next = replace_entry_str(&raw_resp, 8, 1, z - 1, &c.to_string());
+                                    engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: "resp".into(), value: next }));
+                                }
+                            }
+                        });
+                    ui.end_row();
+                }
+            });
         } else {
             let raw11 = raw_val(prog, "11");
             egui::Grid::new("panel-zones-1550").num_columns(4).spacing([10.0, 6.0]).show(ui, |ui| {
@@ -1056,9 +1215,21 @@ pub fn ui(ui: &mut egui::Ui, prog: &ProgView, armed: bool, engine: &EngineHandle
     // --- 5. Access Codes ---
     section_hdr(ui, "Access codes");
     ui.add_enabled_ui(!armed, |ui| {
-        let master_slot = if m == Model::Pc1832 { "40" } else { "1" };
-        let extra_slot = if m == Model::Pc1832 { "maint" } else { "m2" };
-        let extra_label = if m == Model::Pc1832 { "Maintenance code ([008])" } else { "2nd Master code ([22])" };
+        let master_slot = match m {
+            Model::Pc1832 => "40",
+            Model::Vista20p => "02",
+            Model::Pc1550 => "1",
+        };
+        let extra_slot = match m {
+            Model::Pc1832 => "maint",
+            Model::Vista20p => "03",
+            Model::Pc1550 => "m2",
+        };
+        let extra_label = match m {
+            Model::Pc1832 => "Maintenance code ([008])",
+            Model::Vista20p => "User 03 code ([Master]+8+03)",
+            Model::Pc1550 => "2nd Master code ([22])",
+        };
         egui::Grid::new("panel-codes").num_columns(3).spacing([10.0, 6.0]).show(ui, |ui| {
             ui.label("Master code");
             ui.add(

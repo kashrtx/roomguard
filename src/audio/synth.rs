@@ -29,6 +29,7 @@
 
 use std::collections::VecDeque;
 
+use super::voice::VoicePlayer;
 use super::{AudioCmd, BellPattern, ChimeKind, KeypadVoice, Pattern, ToneSeg};
 use crate::engine::types::SirenModel;
 
@@ -197,17 +198,25 @@ impl Gate {
             self.pos = 0;
         }
     }
-    fn next(&mut self, sr: f32) -> bool {
+    fn next(&mut self, sr: f32) -> (bool, Option<f32>) {
         match self.pat {
-            Pattern::Off => false,
-            Pattern::Steady => true,
+            Pattern::Off => (false, None),
+            Pattern::Steady => (true, None),
             Pattern::Beeps { on_ms, off_ms, count, period_ms } => {
                 let on = ms(sr, on_ms as u32).max(1);
                 let unit = on + ms(sr, off_ms as u32);
                 let period = ms(sr, period_ms).max(unit * count.max(1) as u32).max(1);
                 let p = self.pos;
                 self.pos = (self.pos + 1) % period;
-                (p / unit) < count as u32 && (p % unit) < on
+                ((p / unit) < count as u32 && (p % unit) < on, None)
+            }
+            Pattern::HiLo { hi_hz, lo_hz, step_ms } => {
+                let step = ms(sr, step_ms as u32).max(1);
+                let period = step * 2;
+                let p = self.pos;
+                self.pos = (self.pos + 1) % period;
+                let f = if p < step { hi_hz as f32 } else { lo_hz as f32 };
+                (true, Some(f))
             }
         }
     }
@@ -266,6 +275,12 @@ impl Piezo {
                 let t = (self.level.saturating_sub(1) as f32) / 19.0;
                 let f = 2050.0 + t * 1600.0;
                 (f, 15.0, 0.11, 1.45, 0.06)
+            }
+            KeypadVoice::Vista6160 => {
+                // Real 6160V uses a 1-inch dynamic speaker (not a narrow high-Q
+                // ceramic piezo), giving a warmer ~2.18 kHz keypress chirp and
+                // carrying both octaves of the continuous hi-lo "dee-doo" alarm cleanly.
+                (2180.0, 3.6, 0.30, 1.35, 0.08)
             }
         };
         self.f0 = f0;
@@ -640,6 +655,7 @@ pub struct Synth {
     voice: KeypadVoice,
     buzzer_level: u8,
     piezo: Piezo,
+    voice_player: VoicePlayer,
     sounder: Gate,
     segs: VecDeque<Seg>,
     seg: Option<(Seg, u32, f32)>,
@@ -679,6 +695,7 @@ impl Synth {
             voice: KeypadVoice::Pk5500,
             buzzer_level: 14,
             piezo: Piezo::new(sr, KeypadVoice::Pk5500, 14),
+            voice_player: VoicePlayer::new(sr),
             sounder: Gate { pat: Pattern::Off, pos: 0 },
             segs: VecDeque::new(),
             seg: None,
@@ -757,19 +774,26 @@ impl Synth {
                 self.buzzer_level = level.min(20);
                 self.piezo.set_level(self.buzzer_level);
             }
+            AudioCmd::VoiceLevel(level) => {
+                self.voice_player.set_level(level);
+            }
+            AudioCmd::Speak(tokens) => {
+                self.voice_player.speak(tokens);
+            }
             AudioCmd::Sounder(p) => self.sounder.set(p),
             AudioCmd::KeyBeep => {
-                // A keypress is about 80 ms. During a steady tone (entry delay,
-                // a 24 hour alarm) the tone drops out around it, so every digit
-                // you punch in is heard clearly over it, like on the real keypad.
+                // A keypress is ~80 ms on DSC or a crisp ~48 ms chirp on Vista 6160V.
+                // During a steady tone the tone drops out around it so every digit
+                // is heard clearly, like on the real keypad.
                 self.segs.clear();
                 self.seg = None;
                 let f = self.piezo.f0;
+                let dur = if self.voice == KeypadVoice::Vista6160 { 48 } else { 80 };
                 if matches!(self.sounder.pat, Pattern::Steady) {
                     self.segs.push_back(Seg { on: 0, off: ms(self.sr, 30).max(1), freq: f, decay: 1.0, amp: 0.0, key: true });
-                    self.segs.push_back(Seg { on: ms(self.sr, 80).max(1), off: ms(self.sr, 40).max(1), freq: f, decay: 1.0, amp: 1.0, key: true });
+                    self.segs.push_back(Seg { on: ms(self.sr, dur).max(1), off: ms(self.sr, 40).max(1), freq: f, decay: 1.0, amp: 1.0, key: true });
                 } else {
-                    self.segs.push_back(Seg { on: ms(self.sr, 80).max(1), off: ms(self.sr, 25), freq: f, decay: 1.0, amp: 1.0, key: true });
+                    self.segs.push_back(Seg { on: ms(self.sr, dur).max(1), off: ms(self.sr, 22), freq: f, decay: 1.0, amp: 1.0, key: true });
                 }
             }
             AudioCmd::Beeps { count, on_ms, off_ms } => {
@@ -842,6 +866,7 @@ impl Synth {
                 self.sounder.set(Pattern::Off);
                 self.segs.clear();
                 self.seg = None;
+                self.voice_player.stop();
                 self.bell = BellPattern::Off;
                 self.squawks.clear();
                 self.line.clear();
@@ -970,18 +995,22 @@ impl Synth {
     }
 
     pub fn next(&mut self) -> f32 {
-        let bg_on = self.sounder.next(self.sr);
-        let (on, freq, amp) = match self.seg_next() {
+        let (bg_on, bg_freq) = self.sounder.next(self.sr);
+        let seg_out = self.seg_next();
+        let has_seg = seg_out.is_some();
+        let (on, freq, amp) = match seg_out {
             // Active keypress / confirmation / chime sequence takes exclusive
             // control of the single keypad piezo (including its silent gaps),
             // so rapid beeps and keypresses cut cleanly through steady tones.
             Some((gate, f, a)) => (gate, f, a),
-            None => (bg_on, self.piezo.f0, 1.0),
+            None => (bg_on, bg_freq.unwrap_or(self.piezo.f0), 1.0),
         };
         let power = self.bell_gate() | self.squawk_next();
+        let speaking = self.voice_player.is_speaking();
         // Fast path when every voice is silent: skip 48 kHz resonator and tanh
         // math so idle audio uses near-zero CPU and battery.
         let idle = !on
+            && !speaking
             && self.piezo.quiet()
             && !power
             && self.siren.quiet()
@@ -994,7 +1023,12 @@ impl Synth {
         let mix = if idle {
             0.0
         } else {
-            let keypad = self.piezo.next(on, freq, amp) * self.vol_keypad;
+            // 6160V voice priority: let short confirmation / chime / keypress beeps
+            // finish playing cleanly FIRST, then speak while ducking only continuous
+            // background sounder tones (exit/entry/alarm).
+            let keypad_on = if has_seg { on } else { on && !speaking };
+            let keypad = self.piezo.next(keypad_on, freq, amp) * self.vol_keypad;
+            let spoken = if has_seg { 0.0 } else { self.voice_player.next() * self.vol_keypad };
             let siren = self.siren.next(power) * self.vol_siren;
             let mut preview = 0.0;
             if let Some((s, left)) = self.preview.as_mut() {
@@ -1011,7 +1045,7 @@ impl Synth {
             let line = self.line_next() * self.vol_line;
             let ring = self.ring_next();
             let click = self.click_next() * self.vol_keypad * 0.12;
-            (keypad * 0.8 + siren + preview + line + ring + click) * self.vol_master
+            (keypad * 0.8 + spoken + siren + preview + line + ring + click) * self.vol_master
         };
         // Keeps the output awake. Silence lets many laptop speakers and USB,
         // HDMI and Bluetooth outputs power their amplifier down, and waking it

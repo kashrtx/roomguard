@@ -313,12 +313,14 @@ impl RoomGuardApp {
                         let cover_open = match self.cfg.model {
                             Model::Pc1550 => self.cfg.ui.door_open_1550,
                             Model::Pc1832 => self.cfg.ui.door_open_5500,
+                            Model::Vista20p => self.cfg.ui.door_open_6160,
                         };
                         let cover_label = if cover_open { "Close cover" } else { "Open cover" };
                         if ui.button(RichText::new(cover_label).size(12.5)).clicked() {
                             match self.cfg.model {
                                 Model::Pc1550 => self.cfg.ui.door_open_1550 = !self.cfg.ui.door_open_1550,
                                 Model::Pc1832 => self.cfg.ui.door_open_5500 = !self.cfg.ui.door_open_5500,
+                                Model::Vista20p => self.cfg.ui.door_open_6160 = !self.cfg.ui.door_open_6160,
                             }
                             self.audio.send(AudioCmd::Click);
                             *changed = true;
@@ -327,6 +329,10 @@ impl RoomGuardApp {
                         let armed = view.armed;
                         let resp = ui
                             .add_enabled_ui(!armed, |ui| {
+                                if ui.selectable_label(self.cfg.model == Model::Vista20p, "Voice keypad").clicked() && self.cfg.model != Model::Vista20p {
+                                    self.cfg.model = Model::Vista20p;
+                                    *changed = true;
+                                }
                                 if ui.selectable_label(self.cfg.model == Model::Pc1832, "LCD keypad").clicked() && self.cfg.model != Model::Pc1832 {
                                     self.cfg.model = Model::Pc1832;
                                     *changed = true;
@@ -492,11 +498,13 @@ impl RoomGuardApp {
         let toggled = match view.model {
             Model::Pc1550 => keypads::classic::draw(ui, area, view, &mut self.input, &self.engine, &self.audio, l, t),
             Model::Pc1832 => keypads::lcd::draw(ui, area, view, &mut self.input, &self.engine, &self.audio, l, t),
+            Model::Vista20p => keypads::vista::draw(ui, area, view, &mut self.input, &self.engine, &self.audio, l, t),
         };
         if toggled {
             match view.model {
                 Model::Pc1550 => self.cfg.ui.door_open_1550 = !self.cfg.ui.door_open_1550,
                 Model::Pc1832 => self.cfg.ui.door_open_5500 = !self.cfg.ui.door_open_5500,
+                Model::Vista20p => self.cfg.ui.door_open_6160 = !self.cfg.ui.door_open_6160,
             }
             self.audio.send(AudioCmd::Click);
             *changed = true;
@@ -505,10 +513,12 @@ impl RoomGuardApp {
         let caption = match view.model {
             Model::Pc1550 => "RmG Classic LED Keypad  \u{00b7}  PC1550 compatible  \u{00b7}  Click cover to swing open/closed",
             Model::Pc1832 => "GuardSeries LCD Keypad  \u{00b7}  PC1832 compatible  \u{00b7}  Click cover to flip open/closed",
+            Model::Vista20p => "VistaGuard Voice LCD Keypad  \u{00b7}  Vista 20P compatible  \u{00b7}  Click cover to flip open/closed",
         };
         let keys_hint = match view.model {
             Model::Pc1550 => "Keyboard: 0-9, *, #  \u{00b7}  Hold F, A or P for emergency keys",
             Model::Pc1832 => "Keyboard: 0-9, *, #  \u{00b7}  Arrows scroll  \u{00b7}  F1-F5 function keys  \u{00b7}  Hold F, A, P",
+            Model::Vista20p => "Commands: [Code]+1 OFF, +2 AWAY, +3 STAY, +9 CHIME  \u{00b7}  # + * speaks status  \u{00b7}  Hold F, P, A",
         };
         // While a menu or delay is running, say what the keypad is waiting for.
         let hint: &str = if view.hint.is_empty() { keys_hint } else { view.hint.as_str() };
@@ -718,7 +728,22 @@ impl Drop for RoomGuardApp {
 }
 
 impl eframe::App for RoomGuardApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // Never let a UI bug crash the alarm panel: catch any panic, log it
+        // (the global panic hook records file & line in roomguard.log), and
+        // keep the window alive.
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.update_inner(ctx, frame);
+        }));
+        if res.is_err() {
+            util::log("the UI recovered from an internal error (the panic line above says where)");
+            ctx.request_repaint_after(Duration::from_millis(250));
+        }
+    }
+}
+
+impl RoomGuardApp {
+    fn update_inner(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let view = self.engine.view();
         let t = ctx.input(|i| i.time);
         if self.start_minimized {
@@ -751,7 +776,7 @@ impl eframe::App for RoomGuardApp {
         } else {
             self.lights = target;
         }
-        self.input.sync_doors(ctx, self.cfg.ui.door_open_1550, self.cfg.ui.door_open_5500);
+        self.input.sync_doors(ctx, self.cfg.ui.door_open_1550, self.cfg.ui.door_open_5500, self.cfg.ui.door_open_6160);
 
         let mut changed = false;
         self.top_bar(ctx, &view, &mut changed);
@@ -771,6 +796,10 @@ impl eframe::App for RoomGuardApp {
                 }
                 Model::Pc1832 if !self.cfg.ui.door_open_5500 => {
                     self.cfg.ui.door_open_5500 = true;
+                    changed = true;
+                }
+                Model::Vista20p if !self.cfg.ui.door_open_6160 => {
+                    self.cfg.ui.door_open_6160 = true;
                     changed = true;
                 }
                 _ => {}

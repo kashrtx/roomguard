@@ -7,50 +7,56 @@ pub enum Model {
     Pc1550,
     #[default]
     Pc1832,
+    Vista20p,
 }
 
 impl Model {
     pub fn zone_count(self) -> usize {
         match self {
             Model::Pc1550 => 6,
-            Model::Pc1832 => 8,
+            Model::Pc1832 | Model::Vista20p => 8,
         }
     }
     pub fn panel_name(self) -> &'static str {
         match self {
             Model::Pc1550 => "PC1550",
             Model::Pc1832 => "PC1832",
+            Model::Vista20p => "Vista 20P",
         }
     }
     pub fn keypad_name(self) -> &'static str {
         match self {
             Model::Pc1550 => "PC1500RK",
             Model::Pc1832 => "PK5500",
+            Model::Vista20p => "VG6160V",
         }
     }
     pub fn era(self) -> &'static str {
         match self {
             Model::Pc1550 => "RmG Classic LED keypad, 1990s",
             Model::Pc1832 => "GuardSeries LCD keypad, 2000s",
+            Model::Vista20p => "VistaGuard Voice LCD keypad, 2000s",
         }
     }
     pub fn file_key(self) -> &'static str {
         match self {
             Model::Pc1550 => "pc1550",
             Model::Pc1832 => "pc1832",
+            Model::Vista20p => "vista20p",
         }
     }
     /// How long the emergency and function keys must be held, in ms.
     pub fn hold_ms(self) -> u128 {
         match self {
             Model::Pc1550 => 1000,
-            Model::Pc1832 => 2000,
+            Model::Pc1832 | Model::Vista20p => 2000,
         }
     }
     pub fn installer_default(self) -> &'static str {
         match self {
             Model::Pc1550 => "1500",
             Model::Pc1832 => "5555",
+            Model::Vista20p => "4112",
         }
     }
 }
@@ -68,9 +74,9 @@ impl SirenModel {
     pub const ALL: [SirenModel; 4] = [SirenModel::Wave2F, SirenModel::MasterBlaster, SirenModel::Rx7c, SirenModel::MotorBell];
     pub fn label(self) -> &'static str {
         match self {
-            SirenModel::Wave2F => "Ademco WAVE-2F",
-            SirenModel::MasterBlaster => "Klaxon Master Blaster",
-            SirenModel::Rx7c => "ADT RX-7C sounder",
+            SirenModel::Wave2F => "WAVE-2F Horn Siren",
+            SirenModel::MasterBlaster => "Master Blaster Motor Siren",
+            SirenModel::Rx7c => "RX-7C Indoor Piezo",
             SirenModel::MotorBell => "10 inch motor bell",
         }
     }

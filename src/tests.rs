@@ -949,3 +949,107 @@ fn entry_tone_stops_when_burglary_bell_starts_and_pk5500_ready_clears_on_exit() 
     assert_eq!(p.leds_5500(t0 + secs(165))[0], Led::On);
     assert_eq!(p.leds_5500(t0 + secs(165))[1], Led::Off);
 }
+
+#[test]
+fn vista20p_commands_autostay_twostep_clear_and_voice_rom() {
+    use crate::audio::voice;
+    // 1. 6160V Voice ROM whitelist filters out unsupported words like PANEL/TAMPER
+    assert_eq!(voice::filter_zone_words("BEDROOM DOOR"), vec!["bedroom", "door"]);
+    assert!(voice::filter_zone_words("PANEL TAMPER").is_empty());
+
+    // 2. VoicePlayer synthesizes audible non-zero audio for ROM tokens
+    let mut vp = voice::VoicePlayer::new(48_000.0);
+    vp.speak(vec!["disarmed".into(), "ready_to_arm".into()]);
+    assert!(vp.is_speaking());
+    let peak = (0..12_000).map(|_| vp.next().abs()).fold(0.0f32, f32::max);
+    assert!(peak > 0.05, "6160V voice ROM should produce audible speech (got {})", peak);
+
+    // 3. VISTA-20P [Code] + 2 (AWAY) -> Exit Delay -> Auto-Stay (*84) if no door opened
+    let t0 = Instant::now();
+    let mut p = panel(Model::Vista20p);
+    keys(&mut p, "12342", t0);
+    assert!(p.exit.is_some());
+    assert!(p.lcd_vista(t0, 0).lines[0].contains("AWAY"));
+    // Advance past 60s exit delay without opening Zone 1 -> Auto-Stay converts to STAY!
+    p.tick(t0 + secs(65), 0);
+    assert_eq!(p.armed.map(|a| a.mode), Some(ArmMode::Stay));
+
+    // 4. Disarm with [Code] + 1 (OFF), then arm AWAY and open+close Zone 1 during exit -> stays AWAY
+    keys(&mut p, "12341", t0 + secs(66));
+    assert!(p.armed.is_none());
+    keys(&mut p, "12342", t0 + secs(70));
+    p.set_zone(1, true, false, false, t0 + secs(75));
+    p.set_zone(1, false, false, false, t0 + secs(78));
+    p.tick(t0 + secs(135), 0);
+    assert_eq!(p.armed.map(|a| a.mode), Some(ArmMode::Away));
+
+    // 5. Trip Zone 3 (Perimeter) -> Instant Alarm with slow two-tone hi-lo keypad speaker & two-step clear
+    p.set_zone(3, true, false, false, t0 + secs(140));
+    p.tick(t0 + secs(141), 0);
+    assert!(p.alarm_sounding(t0 + secs(141)));
+    assert!(matches!(p.sounder_sent, Pattern::HiLo { hi_hz: 1960, lo_hz: 1040, step_ms: 420 }));
+    // 1st [Code] + 1 silences alarm but leaves alarm memory latched on LCD
+    keys(&mut p, "12341", t0 + secs(145));
+    p.set_zone(3, false, false, false, t0 + secs(146));
+    assert!(p.vista_alarm_mem_zone.is_some());
+    assert!(p.lcd_vista(t0 + secs(146), 0).lines[0].contains("ALARM 03"));
+    // 2nd [Code] + 1 clears alarm memory and flashes Alarm Canceled (*86 = 1)
+    keys(&mut p, "12341", t0 + secs(148));
+    assert!(p.vista_alarm_mem_zone.is_none());
+    assert!(p.lcd_vista(t0 + secs(149), 0).lines[0].contains("Alarm Canceled"));
+
+    // 6. Installer programming: 4112 + 800 -> *35 -> 45 -> *99
+    keys(&mut p, "4112800", t0 + secs(155));
+    assert!(p.is_programming());
+    keys(&mut p, "*3545*99", t0 + secs(156));
+    assert!(!p.is_programming());
+    assert_eq!(p.entry_secs(ZoneKind::Delay1), 45);
+
+    // 7. Confirmation beep plays cleanly BEFORE 6160V voice speaks (not ducked/swallowed)
+    let mut s = crate::audio::synth::Synth::new(48_000.0);
+    s.apply(AudioCmd::Voice(crate::audio::KeypadVoice::Vista6160));
+    s.apply(AudioCmd::Beeps { count: 1, on_ms: 220, off_ms: 80 });
+    s.apply(AudioCmd::Speak(vec!["disarmed".into()]));
+    // First 200 ms: confirmation beep must be loud and clear
+    let beep_peak = (0..9_600).map(|_| s.next().abs()).fold(0.0f32, f32::max);
+    assert!(beep_peak > 0.10, "6160V confirmation beep must not be swallowed by voice (got {})", beep_peak);
+    // Skip past the remaining 20 ms beep + 80 ms gap, then voice must speak audibly
+    for _ in 0..5_200 {
+        s.next();
+    }
+    let voice_peak = (0..12_000).map(|_| s.next().abs()).fold(0.0f32, f32::max);
+    assert!(voice_peak > 0.05, "6160V voice must speak right after confirmation beep (got {})", voice_peak);
+}
+
+#[test]
+fn all_three_keypads_render_without_panicking() {
+    use crate::keypads::{classic, lcd, vista, KeyInput};
+    use eframe::egui;
+
+    let ctx = egui::Context::default();
+    crate::theme::install(&ctx);
+    let audio = crate::audio::start();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let cam = crate::vision::start(crate::config::CameraCfg { enabled: false, ..Default::default() }, tx.clone(), ctx.clone());
+    let notify = crate::notify::start(tx.clone());
+    let engine = crate::engine::start(crate::config::AppConfig::default(), tx, rx, audio.clone(), cam, notify, ctx.clone());
+    let mut input = KeyInput::default();
+    let mut view = crate::engine::View::default();
+    view.lcd = ["****DISARMED****".into(), "Ready to Arm    ".into()];
+    view.backlight = 1.0;
+
+    for open in [true, false] {
+        input.door_anim_1550 = if open { 1.0 } else { 0.0 };
+        input.door_anim_5500 = if open { 1.0 } else { 0.0 };
+        input.door_anim_6160 = if open { 1.0 } else { 0.0 };
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let area = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(500.0, 500.0));
+                classic::draw(ui, area, &view, &mut input, &engine, &audio, 1.0, 0.5);
+                lcd::draw(ui, area, &view, &mut input, &engine, &audio, 1.0, 0.5);
+                vista::draw(ui, area, &view, &mut input, &engine, &audio, 1.0, 0.5);
+            });
+        });
+    }
+    engine.shutdown();
+}

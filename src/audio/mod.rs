@@ -5,6 +5,7 @@
 //! tells the panel when the "bell circuit" is broken.
 
 pub mod synth;
+pub mod voice;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -19,6 +20,8 @@ pub enum Pattern {
     Off,
     Steady,
     Beeps { on_ms: u16, off_ms: u16, count: u8, period_ms: u32 },
+    /// Continuous alternating two-tone alarm (e.g. 6160V burglary "dee-doo").
+    HiLo { hi_hz: u16, lo_hz: u16, step_ms: u16 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -34,6 +37,7 @@ pub enum BellPattern {
 pub enum KeypadVoice {
     Classic,
     Pk5500,
+    Vista6160,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,6 +61,8 @@ pub struct ToneSeg {
 pub enum AudioCmd {
     Voice(KeypadVoice),
     BuzzerLevel(u8),
+    VoiceLevel(u8),
+    Speak(Vec<String>),
     Sounder(Pattern),
     KeyBeep,
     Beeps { count: u8, on_ms: u16, off_ms: u16 },
@@ -106,6 +112,7 @@ pub fn start() -> AudioHandle {
 struct State {
     voice: Option<AudioCmd>,
     buzzer_level: Option<AudioCmd>,
+    voice_level: Option<AudioCmd>,
     sounder: Option<AudioCmd>,
     bell: Option<AudioCmd>,
     siren: Option<AudioCmd>,
@@ -118,6 +125,7 @@ impl State {
         let slot = match c {
             AudioCmd::Voice(_) => &mut self.voice,
             AudioCmd::BuzzerLevel(_) => &mut self.buzzer_level,
+            AudioCmd::VoiceLevel(_) => &mut self.voice_level,
             AudioCmd::Sounder(_) => &mut self.sounder,
             AudioCmd::Bell(_) => &mut self.bell,
             AudioCmd::Siren { .. } => &mut self.siren,
@@ -141,7 +149,7 @@ impl State {
     }
 
     fn replay(&self) -> Vec<AudioCmd> {
-        [&self.voice, &self.buzzer_level, &self.volumes, &self.siren, &self.sounder, &self.bell, &self.ring]
+        [&self.voice, &self.buzzer_level, &self.voice_level, &self.volumes, &self.siren, &self.sounder, &self.bell, &self.ring]
             .iter()
             .filter_map(|c| (*c).clone())
             .collect()
