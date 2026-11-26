@@ -2,7 +2,7 @@
 //!
 //! Lets you configure every real panel setting (delays, bell cut-off, zone
 //! definitions and attributes, chime sounds, keypad levels, codes, and every
-//! raw EEPROM installer section) directly with plain-English controls — no
+//! raw EEPROM installer section) directly with plain-English controls, no
 //! need to memorize [*][8] keypad sequences unless you want to. Every change
 //! writes straight to the same EEPROM sections the keypad reads and writes.
 
@@ -740,8 +740,8 @@ pub fn ui(ui: &mut egui::Ui, prog: &ProgView, armed: bool, engine: &EngineHandle
         },
     );
     ui.label(theme::muted(match m {
-        Model::Vista20p => "Change Vista installer programming (*fields) and 6160V voice settings directly here — no 4112+800 sequences required.",
-        _ => "Change installer and keypad programming directly here — no keypad codes required. Everything writes to the same panel EEPROM as [*][8] programming.",
+        Model::Vista20p => "Change Vista installer programming (*fields) and 6160V voice settings directly here. No 4112+800 sequences required.",
+        _ => "Change installer and keypad programming directly here. No keypad codes required. Everything writes to the same panel EEPROM as [*][8] programming.",
     }));
     if armed {
         ui.add_space(4.0);
@@ -765,7 +765,7 @@ pub fn ui(ui: &mut egui::Ui, prog: &ProgView, armed: bool, engine: &EngineHandle
                     let v = replace_entry(&raw05, 3, 3, 0, e1);
                     engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: "005.01".into(), value: v }));
                 }
-                ui.label(theme::muted("Section [005][01] — primary doorway"));
+                ui.label(theme::muted("Section [005][01]: primary doorway"));
                 ui.end_row();
 
                 ui.label("Entry delay 2");
@@ -773,7 +773,7 @@ pub fn ui(ui: &mut egui::Ui, prog: &ProgView, armed: bool, engine: &EngineHandle
                     let v = replace_entry(&raw05, 3, 3, 1, e2);
                     engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: "005.01".into(), value: v }));
                 }
-                ui.label(theme::muted("Section [005][01] — secondary entry"));
+                ui.label(theme::muted("Section [005][01]: secondary entry"));
                 ui.end_row();
 
                 ui.label("Exit delay");
@@ -781,7 +781,7 @@ pub fn ui(ui: &mut egui::Ui, prog: &ProgView, armed: bool, engine: &EngineHandle
                     let v = replace_entry(&raw05, 3, 3, 2, ex);
                     engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: "005.01".into(), value: v }));
                 }
-                ui.label(theme::muted("Section [005][01] — time to leave"));
+                ui.label(theme::muted("Section [005][01]: time to leave"));
                 ui.end_row();
 
                 ui.label("Bell cut-off");
@@ -789,7 +789,7 @@ pub fn ui(ui: &mut egui::Ui, prog: &ProgView, armed: bool, engine: &EngineHandle
                     let v = format!("{:03}", bell);
                     engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: "005.09".into(), value: v }));
                 }
-                ui.label(theme::muted("Section [005][09] — siren auto-silence"));
+                ui.label(theme::muted("Section [005][09]: siren auto-silence"));
                 ui.end_row();
             } else if m == Model::Vista20p {
                 let mut ex = read_entry(&raw_val(prog, "34"), 0, 2, 60);
@@ -801,28 +801,28 @@ pub fn ui(ui: &mut egui::Ui, prog: &ProgView, armed: bool, engine: &EngineHandle
                 if ui.add(egui::DragValue::new(&mut ex).range(15..=96).suffix(" s")).changed() {
                     engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: "34".into(), value: format!("{:02}", ex) }));
                 }
-                ui.label(theme::muted("Field *34 — time to leave"));
+                ui.label(theme::muted("Field *34: time to leave"));
                 ui.end_row();
 
                 ui.label("Entry delay #1");
                 if ui.add(egui::DragValue::new(&mut e1).range(15..=96).suffix(" s")).changed() {
                     engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: "35".into(), value: format!("{:02}", e1) }));
                 }
-                ui.label(theme::muted("Field *35 — primary doorway"));
+                ui.label(theme::muted("Field *35: primary doorway"));
                 ui.end_row();
 
                 ui.label("Entry delay #2");
                 if ui.add(egui::DragValue::new(&mut e2).range(15..=96).suffix(" s")).changed() {
                     engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: "36".into(), value: format!("{:02}", e2) }));
                 }
-                ui.label(theme::muted("Field *36 — secondary entry"));
+                ui.label(theme::muted("Field *36: secondary entry"));
                 ui.end_row();
 
                 ui.label("Bell timeout");
                 if ui.add(egui::DragValue::new(&mut bell_step).range(1..=4).suffix(" x 4 min")).changed() {
                     engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: "33".into(), value: format!("{}", bell_step) }));
                 }
-                ui.label(theme::muted("Field *33 — 1=4m, 2=8m, 3=12m, 4=16m"));
+                ui.label(theme::muted("Field *33: 1=4m, 2=8m, 3=12m, 4=16m"));
                 ui.end_row();
             } else {
                 let raw17 = raw_val(prog, "17");
@@ -837,7 +837,7 @@ pub fn ui(ui: &mut egui::Ui, prog: &ProgView, armed: bool, engine: &EngineHandle
                     let v = replace_entry(&raw17, 6, 3, 0, e1);
                     engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: "17".into(), value: v }));
                 }
-                ui.label(theme::muted("Section [17] — standard delay"));
+                ui.label(theme::muted("Section [17]: standard delay"));
                 ui.end_row();
 
                 ui.label("Auxiliary entry delay");
@@ -845,7 +845,7 @@ pub fn ui(ui: &mut egui::Ui, prog: &ProgView, armed: bool, engine: &EngineHandle
                     let v = replace_entry(&raw18, 2, 3, 0, aux_e);
                     engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: "18".into(), value: v }));
                 }
-                ui.label(theme::muted("Section [18] — auxiliary delay zones"));
+                ui.label(theme::muted("Section [18]: auxiliary delay zones"));
                 ui.end_row();
 
                 ui.label("Exit delay");
@@ -853,7 +853,7 @@ pub fn ui(ui: &mut egui::Ui, prog: &ProgView, armed: bool, engine: &EngineHandle
                     let v = replace_entry(&raw17, 6, 3, 1, ex);
                     engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: "17".into(), value: v }));
                 }
-                ui.label(theme::muted("Section [17] — time to leave"));
+                ui.label(theme::muted("Section [17]: time to leave"));
                 ui.end_row();
 
                 ui.label("Bell cut-off");
@@ -861,7 +861,7 @@ pub fn ui(ui: &mut egui::Ui, prog: &ProgView, armed: bool, engine: &EngineHandle
                     let v = replace_entry(&raw17, 6, 3, 2, bell);
                     engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: "17".into(), value: v }));
                 }
-                ui.label(theme::muted("Section [17] — siren auto-silence"));
+                ui.label(theme::muted("Section [17]: siren auto-silence"));
                 ui.end_row();
             }
         });
@@ -870,7 +870,12 @@ pub fn ui(ui: &mut egui::Ui, prog: &ProgView, armed: bool, engine: &EngineHandle
     // --- 2. Common Behavior & Options ---
     section_hdr(ui, "Keypad & alarm behavior");
     let mut chime = prog.chime;
-    if ui.checkbox(&mut chime, "Door chime enabled  ([*][4])").changed() {
+    let chime_lbl = if m == Model::Vista20p {
+        "Door chime enabled  ([Code] + 9)"
+    } else {
+        "Door chime enabled  ([*][4])"
+    };
+    if ui.checkbox(&mut chime, chime_lbl).changed() {
         engine.send(EngineMsg::EditPanel(PanelEdit::SetChime(chime)));
     }
     ui.add_enabled_ui(!armed, |ui| {
@@ -884,7 +889,7 @@ pub fn ui(ui: &mut egui::Ui, prog: &ProgView, armed: bool, engine: &EngineHandle
                 engine.send(EngineMsg::EditPanel(PanelEdit::SetToggle { key: "022".into(), opt: 8, on: stay_audible }));
             }
             let mut quick_arm = toggle_on(prog, "015", 4);
-            if ui.checkbox(&mut quick_arm, "Quick arming — arm with Stay, Away or [*][0] without a code  ([015] opt 4)").changed() {
+            if ui.checkbox(&mut quick_arm, "Quick arming: arm with Stay, Away or [*][0] without a code  ([015] opt 4)").changed() {
                 engine.send(EngineMsg::EditPanel(PanelEdit::SetQuickArm(quick_arm)));
             }
             let mut quick_exit = toggle_on(prog, "015", 3);
@@ -928,19 +933,19 @@ pub fn ui(ui: &mut egui::Ui, prog: &ProgView, armed: bool, engine: &EngineHandle
             if ui.checkbox(&mut ding, "Confirmation of arming ding on external bell  (*38)").changed() {
                 engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: "38".into(), value: if ding { "1" } else { "0" }.into() }));
             }
-            let mut astay = read_entry(&raw_val(prog, "84"), 0, 1, 1) != 0;
+            let mut astay = read_entry(&raw_val(prog, "84"), 0, 1, 3) != 0;
             if ui.checkbox(&mut astay, "Auto-Stay: convert Away to Stay if no door opens during exit  (*84)").changed() {
-                engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: "84".into(), value: if astay { "1" } else { "0" }.into() }));
+                engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: "84".into(), value: if astay { "3" } else { "0" }.into() }));
             }
             let mut cver = read_entry(&raw_val(prog, "86"), 0, 1, 1) != 0;
             if ui.checkbox(&mut cver, "Flash 'Alarm Canceled' on LCD when clearing alarm memory  (*86)").changed() {
                 engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: "86".into(), value: if cver { "1" } else { "0" }.into() }));
             }
-            let mut eerr = read_entry(&raw_val(prog, "59"), 0, 1, 1) != 0;
-            if ui.checkbox(&mut eerr, "Exit error alarm if doorway is left open when exit ends  (*59)").changed() {
+            let mut eerr = read_entry(&raw_val(prog, "59"), 0, 1, 0) != 0;
+            if ui.checkbox(&mut eerr, "Send exit error report code to monitoring  (*59)").changed() {
                 engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: "59".into(), value: if eerr { "1" } else { "0" }.into() }));
             }
-            let mut cd = read_entry(&raw_val(prog, "197"), 0, 1, 1) != 0;
+            let mut cd = read_entry(&raw_val(prog, "197"), 0, 1, 0) != 0;
             if ui.checkbox(&mut cd, "Show live exit delay seconds countdown on LCD  (*197)").changed() {
                 engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: "197".into(), value: if cd { "1" } else { "0" }.into() }));
             }
@@ -948,6 +953,10 @@ pub fn ui(ui: &mut egui::Ui, prog: &ProgView, armed: bool, engine: &EngineHandle
             let mut audible_exit = toggle_on(prog, "34", 1);
             if ui.checkbox(&mut audible_exit, "Audible exit delay with urgency beeps  ([34] opt 1)").changed() {
                 engine.send(EngineMsg::EditPanel(PanelEdit::SetToggle { key: "34".into(), opt: 1, on: audible_exit }));
+            }
+            let mut entry_urg = toggle_on(prog, "34", 4);
+            if ui.checkbox(&mut entry_urg, "Entry delay urgency pulsing in last 10 seconds  ([34] opt 4)").changed() {
+                engine.send(EngineMsg::EditPanel(PanelEdit::SetToggle { key: "34".into(), opt: 4, on: entry_urg }));
             }
             let mut quick_arm = prog.quick_arm;
             if ui.checkbox(&mut quick_arm, "Quick arming with [*][0]  ([*][6] opt 4)").changed() {
@@ -1041,7 +1050,7 @@ pub fn ui(ui: &mut egui::Ui, prog: &ProgView, armed: bool, engine: &EngineHandle
 
             ui.label("Buzzer tone / level");
             lvl_changed |= ui.add(egui::Slider::new(&mut bz, 0..=20)).changed();
-            ui.label(theme::muted(if bz == 0 { "0 = muted" } else { "[*][6] Buzzer (01–20 pitch)" }));
+            ui.label(theme::muted(if bz == 0 { "0 = muted" } else { "[*][6] Buzzer (01 to 20 pitch)" }));
             ui.end_row();
         });
         if lvl_changed {
@@ -1056,7 +1065,7 @@ pub fn ui(ui: &mut egui::Ui, prog: &ProgView, armed: bool, engine: &EngineHandle
             if ui.add(egui::Slider::new(&mut vl, 0..=7)).changed() {
                 engine.send(EngineMsg::EditPanel(PanelEdit::SetVoiceLevel(vl)));
             }
-            ui.label(theme::muted(if vl == 0 { "Muted (#+0+2 on keypad)" } else { "0 = mute, 1–7 (#+0+2)" }));
+            ui.label(theme::muted(if vl == 0 { "Muted (#+0+2 on keypad)" } else { "0 = mute, 1 to 7 (#+0+2)" }));
         });
     }
 
@@ -1069,7 +1078,7 @@ pub fn ui(ui: &mut egui::Ui, prog: &ProgView, armed: bool, engine: &EngineHandle
                 ui.label(theme::muted("Zone"));
                 ui.label(theme::muted("Definition ([001])"));
                 ui.label(theme::muted("Chime sound"));
-                ui.label(theme::muted("Options ([101]–[108])"));
+                ui.label(theme::muted("Options ([101] to [108])"));
                 ui.end_row();
 
                 for z in 1..=8usize {
@@ -1368,7 +1377,7 @@ pub fn ui(ui: &mut egui::Ui, prog: &ProgView, armed: bool, engine: &EngineHandle
                             let lbl = if name.is_empty() {
                                 format!("Option {}", i)
                             } else {
-                                format!("{} — {}", i, name)
+                                format!("{}: {}", i, name)
                             };
                             if ui.checkbox(&mut on, lbl).changed() {
                                 engine.send(EngineMsg::EditPanel(PanelEdit::SetToggle {

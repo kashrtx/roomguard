@@ -900,6 +900,7 @@ impl Engine {
         self.cfg = new;
         if model_changed {
             self.save(true);
+            self.audio.send(AudioCmd::Silence);
             self.zone_pend = [None; 8];
             self.panel = load_panel(self.cfg.model, &self.cfg, now);
             self.last_buzzer = self.panel.buzzer;

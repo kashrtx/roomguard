@@ -5,6 +5,37 @@ each version onto its GitHub release page.
 
 ## [2.1.0-beta.1] - 2026-11-25
 
+### VISTA-20P, checked against official programming and user guides
+
+Checked line by line against the VISTA-15P/20P User Guide (K5309-1V7), Programming Guide (K5305-1PRV5) and Installation Guide.
+
+- Keypad sounds follow the user guide's audible notification table, with the actual sounds measured from recordings of a real 6160V. The burglary alarm warbles between 1360 Hz and 1019 Hz every 505 ms without a break. Key beeps are 46 ms at 1360 Hz, the exit warning is 500 ms on and 510 ms off, and the single confirmation beep is a low 1019 Hz tone of about 340 ms, with the voice about 750 ms after it. The sounder's tone was rebuilt to match the real keypad's harmonics within a few dB (it was pitched at 2180 Hz and much buzzier). The entry and exit delays beep slowly (500 ms on, 510 ms off) and then rapidly (90 ms on, 70 ms off) for their last ten seconds, as filmed on a real keypad. The entry delay beeps rapidly all the way if an alarm happened while you were out. A trouble beeps rapidly until any key is pressed. Away and Maximum give two beeps, or the exit warning when *37 is on. A wrong code is silent, and arming with a zone open gives one short beep and shows the zone.
+- During the entry delay or an alarm, the code alone is enough: the beeps stop, and the system disarms about 15 seconds later even without OFF. A fire alarm is silenced by OFF alone.
+- NIGHT-STAY is code + STAY + STAY. It keeps the zones in the Night-Stay list (*81 here, zone list 05 on the real panel) armed.
+- Pressing * while armed Stay or Instant really restarts the exit delay (*91), and reopening the door during an Away exit delay resets it once.
+- Bypassing only adds zones. Code + 6 alone shows the bypassed zones, and code + OFF removes them all.
+- Test mode is code + 5 + 0 (1 is the dialer test). It beeps once about every 30 seconds, three times for each faulted zone, and ends itself after four hours with double beeps in the last five minutes.
+- After an alarm, the first code + OFF keeps the alarm on the display, and the second shows Alarm Canceled for a moment, then Ready to Arm (*86), as filmed on a real keypad. The low confirmation beep comes about a second after OFF, like the real panel's answer.
+- Zone descriptions start at a fixed column like the real display ("FIRE 95  FIRE" over "PANIC"), and the fire panic now shows its description.
+- The 6160V says "Disarmed", "Ready to arm", "Not ready to arm" and "Exit now" in the real keypad's own voice, cut from recordings and cleaned up.
+- Keys must come within 5 seconds of each other, or the entry starts over. Chime only works while disarmed. Changing the master code takes the new code twice, and # 0 deletes a user.
+- Installer programming steps to the next field after each entry, and an invalid field shows ENTRY ERROR.
+- Factory defaults corrected: quick arm *21 and quick bypass *23 off, entry delay 2 *36 30 seconds, function keys A, B and C on 00 (the panic keys) with D on 03, so it arms Away as its printed AWAY label says, *59 is the exit error report code (exit error is always active), auto-stay *84 3, exit time display *197 off. Added *32, *39, *50 (30 second dialer delay), *81 and *93. Saved panels get these once; anything you changed yourself is kept.
+- A camera that's blocked or offline shows as CHECK plus the zone.
+
+### PC1832 keypad sounds, measured from real PK5500 recordings
+
+- The PK5500 now sounds at 2295 Hz at its factory buzzer level (12), measured from recordings of a real PK5500 keypad, instead of about 2980 Hz. Buzzer Control still steps the tone up and down from there. Its notes now rise in about 7 ms, like the real disc.
+- Key beeps are 65 ms, and confirmation beeps are 67 ms on and 50 ms off.
+- A code arms it with six quick beeps, as recorded (and as the PC1550 manual says).
+- The exit delay beeps once every 996 ms. Its last ten seconds ("3 times a second" in the manual) are a burst of three quick beeps each second, not evenly spaced beeps.
+- The entry delay is a steady tone, and its "pulsing tone" for the last ten seconds is beep, beep, beeeep every second (94 ms, 94 ms, then 731 ms, with 26 ms gaps).
+
+### Sound output
+
+- Switching speakers or headphones no longer leaves RoomGuard silent. It follows the system's default output within about a second, keeps an alarm sounding through the switch, and still plays a beep you pressed while it changed over.
+
+
 > **Beta pre-release:** RoomGuard is a new project and this build is marked as a beta while remaining kinks are worked out. Feedback and bug reports are welcome!
 
 ### Smoother, no more freezes

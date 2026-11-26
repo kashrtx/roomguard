@@ -210,6 +210,16 @@ impl Gate {
                 self.pos = (self.pos + 1) % period;
                 ((p / unit) < count as u32 && (p % unit) < on, None)
             }
+            Pattern::ShortShortLong { short_ms, gap_ms, long_ms } => {
+                let s = ms(sr, short_ms as u32).max(1);
+                let g = ms(sr, gap_ms as u32);
+                let l = ms(sr, long_ms as u32).max(1);
+                let period = (2 * (s + g) + l + g).max(1);
+                let p = self.pos;
+                self.pos = (self.pos + 1) % period;
+                let on = p < s || (p >= s + g && p < 2 * s + g) || (p >= 2 * (s + g) && p < 2 * (s + g) + l);
+                (on, None)
+            }
             Pattern::HiLo { hi_hz, lo_hz, step_ms } => {
                 let step = ms(sr, step_ms as u32).max(1);
                 let period = step * 2;
@@ -235,6 +245,12 @@ struct Piezo {
     second: f32,
     level: u8,
     sr: f32,
+    /// The pitch of a plain beep. On the DSC keypads it's the disc's own
+    /// resonance; the Vista 6160 beeps at 1360 Hz.
+    tone: f32,
+    /// The 6160 note envelope, and harmonic gains cached for one pitch.
+    env: f32,
+    gains: (f32, [f32; 4]),
 }
 
 impl Piezo {
@@ -244,6 +260,9 @@ impl Piezo {
             res: Res::new(sr, 3000.0, 12.0),
             res2: Res::new(sr, 3060.0, 9.0),
             body: Res::new(sr, 1420.0, 2.2),
+            tone: 0.0,
+            env: 0.0,
+            gains: (0.0, [0.0; 4]),
             phase: 0.0,
             f0: 3000.0,
             buzz: 0.15,
@@ -270,20 +289,21 @@ impl Piezo {
         let (f0, q, buzz, sat, second) = match self.voice {
             KeypadVoice::Classic => (2780.0, 8.5, 0.30, 2.2, 0.36),
             KeypadVoice::Pk5500 => {
-                // Real PK5500 Buzzer Control: 00 = off, 01..20 shifts the piezo
-                // fundamental tone across ~2.05 to 3.65 kHz (14 ≈ 3.145 kHz).
-                let t = (self.level.saturating_sub(1) as f32) / 19.0;
-                let f = 2050.0 + t * 1600.0;
-                (f, 15.0, 0.11, 1.45, 0.06)
+                // Buzzer Control "adjusts the keypad buzzer tone": 00 is off and
+                // 01 to 20 step the pitch. A recording of a real PowerSeries
+                // keypad at the factory level (12) sounds at 2295 Hz, rising and
+                // falling in about 7 ms (a disc with a Q near 27).
+                let f = 2295.0 * 2f32.powf((self.level.max(1) as f32 - 12.0) * 0.0438);
+                (f, 27.0, 0.11, 1.45, 0.06)
             }
             KeypadVoice::Vista6160 => {
-                // Real 6160V uses a 1-inch dynamic speaker (not a narrow high-Q
-                // ceramic piezo), giving a warmer ~2.18 kHz keypress chirp and
-                // carrying both octaves of the continuous hi-lo "dee-doo" alarm cleanly.
-                (2180.0, 3.6, 0.30, 1.35, 0.08)
+                // Unused by the 6160's own voice (see next_6160), which was
+                // measured from a recording of a real keypad instead.
+                (1360.0, 2.0, 0.0, 1.1, 0.0)
             }
         };
         self.f0 = f0;
+        self.tone = f0;
         self.buzz = buzz;
         self.sat = sat;
         self.second = second;
@@ -292,6 +312,9 @@ impl Piezo {
     }
 
     fn next(&mut self, on: bool, freq: f32, amp: f32) -> f32 {
+        if self.voice == KeypadVoice::Vista6160 {
+            return self.next_6160(on, freq, amp);
+        }
         let muted = self.voice == KeypadVoice::Pk5500 && self.level == 0;
         let drive = if on && !muted && amp > 0.0 {
             let dt = freq / self.sr;
@@ -316,9 +339,71 @@ impl Piezo {
         (v * self.sat).tanh() / self.sat.tanh()
     }
 
+    /// The 6160's sounder, rebuilt from a recording of a real keypad: a square
+    /// wave heard through its small speaker. At 1360 Hz the 3rd harmonic sits
+    /// 31 dB down and the 5th 44 dB down; at 1019 Hz the speaker all but
+    /// swallows the 3rd (-50 dB) and lets the 5th through (-41 dB). Notes rise
+    /// and fall in about 10 ms.
+    fn next_6160(&mut self, on: bool, freq: f32, amp: f32) -> f32 {
+        let target = if on && amp > 0.0 { amp } else { 0.0 };
+        let k = 1.0 - (-1.0 / (0.0045 * self.sr)).exp();
+        self.env += (target - self.env) * k;
+        if target == 0.0 && self.env < 1.0e-5 {
+            self.env = 0.0;
+            return 0.0;
+        }
+        if (self.gains.0 - freq).abs() > 0.5 {
+            self.gains = (freq, speaker_6160(freq));
+        }
+        self.phase += freq / self.sr;
+        if self.phase >= 1.0 {
+            self.phase -= 1.0;
+        }
+        let g = self.gains.1;
+        let p = TAU * self.phase;
+        let v = g[0] * p.sin() + g[1] * (2.0 * p).sin() + g[2] * (3.0 * p).sin() + g[3] * (5.0 * p).sin();
+        v * self.env * 0.9
+    }
+
     fn quiet(&self) -> bool {
+        if self.voice == KeypadVoice::Vista6160 {
+            return self.env < 1e-5;
+        }
         self.res.energy() < 1e-5 && self.res2.energy() < 1e-5 && self.body.energy() < 1e-5
     }
+}
+
+/// The 6160 speaker's response in dB, read off the recording: about flat
+/// across the two notes, a deep dip near 3 kHz and a lift around 4 to 5 kHz.
+fn speaker_6160_db(f: f32) -> f32 {
+    const PTS: [(f32, f32); 8] = [
+        (400.0, -6.0),
+        (1019.0, -1.5),
+        (1360.0, 0.0),
+        (2200.0, -20.0),
+        (3057.0, -40.5),
+        (4080.0, -21.5),
+        (5095.0, -27.0),
+        (6800.0, -30.0),
+    ];
+    if f <= PTS[0].0 {
+        return PTS[0].1;
+    }
+    for w in PTS.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        if f <= b.0 {
+            let t = (f.ln() - a.0.ln()) / (b.0.ln() - a.0.ln());
+            return a.1 + t * (b.1 - a.1);
+        }
+    }
+    -30.0 - (f / 6800.0).log2() * 12.0
+}
+
+/// Gains of the fundamental, 2nd, 3rd and 5th harmonics for a 6160 note.
+fn speaker_6160(f: f32) -> [f32; 4] {
+    let lin = |x: f32| 10f32.powf(speaker_6160_db(x) / 20.0);
+    let g1 = lin(f);
+    [g1, g1 * 0.004, lin(3.0 * f) / 3.0, lin(5.0 * f) / 5.0]
 }
 
 /// All four bell output devices.
@@ -733,7 +818,7 @@ impl Synth {
     }
 
     fn push_chime(&mut self, k: ChimeKind) {
-        let f0 = self.piezo.f0;
+        let f0 = self.piezo.tone;
         let sr = self.sr;
         match k {
             ChimeKind::Beeps(n) => {
@@ -787,8 +872,14 @@ impl Synth {
                 // is heard clearly, like on the real keypad.
                 self.segs.clear();
                 self.seg = None;
-                let f = self.piezo.f0;
-                let dur = if self.voice == KeypadVoice::Vista6160 { 48 } else { 80 };
+                let f = self.piezo.tone;
+                // 46 ms on the 6160, measured from a recording.
+                let dur = match self.voice {
+                    KeypadVoice::Vista6160 => 46,
+                    // Measured from a real PowerSeries keypad.
+                    KeypadVoice::Pk5500 => 65,
+                    KeypadVoice::Classic => 80,
+                };
                 if matches!(self.sounder.pat, Pattern::Steady) {
                     self.segs.push_back(Seg { on: 0, off: ms(self.sr, 30).max(1), freq: f, decay: 1.0, amp: 0.0, key: true });
                     self.segs.push_back(Seg { on: ms(self.sr, dur).max(1), off: ms(self.sr, 40).max(1), freq: f, decay: 1.0, amp: 1.0, key: true });
@@ -796,12 +887,27 @@ impl Synth {
                     self.segs.push_back(Seg { on: ms(self.sr, dur).max(1), off: ms(self.sr, 22), freq: f, decay: 1.0, amp: 1.0, key: true });
                 }
             }
+            AudioCmd::Tone { hz, on_ms, off_ms, delay_ms } => {
+                self.drop_all_but_keys();
+                if delay_ms > 0 {
+                    // The panel's answer comes a moment after the key.
+                    self.segs.push_back(Seg { on: 0, off: ms(self.sr, delay_ms as u32), freq: hz as f32, decay: 1.0, amp: 0.0, key: false });
+                }
+                self.segs.push_back(Seg {
+                    on: ms(self.sr, on_ms as u32).max(1),
+                    off: ms(self.sr, off_ms as u32),
+                    freq: hz as f32,
+                    decay: 1.0,
+                    amp: 1.0,
+                    key: false,
+                });
+            }
             AudioCmd::Beeps { count, on_ms, off_ms } => {
                 // One sounder per keypad: a new sequence replaces the last one,
                 // but a keypress beep that's still sounding finishes first. That
                 // way the last digit of a code is heard, then "beep beep beep".
                 self.drop_all_but_keys();
-                let f = self.piezo.f0;
+                let f = self.piezo.tone;
                 let n = count.max(1);
                 for i in 0..n {
                     // Add a crisp trailing gap on the final beep if the sounder is running.
@@ -1003,7 +1109,7 @@ impl Synth {
             // control of the single keypad piezo (including its silent gaps),
             // so rapid beeps and keypresses cut cleanly through steady tones.
             Some((gate, f, a)) => (gate, f, a),
-            None => (bg_on, bg_freq.unwrap_or(self.piezo.f0), 1.0),
+            None => (bg_on, bg_freq.unwrap_or(self.piezo.tone), 1.0),
         };
         let power = self.bell_gate() | self.squawk_next();
         let speaking = self.voice_player.is_speaking();

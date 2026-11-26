@@ -750,9 +750,9 @@ fn pc1832_exit_delay_beeps_only_with_section_014_option_6() {
     p.tick(t0 + Duration::from_millis(2100), 0);
     assert!(p.exit.is_some());
     p.tick(t0 + secs(5), 0);
-    assert!(matches!(p.sounder_sent, Pattern::Beeps { period_ms: 1000, .. }), "beeps once a second");
+    assert!(matches!(p.sounder_sent, Pattern::Beeps { count: 1, period_ms: 996, .. }), "beeps once a second");
     p.tick(t0 + secs(115), 0);
-    assert!(matches!(p.sounder_sent, Pattern::Beeps { period_ms: 333, .. }), "three a second at the end");
+    assert!(matches!(p.sounder_sent, Pattern::Beeps { count: 3, period_ms: 996, .. }), "a burst of three each second at the end");
     let mut p = panel(Model::Pc1832);
     p.ee.sections.insert("014".to_string(), String::new());
     p.key(Key::Away, true, t0);
@@ -983,20 +983,22 @@ fn vista20p_commands_autostay_twostep_clear_and_voice_rom() {
     p.tick(t0 + secs(135), 0);
     assert_eq!(p.armed.map(|a| a.mode), Some(ArmMode::Away));
 
-    // 5. Trip Zone 3 (Perimeter) -> Instant Alarm with slow two-tone hi-lo keypad speaker & two-step clear
+    // 5. Trip Zone 3 (Perimeter) -> instant alarm, "LOUD, CONTINUOUS" at the keypad, two-step clear
     p.set_zone(3, true, false, false, t0 + secs(140));
     p.tick(t0 + secs(141), 0);
     assert!(p.alarm_sounding(t0 + secs(141)));
-    assert!(matches!(p.sounder_sent, Pattern::HiLo { hi_hz: 1960, lo_hz: 1040, step_ms: 420 }));
+    assert_eq!(p.sounder_sent, Pattern::HiLo { hi_hz: 1360, lo_hz: 1019, step_ms: 505 }, "the measured two-tone warble");
     // 1st [Code] + 1 silences alarm but leaves alarm memory latched on LCD
     keys(&mut p, "12341", t0 + secs(145));
     p.set_zone(3, false, false, false, t0 + secs(146));
     assert!(p.vista_alarm_mem_zone.is_some());
+    // The first code + OFF leaves the alarm on the display, as on a real 6160.
     assert!(p.lcd_vista(t0 + secs(146), 0).lines[0].contains("ALARM 03"));
-    // 2nd [Code] + 1 clears alarm memory and flashes Alarm Canceled (*86 = 1)
+    // The second shows "Alarm Canceled" for a moment (*86), then Ready to Arm.
     keys(&mut p, "12341", t0 + secs(148));
     assert!(p.vista_alarm_mem_zone.is_none());
-    assert!(p.lcd_vista(t0 + secs(149), 0).lines[0].contains("Alarm Canceled"));
+    assert!(p.lcd_vista(t0 + secs(148), 0).lines[0].contains("Alarm Canceled"));
+    assert!(p.lcd_vista(t0 + secs(150), 0).lines[1].contains("Ready to Arm"));
 
     // 6. Installer programming: 4112 + 800 -> *35 -> 45 -> *99
     keys(&mut p, "4112800", t0 + secs(155));
@@ -1052,4 +1054,168 @@ fn all_three_keypads_render_without_panicking() {
         });
     }
     engine.shutdown();
+}
+
+#[test]
+fn the_vista_follows_its_user_guide() {
+    let t0 = Instant::now();
+    let mut p = panel(Model::Vista20p);
+    // Quick arm (*21) and quick bypass (*23) are off from the factory.
+    keys(&mut p, "#2", t0);
+    assert!(p.exit.is_none(), "quick arm stays off until *21 is set");
+
+    // Code + STAY + STAY is NIGHT-STAY.
+    keys(&mut p, "123433", t0 + secs(10));
+    assert!(p.vista_night);
+    assert!(p.lcd_vista(t0 + secs(10), 0).lines[0].contains("NIGHT-STAY"));
+    keys(&mut p, "12341", t0 + secs(20));
+    assert!(p.armed.is_none() && p.exit.is_none() && !p.vista_night);
+
+    // Bypassing only adds, and code + OFF while disarmed removes it.
+    keys(&mut p, "1234603", t0 + secs(30));
+    assert!(p.zones[2].bypassed);
+    keys(&mut p, "1234603", t0 + secs(40));
+    assert!(p.zones[2].bypassed, "entering a bypassed zone again keeps it bypassed");
+    keys(&mut p, "12341", t0 + secs(50));
+    assert!(!p.zones[2].bypassed);
+
+    // In the entry delay a code alone quiets the keypad and disarms 15 s later.
+    keys(&mut p, "12342", t0 + secs(60));
+    p.tick(t0 + secs(125), 0);
+    assert!(p.armed.is_some());
+    p.set_zone(1, true, false, false, t0 + secs(130));
+    p.tick(t0 + secs(130), 0);
+    assert!(p.entry.is_some());
+    assert!(matches!(p.sounder_sent, Pattern::Beeps { on_ms: 500, period_ms: 1010, .. }), "slow entry beeping");
+    keys(&mut p, "1234", t0 + secs(132));
+    p.tick(t0 + secs(133), 0);
+    assert_eq!(p.sounder_sent, Pattern::Off, "the entry beeps stop once a code is in");
+    p.tick(t0 + secs(148), 0);
+    assert!(p.armed.is_none(), "a valid code disarms about 15 seconds later without OFF");
+
+    // A trouble beeps rapidly until any key is pressed.
+    p.inputs.cam_enabled = true;
+    p.inputs.cam_covered = true;
+    p.tick(t0 + secs(150), 0);
+    assert!(matches!(p.sounder_sent, Pattern::Beeps { period_ms: 160, .. }), "rapid trouble beeping");
+    keys(&mut p, "5", t0 + secs(151));
+    p.tick(t0 + secs(152), 0);
+    assert_eq!(p.sounder_sent, Pattern::Off, "any key silences it");
+}
+
+#[test]
+fn the_vista_keypad_plays_the_measured_notes() {
+    use crate::audio::{synth::Synth, AudioCmd, KeypadVoice};
+    let sr = 48_000.0;
+    let mut s = Synth::new(sr);
+    s.apply(AudioCmd::Voice(KeypadVoice::Vista6160));
+    s.apply(AudioCmd::Sounder(Pattern::HiLo { hi_hz: 1360, lo_hz: 1019, step_ms: 505 }));
+    let n = (0.505 * sr) as usize;
+    let hi: Vec<f32> = (0..n).map(|_| s.next()).collect();
+    let lo: Vec<f32> = (0..n).map(|_| s.next()).collect();
+    let pitch = |v: &[f32]| {
+        let w = &v[v.len() / 4..v.len() * 3 / 4];
+        let ups = w.windows(2).filter(|p| p[0] <= 0.0 && p[1] > 0.0).count();
+        ups as f32 / (w.len() as f32 / sr)
+    };
+    assert!((pitch(&hi) - 1360.0).abs() < 15.0, "high note {}", pitch(&hi));
+    assert!((pitch(&lo) - 1019.0).abs() < 15.0, "low note {}", pitch(&lo));
+    let peak = hi.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    assert!(peak > 0.1, "the alarm is loud ({})", peak);
+}
+
+#[test]
+fn the_pc1832_sounds_like_a_real_powerseries_keypad() {
+    let t0 = Instant::now();
+    let mut p = panel(Model::Pc1832);
+    p.out.clear();
+    keys(&mut p, "1234", t0);
+    assert!(p.exit.is_some());
+    assert!(
+        p.out.iter().any(|o| matches!(o, Out::Audio(AudioCmd::Beeps { count: 6, on_ms: 67, off_ms: 50 }))),
+        "a code arms it with six quick beeps"
+    );
+    p.tick(t0 + secs(125), 0);
+    assert!(p.armed.is_some());
+    p.set_zone(1, true, false, false, t0 + secs(130));
+    p.tick(t0 + secs(131), 0);
+    assert_eq!(p.sounder_sent, Pattern::Steady, "a steady entry tone");
+    p.tick(t0 + secs(155), 0);
+    assert_eq!(
+        p.sounder_sent,
+        Pattern::ShortShortLong { short_ms: 94, gap_ms: 26, long_ms: 731 },
+        "then beep, beep, beeeep for the last ten seconds"
+    );
+}
+
+#[test]
+fn the_vista_entry_delay_beeps_faster_at_the_end() {
+    let t0 = Instant::now();
+    let mut p = panel(Model::Vista20p);
+    keys(&mut p, "12342", t0);
+    p.tick(t0 + secs(65), 0);
+    assert!(p.armed.is_some());
+    p.set_zone(1, true, false, false, t0 + secs(70));
+    p.tick(t0 + secs(71), 0);
+    assert!(matches!(p.sounder_sent, Pattern::Beeps { on_ms: 500, period_ms: 1010, .. }), "slow at first");
+    p.tick(t0 + secs(92), 0);
+    assert!(matches!(p.sounder_sent, Pattern::Beeps { on_ms: 90, period_ms: 160, .. }), "rapid for the last ten seconds");
+}
+
+#[test]
+fn pc1550_entry_delay_pulses_in_last_10_seconds_and_vista_speaks_live_ready() {
+    // 1. PC1550RK pulses (beep, beep, beeeep) in the last 10 seconds of entry delay.
+    let t0 = Instant::now();
+    let mut p = panel(Model::Pc1550);
+    keys(&mut p, "1234", t0);
+    p.tick(t0 + secs(125), 0);
+    assert!(p.armed.is_some());
+    p.set_zone(1, true, false, false, t0 + secs(130));
+    p.tick(t0 + secs(131), 0);
+    assert_eq!(p.sounder_sent, Pattern::Steady, "steady entry tone before last 10 seconds");
+    p.tick(t0 + secs(155), 0);
+    assert_eq!(
+        p.sounder_sent,
+        Pattern::ShortShortLong { short_ms: 94, gap_ms: 26, long_ms: 731 },
+        "PC1550RK should pulse beep-beep-beeeep in the last 10 seconds"
+    );
+
+    // 2. Vista20p evaluates ready() LIVE when speaking after disarming (so a
+    // closing doorway doesn't falsely announce "not ready to arm" when ready).
+    let mut v = panel(Model::Vista20p);
+    keys(&mut v, "12342", t0);
+    v.tick(t0 + secs(65), 0);
+    v.set_zone(1, true, false, false, t0 + secs(70));
+    v.tick(t0 + secs(70), 0);
+    v.out.clear();
+    keys(&mut v, "12341", t0 + secs(71));
+    // Zone 1 closes 0.5s later, well before the 2.19s delayed voice announcement.
+    v.set_zone(1, false, false, false, t0 + Duration::from_millis(71_500));
+    v.tick(t0 + Duration::from_millis(73_500), 0);
+    let spoke_ready = v.out.iter().any(|o| matches!(o, Out::Audio(AudioCmd::Speak(toks)) if toks.iter().any(|t| t == "ready_to_arm")));
+    let spoke_not_ready = v.out.iter().any(|o| matches!(o, Out::Audio(AudioCmd::Speak(toks)) if toks.iter().any(|t| t == "not_ready_to_arm")));
+    assert!(spoke_ready && !spoke_not_ready, "Vista must speak ready_to_arm when zone closed before announcement");
+
+    // 3. Vista20p [Code] + 6 shows BYPASS ZONE and stays open past 3 seconds.
+    keys(&mut v, "12346", t0 + secs(80));
+    v.tick(t0 + secs(83), 0);
+    assert!(v.lcd_vista(t0 + secs(83), 0).lines[0].contains("BYPASS"));
+    keys(&mut v, "03", t0 + secs(84));
+    assert!(v.zones[2].bypassed);
+
+    // 4. Switching between all 4 sirens during Steady & Temporal3 produces loud audio,
+    // and PC1832 Panic key sounds the bell out of the box.
+    let mut s = crate::audio::synth::Synth::new(48_000.0);
+    s.apply(AudioCmd::Volumes { master: 0.8, siren: 0.45, keypad: 0.7, line: 0.0 });
+    for sm in SirenModel::ALL {
+        s.apply(AudioCmd::Siren { model: sm, warble: true });
+        s.apply(AudioCmd::Bell(BellPattern::Steady));
+        // Let motor sirens / bells spin up (~0.6s) and measure peak
+        let peak = (0..36_000).map(|_| s.next().abs()).fold(0.0f32, f32::max);
+        assert!(peak > 0.15, "siren {:?} must sound loudly on steady alarm (got {})", sm, peak);
+    }
+    let mut p18 = panel(Model::Pc1832);
+    p18.key(Key::Panic, true, t0);
+    p18.tick(t0 + Duration::from_millis(2100), 0);
+    assert_eq!(p18.bell_sent, BellPattern::Steady, "PC1832 Panic key should sound the siren out of the box");
 }

@@ -206,7 +206,7 @@ impl SetupView {
                 [
                     "Speaks status & alarms with 6160V voice",
                     "[Code]+Action keys & 2-step alarm clear",
-                    "Flip cover with exposed A–D quick keys",
+                    "Flip cover with exposed A to D quick keys",
                 ],
             ),
         ];

@@ -70,7 +70,7 @@ pub const PC1550: &[Spec] = &[
     Spec { key: "31", name: "4th System Option Code", kind: Kind::Toggle(6), default: "" },
     Spec { key: "32", name: "5th System Option Code", kind: Kind::Toggle(6), default: "36" },
     Spec { key: "33", name: "Answering Machine Double Call Timer", kind: d(1, 3), default: "060" },
-    Spec { key: "34", name: "6th System Option Code", kind: Kind::Toggle(6), default: "" },
+    Spec { key: "34", name: "6th System Option Code", kind: Kind::Toggle(6), default: "4" },
     Spec { key: "35", name: "LINKS1000 Test Reporting Code", kind: d(1, 2), default: "FF" },
     Spec { key: "36", name: "Keypad Lockout Control", kind: d(2, 2), default: "0000" },
     Spec { key: "90", name: "Installer's Lockout Enable", kind: Kind::Action, default: "" },
@@ -99,7 +99,7 @@ pub const PC1832: &[Spec] = &[
     Spec { key: "012", name: "Kp Lockout", kind: d(2, 3), default: "000000" },
     Spec { key: "013", name: "1st Sys Opt", kind: Kind::Toggle(8), default: "3567" },
     Spec { key: "014", name: "2nd Sys Opt", kind: Kind::Toggle(8), default: "6" },
-    Spec { key: "015", name: "3rd Sys Opt", kind: Kind::Toggle(8), default: "147" },
+    Spec { key: "015", name: "3rd Sys Opt", kind: Kind::Toggle(8), default: "1247" },
     Spec { key: "016", name: "4th Sys Opt", kind: Kind::Toggle(8), default: "15" },
     Spec { key: "017", name: "5th Sys Opt", kind: Kind::Toggle(8), default: "1" },
     Spec { key: "018", name: "6th Sys Opt", kind: Kind::Toggle(8), default: "" },
@@ -159,25 +159,30 @@ pub const PC1832: &[Spec] = &[
 pub const VISTA20P: &[Spec] = &[
     Spec { key: "20", name: "Installer Code", kind: Kind::Code("inst"), default: "4112" },
     Spec { key: "02", name: "Master Code", kind: Kind::Code("02"), default: "1234" },
-    Spec { key: "21", name: "Quick Arm Enable", kind: d(1, 1), default: "1" },
-    Spec { key: "23", name: "Quick/Forced Bypass", kind: d(1, 1), default: "1" },
+    Spec { key: "21", name: "Quick Arm Enable", kind: d(1, 1), default: "0" },
+    Spec { key: "23", name: "Quick/Forced Bypass", kind: d(1, 1), default: "0" },
     Spec { key: "26", name: "Chime By Zone", kind: d(1, 1), default: "0" },
+    Spec { key: "32", name: "Fire Sounder Timeout", kind: d(1, 1), default: "0" },
     Spec { key: "33", name: "Bell Timeout (x4 min)", kind: d(1, 1), default: "1" },
     Spec { key: "34", name: "Exit Delay (sec)", kind: d(1, 2), default: "60" },
     Spec { key: "35", name: "Entry Delay 1 (sec)", kind: d(1, 2), default: "30" },
-    Spec { key: "36", name: "Entry Delay 2 (sec)", kind: d(1, 2), default: "45" },
+    Spec { key: "36", name: "Entry Delay 2 (sec)", kind: d(1, 2), default: "30" },
     Spec { key: "37", name: "Audible Exit Warning", kind: d(1, 1), default: "1" },
     Spec { key: "38", name: "Confirmation of Arming Ding", kind: d(1, 1), default: "0" },
+    Spec { key: "39", name: "Power Up In Previous State", kind: d(1, 1), default: "1" },
     Spec { key: "41", name: "Primary Phone Number", kind: Kind::Phone(20), default: "5551234" },
     Spec { key: "42", name: "Secondary Phone Number", kind: Kind::Phone(20), default: "" },
     Spec { key: "43", name: "Partition 1 Account Code", kind: d(1, 4), default: "1234" },
+    Spec { key: "50", name: "Burglary Dialer Delay", kind: d(1, 1), default: "2" },
     Spec { key: "56", name: "Zone Types (01-08)", kind: d(8, 2), default: "0104030104090210" },
     Spec { key: "57", name: "Function Keys A-D", kind: d(4, 2), default: "00000003" },
-    Spec { key: "59", name: "Exit Error Alarm", kind: d(1, 1), default: "1" },
-    Spec { key: "84", name: "Auto-Stay Arming", kind: d(1, 1), default: "1" },
+    Spec { key: "59", name: "Exit Error Report Code", kind: d(1, 1), default: "0" },
+    Spec { key: "81", name: "Night-Stay Zones (List 05)", kind: d(8, 1), default: "00000000" },
+    Spec { key: "84", name: "Auto-Stay Arming", kind: d(1, 1), default: "3" },
     Spec { key: "86", name: "Cancel Verify Display", kind: d(1, 1), default: "1" },
     Spec { key: "91", name: "Option Selection", kind: d(1, 1), default: "8" },
-    Spec { key: "197", name: "Exit Time Display Interval", kind: d(1, 1), default: "1" },
+    Spec { key: "93", name: "Reports In Armed Period", kind: d(1, 1), default: "1" },
+    Spec { key: "197", name: "Exit Time Display Interval", kind: d(1, 1), default: "0" },
     Spec { key: "resp", name: "Zone Response Times (0-3)", kind: d(8, 1), default: "11111111" },
     Spec { key: "97", name: "Reset Factory Defaults", kind: Kind::Action, default: "" },
     Spec { key: "98", name: "Exit Programming (Lockout)", kind: Kind::Action, default: "" },
@@ -216,7 +221,7 @@ pub struct CodeSlot {
 
 /// Bumped whenever a factory default is corrected, so saved panels can be
 /// brought up to date once (see `Eeprom::migrate`).
-pub const EEPROM_REV: u32 = 1;
+pub const EEPROM_REV: u32 = 5;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -292,6 +297,54 @@ impl Eeprom {
                 }
             }
             self.rev = 1;
+        }
+        if self.rev < 2 {
+            // RoomGuard 2.1's VISTA-20P defaults, against the Programming Guide.
+            let fixes: &[(&'static str, &'static str, &'static str)] = match model {
+                Model::Vista20p => &[
+                    ("21", "1", "0"),
+                    ("23", "1", "0"),
+                    ("36", "45", "30"),
+                    ("59", "1", "0"),
+                    ("84", "1", "3"),
+                    ("197", "1", "0"),
+                ],
+                _ => &[],
+            };
+            for (key, old, new) in fixes.iter() {
+                if self.sections.get(*key).map_or(false, |v| v.as_str() == *old) {
+                    self.sections.insert(key.to_string(), new.to_string());
+                    changed.push(*key);
+                }
+            }
+            self.rev = 2;
+        }
+        if self.rev < 3 {
+            // Key D is printed AWAY on the 6160, so RoomGuard sets it to arm
+            // Away (*57 code 03), undoing the paging default 2.1's first build gave it.
+            if model == Model::Vista20p && self.sections.get("57").map_or(false, |v| v.as_str() == "00000000") {
+                self.sections.insert("57".to_string(), "00000003".to_string());
+                changed.push("57");
+            }
+            self.rev = 3;
+        }
+        if self.rev < 4 {
+            // Enable PC1550 [34] opt 4 (Entry Delay urgency pulsing in last 10s)
+            // on untouched saves so the last 10 seconds pulse like the PC1832.
+            if model == Model::Pc1550 && self.sections.get("34").map_or(false, |v| v.is_empty()) {
+                self.sections.insert("34".to_string(), "4".to_string());
+                changed.push("34");
+            }
+            self.rev = 4;
+        }
+        if self.rev < 5 {
+            // Enable PC1832 [015] opt 2 (audible Panic key) on untouched saves
+            // so the Panic button sounds the selected siren out of the box.
+            if model == Model::Pc1832 && self.sections.get("015").map_or(false, |v| v.as_str() == "147") {
+                self.sections.insert("015".to_string(), "1247".to_string());
+                changed.push("015");
+            }
+            self.rev = 5;
         }
         changed
     }
@@ -483,7 +536,7 @@ impl Eeprom {
                     2 => (ZoneKind::Delay2, true, true, true),
                     3 => (ZoneKind::Instant, true, true, true),
                     4 => (ZoneKind::StayAway, true, true, false),
-                    5 => (ZoneKind::DayZone, true, true, true),
+                    5 => (ZoneKind::DayZone, true, true, false),
                     6 => (ZoneKind::H24(H24::Holdup), false, true, false),
                     7 => (ZoneKind::H24(H24::Panic), true, true, false),
                     8 => (ZoneKind::H24(H24::Medical), false, true, false),
@@ -491,6 +544,8 @@ impl Eeprom {
                     10 => (ZoneKind::DelayStayAway, true, true, false),
                     14 => (ZoneKind::H24(H24::CarbonMonoxide), true, false, false),
                     16 => (ZoneKind::FireDelayed, true, false, false),
+                    23 => (ZoneKind::NonAlarm, false, true, false),
+                    24 => (ZoneKind::Instant, false, true, false),
                     _ => (ZoneKind::Null, false, true, false),
                 };
                 ZoneCfg {

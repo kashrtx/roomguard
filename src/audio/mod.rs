@@ -22,6 +22,9 @@ pub enum Pattern {
     Beeps { on_ms: u16, off_ms: u16, count: u8, period_ms: u32 },
     /// Continuous alternating two-tone alarm (e.g. 6160V burglary "dee-doo").
     HiLo { hi_hz: u16, lo_hz: u16, step_ms: u16 },
+    /// Two short beeps then a long one, over and over: the PowerSeries entry
+    /// delay's "pulsing tone" in its last ten seconds, measured from a recording.
+    ShortShortLong { short_ms: u16, gap_ms: u16, long_ms: u16 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,6 +78,8 @@ pub enum AudioCmd {
     Ring(bool),
     Click,
     Preview { model: SirenModel, warble: bool, ms: u32 },
+    /// One pitched keypad beep, e.g. the Vista's low 1019 Hz confirmation.
+    Tone { hz: u16, on_ms: u16, off_ms: u16, delay_ms: u16 },
     Silence,
     /// The pointer is near the keypad: make sure the output is awake.
     Wake,
@@ -145,7 +150,7 @@ impl State {
 
     /// Sounds that matter if they're missed while the output reconnects.
     fn worth_replaying(c: &AudioCmd) -> bool {
-        matches!(c, AudioCmd::KeyBeep | AudioCmd::Beeps { .. } | AudioCmd::Chime(_))
+        matches!(c, AudioCmd::KeyBeep | AudioCmd::Beeps { .. } | AudioCmd::Chime(_) | AudioCmd::Tone { .. })
     }
 
     fn replay(&self) -> Vec<AudioCmd> {
@@ -166,7 +171,10 @@ fn run(rx: Receiver<AudioCmd>, ok: Arc<AtomicBool>) {
     loop {
         let failed = Arc::new(AtomicBool::new(false));
         let (itx, irx) = mpsc::channel::<AudioCmd>();
-        let stream = build_stream(irx, failed.clone());
+        let built = build_stream(irx, failed.clone());
+        // Which output this stream plays into, to notice a switch.
+        let using = built.as_ref().ok().and_then(|(_, name)| name.clone());
+        let stream = built.map(|(s, _)| s);
         match &stream {
             Ok(_) => {
                 ok.store(true, Ordering::Relaxed);
@@ -192,6 +200,8 @@ fn run(rx: Receiver<AudioCmd>, ok: Arc<AtomicBool>) {
                 }
             }
         }
+        let mut checked = Instant::now();
+        let mut switched = false;
         loop {
             match rx.recv_timeout(Duration::from_millis(200)) {
                 Ok(cmd) => {
@@ -209,15 +219,35 @@ fn run(rx: Receiver<AudioCmd>, ok: Arc<AtomicBool>) {
             if stream.is_err() || failed.load(Ordering::Relaxed) {
                 break;
             }
+            // A stream stays on the device it opened. Pick another output
+            // (speakers to headphones, say) while the old one is still plugged
+            // in and nothing fails, so RoomGuard would keep playing into the old
+            // one and you'd hear nothing. It follows the system's output instead.
+            if using.is_some() && checked.elapsed() >= Duration::from_secs(1) {
+                checked = Instant::now();
+                if let Some(now_default) = default_output_name() {
+                    if using.as_deref() != Some(now_default.as_str()) {
+                        util::log(&format!("sound output switched to {}", now_default));
+                        switched = true;
+                        break;
+                    }
+                }
+            }
         }
         drop(stream);
         ok.store(false, Ordering::Relaxed);
         // Reconnect fast. A device that's just waking up is usually back in a
         // moment, and a waiting beep gets the quickest retry of all.
-        let wait = if pending.is_some() { Duration::from_millis(50) } else { backoff };
+        let wait = if switched || pending.is_some() { Duration::from_millis(50) } else { backoff };
         std::thread::sleep(wait);
-        backoff = (backoff * 2).min(Duration::from_millis(1500));
+        backoff = if switched { Duration::from_millis(100) } else { (backoff * 2).min(Duration::from_millis(1500)) };
     }
+}
+
+/// The output the system is set to use right now.
+fn default_output_name() -> Option<String> {
+    use cpal::traits::{DeviceTrait, HostTrait};
+    cpal::default_host().default_output_device().and_then(|d| d.name().ok())
 }
 
 /// Fills one buffer from the synth. A bug in the synth must never take the
@@ -238,12 +268,14 @@ fn render<T: Copy>(synth: &mut synth::Synth, data: &mut [T], channels: usize, si
     }
 }
 
-fn build_stream(rx: Receiver<AudioCmd>, failed: Arc<AtomicBool>) -> Result<cpal::Stream, String> {
+/// Opens the system's default output. Also returns its name, if it has one.
+fn build_stream(rx: Receiver<AudioCmd>, failed: Arc<AtomicBool>) -> Result<(cpal::Stream, Option<String>), String> {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
     let host = cpal::default_host();
     let device = host
         .default_output_device()
         .ok_or_else(|| "no audio output device".to_string())?;
+    let name = device.name().ok();
     let supported = device.default_output_config().map_err(|e| e.to_string())?;
     let format = supported.sample_format();
     let config: cpal::StreamConfig = supported.into();
@@ -253,7 +285,13 @@ fn build_stream(rx: Receiver<AudioCmd>, failed: Arc<AtomicBool>) -> Result<cpal:
     // The sound thread gets a high priority the first time it runs, so heavy
     // background work can never make the keypad stutter or beep late.
     let mut boosted = false;
-    util::log(&format!("audio output: {} Hz, {} channels, {:?}", config.sample_rate.0, channels, format));
+    util::log(&format!(
+        "audio output: {}, {} Hz, {} channels, {:?}",
+        name.as_deref().unwrap_or("unnamed device"),
+        config.sample_rate.0,
+        channels,
+        format
+    ));
     let flag = failed.clone();
     let on_error = move |e: cpal::StreamError| {
         util::log(&format!("audio stream error: {}", e));
@@ -324,5 +362,5 @@ fn build_stream(rx: Receiver<AudioCmd>, failed: Arc<AtomicBool>) -> Result<cpal:
     }
     .map_err(|e| e.to_string())?;
     stream.play().map_err(|e| e.to_string())?;
-    Ok(stream)
+    Ok((stream, name))
 }

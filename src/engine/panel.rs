@@ -326,6 +326,21 @@ pub struct Panel {
     pub vista_fault_idx: usize,
     pub vista_voice_level: u8,
     pub vista_alarm_mem_zone: Option<(u8, AlarmKind)>,
+    /// When the last key was pressed, for the 4 to 5 second entry timeout.
+    pub vista_prev_key: Instant,
+    /// A code entered during entry delay or an alarm disarms about 15
+    /// seconds later even without OFF: (when, user, code slot).
+    pub vista_code_disarm: Option<(Instant, u8, String)>,
+    /// Armed NIGHT-STAY ([Code] + STAY + STAY).
+    pub vista_night: bool,
+    /// When test mode started; it ends itself after four hours.
+    pub vista_test_since: Option<Instant>,
+    /// 6160V voice status and voice chime (# + 0 + 2 + 4 turns them on and off).
+    pub vista_voice_on: bool,
+    /// Deferred 6160V status announcement (evaluated LIVE right when spoken after
+    /// the 1.1 s panel answer + confirmation beep, so a closing door/motion zone
+    /// never causes a stale "not ready to arm" announcement).
+    pub vista_pending_status: Option<Instant>,
 }
 
 impl Panel {
@@ -410,6 +425,12 @@ impl Panel {
             vista_fault_idx: 0,
             vista_voice_level: save.voice_level.min(7),
             vista_alarm_mem_zone: None,
+            vista_prev_key: now,
+            vista_code_disarm: None,
+            vista_night: false,
+            vista_test_since: None,
+            vista_voice_on: true,
+            vista_pending_status: None,
         };
         // Like a real panel after a power cut, come back armed if it was armed.
         if let Some(a) = save.armed {
@@ -514,7 +535,9 @@ impl Panel {
     /// Quick confirmation beeps, about 80 ms on and 80 ms off like the real
     /// keypads ("beep beep beep" when a code or command is accepted).
     pub fn beeps(&mut self, n: u8) {
-        self.audio(AudioCmd::Beeps { count: n, on_ms: 80, off_ms: 80 });
+        // A real PowerSeries keypad: about 67 ms on and 50 ms off.
+        let (on_ms, off_ms) = if self.model == Model::Pc1832 { (67, 50) } else { (80, 80) };
+        self.audio(AudioCmd::Beeps { count: n, on_ms, off_ms });
     }
     /// A feature turning off. The PC1832 manual calls it "a steady 2-second
     /// tone"; the PC1550 gives "one long beep".
@@ -526,10 +549,18 @@ impl Panel {
         self.audio(AudioCmd::Beeps { count: 1, on_ms: ms, off_ms: 0 });
     }
     pub fn error_tone(&mut self) {
+        if self.model == Model::Vista20p {
+            // The user guide's "one short beep" (as when arming with a zone
+            // open): the 6160's low 1019 Hz single beep.
+            self.audio(AudioCmd::Tone { hz: 1019, on_ms: 340, off_ms: 60, delay_ms: 0 });
+            return;
+        }
         let ms = match self.model {
             Model::Pc1550 => 1500,
             Model::Pc1832 => 2000,
-            Model::Vista20p => 1000,
+            // The Vista has no long error tone. A refused command gets the
+            // user guide's "one short beep" (as for arming with a zone open).
+            Model::Vista20p => 150,
         };
         self.audio(AudioCmd::Beeps { count: 1, on_ms: ms, off_ms: 0 });
     }
@@ -653,7 +684,7 @@ impl Panel {
             }
             Model::Vista20p => {
                 let raw = if kind == ZoneKind::Delay2 {
-                    self.ee.entry_or(m, "36", 0, 45)
+                    self.ee.entry_or(m, "36", 0, 30)
                 } else {
                     self.ee.entry_or(m, "35", 0, 30)
                 };
@@ -698,7 +729,8 @@ impl Panel {
         match self.model {
             Model::Pc1550 => self.ee.entry_or(self.model, "15", 0, 3).min(99) as u8,
             Model::Pc1832 => self.ee.entry_or(self.model, "377", 0, 3).min(99) as u8,
-            Model::Vista20p => 2,
+            // *93: report pairs per zone in an armed period, 1 from the factory.
+            Model::Vista20p => self.ee.entry_or(self.model, "93", 0, 1).min(99) as u8,
         }
     }
 
@@ -706,7 +738,13 @@ impl Panel {
         match self.model {
             Model::Pc1550 => self.ee.entry_or(self.model, "15", 1, 0),
             Model::Pc1832 => self.ee.entry_or(self.model, "377", 3, 30),
-            Model::Vista20p => 15,
+            // *50 burglary dialer delay: 0 none, 1 15 s, 2 30 s (factory), 3 45 s.
+            Model::Vista20p => match self.ee.entry_or(self.model, "50", 0, 2) {
+                0 => 0,
+                1 => 15,
+                3 => 45,
+                _ => 30,
+            },
         }
     }
 
@@ -739,7 +777,7 @@ impl Panel {
         match self.model {
             Model::Pc1550 => self.quick_arm,
             Model::Pc1832 => self.ee.toggle(self.model, "015", 4),
-            Model::Vista20p => self.ee.entry_or(self.model, "21", 0, 1) != 0,
+            Model::Vista20p => self.ee.entry_or(self.model, "21", 0, 0) != 0,
         }
     }
 
@@ -806,7 +844,9 @@ impl Panel {
             if self.ee.toggle(self.model, "381", 4) {
                 self.beeps(8);
             } else {
-                self.beeps(3);
+                // Six quick beeps when a code arms it, as recorded on a real
+                // PowerSeries keypad (and as the PC1550 manual says too).
+                self.beeps(6);
             }
         }
         let user_squawk = self.model == Model::Pc1832
@@ -888,7 +928,8 @@ impl Panel {
         let exit_fault = match self.model {
             Model::Pc1550 => self.ee.toggle(self.model, "34", 3),
             Model::Pc1832 => self.ee.toggle(self.model, "013", 6),
-            Model::Vista20p => self.ee.entry_or(self.model, "59", 0, 1) != 0,
+            // Always active on the VISTA-20P; field *59 is only its report code.
+            Model::Vista20p => true,
         };
         if self.model == Model::Vista20p && self.squawk_on() {
             self.squawk(1);
@@ -1351,7 +1392,10 @@ impl Panel {
     }
 
     pub fn bad_code(&mut self, now: Instant) {
-        self.error_tone();
+        // On the Vista a wrong code just does nothing (its key beeps only).
+        if self.model != Model::Vista20p {
+            self.error_tone();
+        }
         self.bad_codes = self.bad_codes.saturating_add(1);
         let (count, minutes) = self.lockout_params();
         if count > 0 && self.bad_codes as u32 >= count {
@@ -1975,13 +2019,16 @@ impl Panel {
                 if !opened {
                     return;
                 }
-                // 6160V Chime: 3 rapid beeps + voice announcing the zone!
+                // "Three tones sound at the keypad whenever a perimeter door or
+                // window is opened", and voice chime (if on) says which one.
                 self.beeps(3);
-                let words = voice::filter_zone_words(&self.label(z));
-                if words.is_empty() {
-                    self.vista_speak(vec!["fault".into()]);
-                } else {
-                    self.vista_speak(words);
+                if self.vista_voice_on {
+                    let words = voice::filter_zone_words(&self.label(z));
+                    if words.is_empty() {
+                        self.vista_speak(vec!["fault".into()]);
+                    } else {
+                        self.vista_speak(words);
+                    }
                 }
             }
         }
@@ -1995,7 +2042,15 @@ impl Panel {
         let zr = self.zones[z - 1];
         if self.walk_test && self.armed.is_none() && self.exit.is_none() {
             self.log(EvKind::Info, format!("Walk test: zone {} ({})", z, self.label(z)));
-            self.walk_burst_until = Some(now + Duration::from_secs(2));
+            if self.model == Model::Vista20p {
+                // "Open each protected door and window in turn and listen for
+                // three beeps from the keypad", with the zone on the display.
+                self.beeps(3);
+                let lbl = self.label(z).to_ascii_uppercase();
+                self.vista_test_fault(z as u8, &lbl);
+            } else {
+                self.walk_burst_until = Some(now + Duration::from_secs(2));
+            }
             return;
         }
         if c.kind == ZoneKind::NonAlarm {
@@ -2025,11 +2080,15 @@ impl Panel {
         }
         if let Some(ex) = self.exit.as_mut() {
             if c.kind.is_delay() {
-                if self.model == Model::Pc1832
-                    && ex.delay_closed
-                    && !ex.restarted
-                    && self.ee.toggle(self.model, "018", 7)
-                {
+                let restart_on = match self.model {
+                    Model::Pc1832 => self.ee.toggle(self.model, "018", 7),
+                    // *91 option 8, on from the factory: "reopening and closing the
+                    // entry/exit door before exit delay time expires will reset the
+                    // exit delay time once."
+                    Model::Vista20p => (self.ee.entry_or(self.model, "91", 0, 8) & 8) != 0,
+                    Model::Pc1550 => false,
+                };
+                if restart_on && ex.delay_closed && !ex.restarted {
                     let secs = self.exit_secs();
                     if let Some(ex2) = self.exit.as_mut() {
                         ex2.started = now;
@@ -2170,12 +2229,30 @@ impl Panel {
         if self.model == Model::Vista20p {
             // Vista Function Key D (mapped to Key::Away): check field *57 entry 3
             if key == Key::Away {
-                let code = self.ee.entry_or(Model::Vista20p, "57", 3, 3);
+                // *57 function codes. Single button arming needs no code.
+                let code = self.ee.entry_or(Model::Vista20p, "57", 3, 0);
                 match code {
-                    3 => self.fn_arm(ArmHow::AwayKey, now),
-                    4 => self.fn_arm(ArmHow::StayKey, now),
+                    3 => self.vista_arm_key(2, now),
+                    4 => self.vista_arm_key(3, now),
+                    5 => {
+                        self.vista_arm_key(3, now);
+                        if self.exit.is_some() || self.armed.is_some() {
+                            self.vista_set_night();
+                        }
+                    }
+                    6 => {
+                        // Step arming: STAY, then NIGHT-STAY, then AWAY.
+                        if self.armed.is_none() && self.exit.is_none() {
+                            self.vista_arm_key(3, now);
+                        } else if !self.vista_night {
+                            self.vista_set_night();
+                        } else {
+                            self.vista_step_to_away();
+                        }
+                    }
+                    8 => self.vista_comm_test(),
                     2 => self.vista_speak_status(),
-                    _ => self.vista_speak_status(),
+                    _ => self.vista_page(),
                 }
                 return;
             }
@@ -2297,7 +2374,8 @@ impl Panel {
             Key::Aux => {
                 if m == Model::Vista20p {
                     self.beeps(2);
-                    self.trigger(AlarmKind::Medical, 96, false, false, now);
+                    // VISTA-20P Zone 96 (Type 08 Auxiliary): keypad alarm, external bell silent.
+                    self.trigger(AlarmKind::Medical, 96, false, true, now);
                     return;
                 }
                 if m == Model::Pc1832 && !self.ee.toggle(m, "kp074", 2) {
@@ -2541,10 +2619,14 @@ impl Panel {
         // two-tone hi-lo "dee-doo dee-doo" (~1960 Hz <-> ~1040 Hz, ~420 ms per tone),
         // muted for 10s if any key is pressed while external bell keeps ringing.
         if self.model == Model::Vista20p {
+            // "LOUD, CONTINUOUS" in the user guide means it never pauses. A
+            // recording of a real 6160 shows the sound itself: 1360 Hz and
+            // 1019 Hz taking turns every 505 ms with no gap. Entering a code
+            // quiets the keypad.
             let muted = self.vista_sounder_mute_until.map_or(false, |t| now < t);
-            let burg = self.live_alarms(now).any(|a| a.audible && !a.kind.pulsed());
-            if burg && !muted {
-                return Pattern::HiLo { hi_hz: 1960, lo_hz: 1040, step_ms: 420 };
+            let burg = self.live_alarms(now).any(|a| (a.audible || a.buzzer) && !a.kind.pulsed());
+            if burg {
+                return if muted { Pattern::Off } else { Pattern::HiLo { hi_hz: 1360, lo_hz: 1019, step_ms: 505 } };
             }
         }
         if buzzer_alarm {
@@ -2559,19 +2641,28 @@ impl Panel {
         if let Some(e) = &self.entry {
             let left = (e.started + e.dur).saturating_duration_since(now).as_secs_f32();
             if self.model == Model::Vista20p {
-                // Vista Entry Delay: 1 Hz slow beeps (NOT continuous!), ramping
-                // to rapid ~4.5 Hz beeps in the final 10 seconds.
-                if left <= 10.0 {
-                    return Pattern::Beeps { on_ms: 100, off_ms: 120, count: 1, period_ms: 220 };
+                // Slow beeping, then rapid beeping for the last ten seconds, as
+                // a video of a real 6160 shows (the user guide only lists the
+                // slow part). Coming home after an alarm beeps rapidly all the
+                // way. The beeps stop once a code is in.
+                if self.vista_sounder_mute_until.map_or(false, |t| now < t) {
+                    return Pattern::Off;
                 }
-                return Pattern::Beeps { on_ms: 200, off_ms: 800, count: 1, period_ms: 1000 };
+                if self.memory_flag || left <= 10.0 {
+                    // Measured: 90 ms on, 70 ms off.
+                    return Pattern::Beeps { on_ms: 90, off_ms: 70, count: 1, period_ms: 160 };
+                }
+                // The same slow beeping as the exit warning: 500 ms on, 510 off.
+                return Pattern::Beeps { on_ms: 500, off_ms: 0, count: 1, period_ms: 1010 };
             }
             let urgency = match self.model {
                 Model::Pc1550 => self.ee.toggle(self.model, "34", 4),
                 Model::Pc1832 | Model::Vista20p => true,
             };
             if urgency && left <= 10.0 {
-                return Pattern::Beeps { on_ms: 250, off_ms: 250, count: 1, period_ms: 500 };
+                // Both PC1550 (v4.1 [34] light 4) and PC1832 emit the pulsing
+                // double-beep tone during the last 10 seconds: beep, beep, beeeep.
+                return Pattern::ShortShortLong { short_ms: 94, gap_ms: 26, long_ms: 731 };
             }
             return Pattern::Steady;
         }
@@ -2581,9 +2672,9 @@ impl Panel {
                 Model::Pc1550 => {
                     if self.ee.toggle(self.model, "34", 1) {
                         return if left <= 10.0 {
-                            Pattern::Beeps { on_ms: 150, off_ms: 150, count: 1, period_ms: 300 }
+                            Pattern::Beeps { on_ms: 70, off_ms: 50, count: 3, period_ms: 996 }
                         } else {
-                            Pattern::Beeps { on_ms: 300, off_ms: 700, count: 1, period_ms: 1000 }
+                            Pattern::Beeps { on_ms: 70, off_ms: 0, count: 1, period_ms: 996 }
                         };
                     }
                 }
@@ -2593,10 +2684,13 @@ impl Panel {
                     // the last ten. Off is "Silent Exit Delay". Stay key arming
                     // stays silent unless [022] option 8 is on.
                     if !ex.silent && self.ee.toggle(self.model, "014", 6) {
+                        // As recorded on a real PowerSeries keypad: one 70 ms beep
+                        // every 996 ms, and for the last ten seconds a burst of
+                        // three quick beeps each second ("3 times a second").
                         if left <= 10.0 {
-                            return Pattern::Beeps { on_ms: 90, off_ms: 0, count: 1, period_ms: 333 };
+                            return Pattern::Beeps { on_ms: 70, off_ms: 50, count: 3, period_ms: 996 };
                         }
-                        return Pattern::Beeps { on_ms: 100, off_ms: 0, count: 1, period_ms: 1000 };
+                        return Pattern::Beeps { on_ms: 70, off_ms: 0, count: 1, period_ms: 996 };
                     }
                 }
                 Model::Vista20p => {
@@ -2604,9 +2698,11 @@ impl Panel {
                     // ramping to ~4 Hz urgency (100ms ON / 150ms OFF) in final 10s.
                     if !ex.silent && self.ee.entry_or(self.model, "37", 0, 1) != 0 {
                         if left <= 10.0 {
-                            return Pattern::Beeps { on_ms: 100, off_ms: 150, count: 1, period_ms: 250 };
+                            // The same rapid beeping as the end of the entry delay.
+                            return Pattern::Beeps { on_ms: 90, off_ms: 70, count: 1, period_ms: 160 };
                         }
-                        return Pattern::Beeps { on_ms: 150, off_ms: 850, count: 1, period_ms: 1000 };
+                        // Measured from a real 6160: 500 ms on, 510 ms off.
+                        return Pattern::Beeps { on_ms: 500, off_ms: 0, count: 1, period_ms: 1010 };
                     }
                 }
             }
@@ -2614,9 +2710,21 @@ impl Panel {
         if self.auto_pre.is_some() {
             return Pattern::Steady;
         }
+        if self.model == Model::Vista20p && self.walk_test {
+            // Test mode: "ONE SHORT BEEP about every 30 seconds", then a double
+            // beep every 30 seconds for the last five minutes before it ends
+            // itself at four hours.
+            let late = self.vista_test_since.map_or(false, |t| now.saturating_duration_since(t).as_secs() >= 4 * 3600 - 300);
+            return Pattern::Beeps { on_ms: 100, off_ms: 120, count: if late { 2 } else { 1 }, period_ms: 30_000 };
+        }
         let unacked = self.troubles & !self.trouble_ack;
         let silent_troubles = self.model == Model::Pc1832 && self.ee.toggle(self.model, "023", 7);
         if unacked != 0 && !silent_troubles && self.armed.is_none() && !self.is_programming() {
+            if self.model == Model::Vista20p {
+                // "RAPID BEEPING: trouble (CHECK), system low battery, bell
+                // failure." Any key silences it; the display stays.
+                return Pattern::Beeps { on_ms: 90, off_ms: 70, count: 1, period_ms: 160 };
+            }
             return Pattern::Beeps { on_ms: 100, off_ms: 120, count: 2, period_ms: 10_000 };
         }
         Pattern::Off
