@@ -53,10 +53,17 @@ fn plain(a: &str, b: &str) -> LcdOut {
 }
 
 impl Panel {
-    /// Speaks a sequence of 6160V voice ROM tokens.
+    /// Speaks a sequence of 6160V voice ROM tokens unconditionally (alarms, volume test).
     pub fn vista_speak(&mut self, tokens: Vec<String>) {
         if self.model == Model::Vista20p && !tokens.is_empty() {
             self.audio(AudioCmd::Speak(tokens));
+        }
+    }
+
+    /// Speaks a status/chime/arming phrase only when 6160V voice status is ON (#+0+2+4).
+    pub fn vista_speak_if_on(&mut self, tokens: Vec<String>) {
+        if self.vista_voice_on {
+            self.vista_speak(tokens);
         }
     }
 
@@ -119,10 +126,20 @@ impl Panel {
                 (ArmMode::Stay, true) => toks.push("instant".into()),
                 (ArmMode::Stay, false) => toks.push("stay".into()),
             }
-        } else if self.exit.is_some() {
+        } else if let Some(ex) = &self.exit {
             toks.push("armed".into());
-            toks.push("away".into());
-            toks.push("exit_now".into());
+            match ex.how {
+                ArmHow::MaxKey => {
+                    toks.push("maximum".into());
+                    toks.push("exit_now".into());
+                }
+                ArmHow::StayKey => toks.push("stay".into()),
+                ArmHow::NoEntry => toks.push("instant".into()),
+                _ => {
+                    toks.push("away".into());
+                    toks.push("exit_now".into());
+                }
+            }
         } else {
             toks.push("disarmed".into());
             if self.ready() {
@@ -149,6 +166,9 @@ impl Panel {
     }
 
     pub(crate) fn press_vista(&mut self, key: Key, now: Instant) {
+        // Cancel any pending post-OFF status announcement so it never speaks
+        // stale words on top of new keypresses or commands.
+        self.vista_pending_status = None;
         // "When entering codes and commands, sequential key depressions must be
         // made within 4-5 seconds of one another. If 4-5 seconds elapse without a
         // key depression, the entry will be aborted."
@@ -165,6 +185,15 @@ impl Panel {
         }
         // "To silence the beeping for these conditions, press any key."
         self.ack_troubles();
+        // VISTA-20P Installation Manual p.70: "Pressing any key will silence the
+        // keypad sounder for 10 seconds. Disarming the system will silence both
+        // keypad and external sounders."
+        if self.alarms.iter().any(|a| !a.silenced && !a.kind.pulsed() && (a.audible || a.buzzer)) {
+            let ten_s = now + Duration::from_secs(10);
+            if self.vista_sounder_mute_until.map_or(true, |t| t < ten_s) {
+                self.vista_sounder_mute_until = Some(ten_s);
+            }
+        }
 
         let mode = std::mem::replace(&mut self.vista_mode, VistaKp::Normal);
         let next = match mode {
@@ -284,7 +313,7 @@ impl Panel {
                     } else {
                         toks.extend(w);
                     }
-                    self.vista_speak(toks);
+                    self.vista_speak_if_on(toks);
                 } else if self.armed.map_or(false, |a| a.mode == ArmMode::Stay)
                     && (self.ee.entry_or(Model::Vista20p, "91", 0, 8) & 8) != 0
                 {
@@ -419,7 +448,7 @@ impl Panel {
                 self.log(EvKind::Program, if self.chime { "Door chime on" } else { "Door chime off" });
                 self.out.push(Out::Save);
                 if self.chime {
-                    self.vista_speak(vec!["chime".into()]);
+                    self.vista_speak_if_on(vec!["chime".into()]);
                 }
                 VistaKp::Normal
             }
@@ -434,7 +463,8 @@ impl Panel {
         let how = match digit {
             2 => ArmHow::AwayKey,
             3 => ArmHow::StayKey,
-            4 | 7 => ArmHow::NoEntry,
+            4 => ArmHow::MaxKey,
+            7 => ArmHow::NoEntry,
             _ => return VistaKp::Normal,
         };
         if self.armed.is_some() || self.exit.is_some() {
@@ -449,7 +479,7 @@ impl Panel {
                 let (l1, l2) = split_zone_lines("FAULT", z, &lbl);
                 self.temp(&l1, &l2, 4000);
             }
-            self.vista_speak(vec!["not_ready_to_arm".into()]);
+            self.vista_speak_if_on(vec!["not_ready_to_arm".into()]);
             return VistaKp::Normal;
         }
         self.vista_armed_by_inst = by_inst;
@@ -461,19 +491,11 @@ impl Panel {
         let exit_warning = self.ee.entry_or(Model::Vista20p, "37", 0, 1) != 0;
         match digit {
             4 => {
-                // MAXIMUM arms Away (all zones) with no entry delay.
-                if let Some(a) = self.armed.as_mut() {
-                    a.mode = ArmMode::Away;
-                    a.no_entry = true;
-                }
-                if let Some(ex) = self.exit.as_mut() {
-                    ex.how = ArmHow::AwayKey;
-                    ex.silent = false;
-                }
+                // MAXIMUM arms Away (all zones) with NO entry delay.
                 if !exit_warning {
                     self.beeps(2);
                 }
-                self.vista_speak(vec!["armed".into(), "maximum".into(), "exit_now".into()]);
+                self.vista_speak_if_on(vec!["armed".into(), "maximum".into(), "exit_now".into()]);
                 self.vista_exit_voice_done = true;
                 VistaKp::Normal
             }
@@ -487,7 +509,7 @@ impl Panel {
             3 => {
                 // STAY, NIGHT-STAY and INSTANT: three beeps.
                 self.beeps(3);
-                self.vista_speak(vec!["armed".into(), "stay".into()]);
+                self.vista_speak_if_on(vec!["armed".into(), "stay".into()]);
                 if quick {
                     VistaKp::Normal
                 } else {
@@ -496,7 +518,7 @@ impl Panel {
             }
             _ => {
                 self.beeps(3);
-                self.vista_speak(vec!["armed".into(), "instant".into()]);
+                self.vista_speak_if_on(vec!["armed".into(), "instant".into()]);
                 VistaKp::Normal
             }
         }
@@ -522,7 +544,7 @@ impl Panel {
                     self.error_tone();
                 } else {
                     self.vista_show_bypassed(&list, now);
-                    self.vista_speak(vec!["bypassed".into()]);
+                    self.vista_speak_if_on(vec!["bypassed".into()]);
                     self.log(EvKind::Info, format!("Quick bypassed {} open zone(s)", list.len()));
                 }
                 VistaKp::Normal
@@ -542,7 +564,7 @@ impl Panel {
                     self.vista_show_bypassed(&[z as u8], now);
                     if !was {
                         self.log(EvKind::Info, format!("Zone {:02} bypassed", z));
-                        self.vista_speak(vec!["bypassed".into()]);
+                        self.vista_speak_if_on(vec!["bypassed".into()]);
                     }
                 } else {
                     self.error_tone();
@@ -660,6 +682,7 @@ impl Panel {
                     self.vista_speak(vec!["chime".into()]);
                 }
                 self.log(EvKind::Program, if self.vista_voice_on { "Voice status on" } else { "Voice status off" });
+                self.out.push(Out::Save);
                 VistaKp::Normal
             }
             Key::Hash | Key::Star => {
@@ -697,6 +720,12 @@ impl Panel {
                 self.key_beep();
                 let ch = char::from(b'0' + d);
                 if field.is_none() {
+                    // Require leading '*' or '#' before typing a field number so
+                    // stray digits at the "20" prompt don't corrupt the prefix.
+                    if buf.is_empty() || !matches!(buf.as_bytes()[0], b'*' | b'#') {
+                        self.error_tone();
+                        return VistaKp::Program { field: None, buf: String::new(), review: false };
+                    }
                     buf.push(ch);
                     let prefix = buf.chars().next().unwrap_or('*');
                     let digits = &buf[1..];
@@ -840,7 +869,7 @@ impl Panel {
                 && now.saturating_duration_since(ex.started).as_millis() >= 2500
             {
                 self.vista_exit_voice_done = true;
-                self.vista_speak(vec!["armed".into(), "away".into(), "exit_now".into()]);
+                self.vista_speak_if_on(vec!["armed".into(), "away".into(), "exit_now".into()]);
             }
         }
         // During active burglary alarm, periodically (~14s) speak "Alarm [zone]"
@@ -959,6 +988,7 @@ impl Panel {
             let head = match ex.how {
                 ArmHow::StayKey if self.vista_night => "ARMED NIGHT-STAY",
                 ArmHow::StayKey => "ARMED ***STAY***",
+                ArmHow::MaxKey => "ARMED *MAXIMUM*",
                 ArmHow::NoEntry => "ARMED *INSTANT*",
                 _ => "ARMED ***AWAY***",
             };
@@ -1056,7 +1086,7 @@ impl Panel {
 
     /// [Code] + OFF: disarms and silences; a second one clears the memory of
     /// alarm display. With nothing to disarm it removes any bypasses.
-    fn vista_off(&mut self, slot: &str, user: u8, now: Instant) {
+    pub(crate) fn vista_off(&mut self, slot: &str, user: u8, now: Instant) {
         self.vista_code_disarm = None;
         self.vista_sounder_mute_until = None;
         // The installer code can only disarm if it was used to arm.
@@ -1131,7 +1161,7 @@ impl Panel {
         self.vista_unbypass_night_zones();
         self.log(EvKind::Arm, "Armed NIGHT-STAY");
         self.out.push(Out::Save);
-        self.vista_speak(vec!["armed".into(), "stay".into()]);
+        self.vista_speak_if_on(vec!["armed".into(), "stay".into()]);
     }
 
     fn vista_night_zone(&self, z: usize) -> bool {
@@ -1201,7 +1231,7 @@ impl Panel {
         self.beeps(2);
         self.log(EvKind::Arm, "Armed AWAY (step arming)");
         self.out.push(Out::Save);
-        self.vista_speak(vec!["armed".into(), "away".into()]);
+        self.vista_speak_if_on(vec!["armed".into(), "away".into()]);
     }
 
     /// Function code 08: communication test (Contact ID 601).

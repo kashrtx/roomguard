@@ -405,30 +405,97 @@ fn direction(a: usize, b: usize) -> usize {
     ((dy + 1) * 3 + (dx + 1)) as usize
 }
 
-/// Watches the doorway like a door contact. It remembers what the doorway
-/// looks like when the door is shut (as an edge pattern, so lighting changes
-/// don't fool it), and reports the door open when that pattern changes and
-/// stays changed after the movement stops.
+/// Saved snapshot of the completely empty room (door closed, nobody in view).
+/// Stores per-pixel mean brightness and per-pixel natural noise floor so Motion
+/// ignores static jitter (bedding, monitor flicker) and DoorWatch can extract
+/// an exact closed-door template even if the doorway box is drawn later.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RoomBaseline {
+    pub w: usize,
+    pub h: usize,
+    pub mean: Vec<u8>,
+    pub std: Vec<u8>,
+}
+
+impl RoomBaseline {
+    pub fn valid(&self) -> bool {
+        self.w >= 16 && self.h >= 16 && self.mean.len() == self.w * self.h && self.std.len() == self.w * self.h
+    }
+}
+
+/// Watches the doorway like a magnetic door contact. Compares both signed
+/// gradient structure (edge NCC) and local intensity pattern (luma NCC) against
+/// the calibrated closed-door reference, so lighting/shadow shifts on a plain
+/// white door never cause false "Open" states while real door openings trip
+/// quickly and cleanly.
 pub struct DoorWatch {
-    reference: Option<Vec<f32>>,
+    ref_gx: Option<Vec<f32>>,
+    ref_gy: Option<Vec<f32>>,
+    ref_luma: Option<Vec<f32>>,
+    ref_raw: Option<Vec<f32>>,
     ref_rect: Option<NRect>,
     still_since: Option<Instant>,
     flip_since: Option<Instant>,
     pub open: bool,
     pub score: f32,
     pub learned: bool,
+    /// True when the reference came from an explicit empty-room calibration.
+    pub calibrated: bool,
 }
 
 impl DoorWatch {
     pub fn new() -> Self {
-        DoorWatch { reference: None, ref_rect: None, still_since: None, flip_since: None, open: false, score: 1.0, learned: false }
+        DoorWatch {
+            ref_gx: None,
+            ref_gy: None,
+            ref_luma: None,
+            ref_raw: None,
+            ref_rect: None,
+            still_since: None,
+            flip_since: None,
+            open: false,
+            score: 1.0,
+            learned: false,
+            calibrated: false,
+        }
     }
 
     pub fn relearn(&mut self) {
-        self.reference = None;
+        self.ref_gx = None;
+        self.ref_gy = None;
+        self.ref_luma = None;
+        self.ref_raw = None;
         self.open = false;
+        self.score = 1.0;
         self.learned = false;
+        self.calibrated = false;
+        self.still_since = None;
         self.flip_since = None;
+    }
+
+    /// Immediately locks the closed-door reference from a calibrated empty-room
+    /// baseline image, so the door is known-closed with zero waiting and zero
+    /// chance of learning an open door or a person.
+    pub fn set_from_baseline(&mut self, base: &RoomBaseline, rect: NRect) -> bool {
+        if !base.valid() {
+            return false;
+        }
+        if let Some((gx, gy, luma, raw)) = door_features(&base.mean, base.w, base.h, rect) {
+            self.ref_gx = Some(gx);
+            self.ref_gy = Some(gy);
+            self.ref_luma = Some(luma);
+            self.ref_raw = Some(raw);
+            self.ref_rect = Some(rect);
+            self.open = false;
+            self.score = 1.0;
+            self.learned = true;
+            self.calibrated = true;
+            self.still_since = None;
+            self.flip_since = None;
+            return true;
+        }
+        false
     }
 
     /// Returns `Some(open)` when the door state changes.
@@ -443,22 +510,37 @@ impl DoorWatch {
             return None;
         }
         let still = *self.still_since.get_or_insert(now);
-        let patch = signature(gray, w, h, rect)?;
-        if self.reference.is_none() {
+        let (gx, gy, luma, raw) = door_features(gray, w, h, rect)?;
+        if self.ref_gx.is_none() {
             if now.saturating_duration_since(still).as_secs_f32() > 4.0 {
-                self.reference = Some(patch);
+                self.ref_gx = Some(gx);
+                self.ref_gy = Some(gy);
+                self.ref_luma = Some(luma);
+                self.ref_raw = Some(raw);
                 self.learned = true;
                 self.open = false;
+                self.score = 1.0;
             }
             return None;
         }
-        let score = self.reference.as_ref().map(|r| ncc(r, &patch)).unwrap_or(1.0);
+        let s_gx = self.ref_gx.as_ref().map(|r| ncc(r, &gx)).unwrap_or(1.0);
+        let s_gy = self.ref_gy.as_ref().map(|r| ncc(r, &gy)).unwrap_or(1.0);
+        let s_luma = self.ref_luma.as_ref().map(|r| ncc(r, &luma)).unwrap_or(1.0);
+        let edge_ncc = 0.5 * (s_gx + s_gy);
+        // Combine lighting-invariant signed edges (65%) with local luma structure (35%).
+        let score = 0.65 * edge_ncc + 0.35 * s_luma;
         self.score = score;
-        let flip = if self.open { score > 0.75 } else { score < 0.55 };
+
+        // Also compute mean-adjusted pixel MAD so tiny camera noise on a plain
+        // white door can never trip "open" unless the doorway actually changed.
+        let mad = self.ref_raw.as_ref().map(|r| mean_adjusted_mad(r, &raw)).unwrap_or(20.0);
+
+        // Open requires BOTH low structural similarity AND real pixel change.
+        let flip = if self.open { score > 0.64 || mad < 7.0 } else { score < 0.48 && mad > 9.0 };
         let mut changed = None;
         if flip {
             let since = *self.flip_since.get_or_insert(now);
-            if now.saturating_duration_since(since).as_secs_f32() > 1.2 {
+            if now.saturating_duration_since(since).as_secs_f32() > 0.65 {
                 self.open = !self.open;
                 self.flip_since = None;
                 changed = Some(self.open);
@@ -466,10 +548,27 @@ impl DoorWatch {
         } else {
             self.flip_since = None;
         }
-        if !self.open && score > 0.85 {
-            if let Some(r) = self.reference.as_mut() {
-                for (a, b) in r.iter_mut().zip(patch.iter()) {
-                    *a = *a * 0.98 + *b * 0.02;
+        // Only gently adapt the reference while confidently closed (>0.88) so
+        // slow daylight drift never degrades accuracy.
+        if !self.open && score > 0.88 {
+            let alpha = if self.calibrated { 0.004 } else { 0.015 };
+            if let (Some(rgx), Some(rgy), Some(rl), Some(rr)) = (
+                self.ref_gx.as_mut(),
+                self.ref_gy.as_mut(),
+                self.ref_luma.as_mut(),
+                self.ref_raw.as_mut(),
+            ) {
+                for (a, b) in rgx.iter_mut().zip(gx.iter()) {
+                    *a = *a * (1.0 - alpha) + *b * alpha;
+                }
+                for (a, b) in rgy.iter_mut().zip(gy.iter()) {
+                    *a = *a * (1.0 - alpha) + *b * alpha;
+                }
+                for (a, b) in rl.iter_mut().zip(luma.iter()) {
+                    *a = *a * (1.0 - alpha) + *b * alpha;
+                }
+                for (a, b) in rr.iter_mut().zip(raw.iter()) {
+                    *a = *a * (1.0 - alpha) + *b * alpha;
                 }
             }
         }
@@ -477,33 +576,62 @@ impl DoorWatch {
     }
 }
 
-fn signature(gray: &[u8], w: usize, h: usize, rect: NRect) -> Option<Vec<f32>> {
-    const SW: usize = 24;
-    const SH: usize = 32;
+fn mean_adjusted_mad(a: &[f32], b: &[f32]) -> f32 {
+    let n = a.len().min(b.len());
+    if n == 0 {
+        return 0.0;
+    }
+    let ma = a[..n].iter().sum::<f32>() / n as f32;
+    let mb = b[..n].iter().sum::<f32>() / n as f32;
+    let shift = mb - ma;
+    let mut sum = 0.0f32;
+    for i in 0..n {
+        sum += ((b[i] - shift) - a[i]).abs();
+    }
+    sum / n as f32
+}
+
+fn door_features(gray: &[u8], w: usize, h: usize, rect: NRect) -> Option<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> {
+    const SW: usize = 32;
+    const SH: usize = 40;
     let px = rect.x * w as f32;
     let py = rect.y * h as f32;
     let pw = (rect.w * w as f32).max(4.0);
     let ph = (rect.h * h as f32).max(4.0);
     let patch = frame::crop_resize(gray, w, h, px, py, pw, ph, SW, SH);
-    let mut g = Vec::with_capacity((SW - 2) * (SH - 2));
+    let cap = (SW - 2) * (SH - 2);
+    let mut gx_v = Vec::with_capacity(cap);
+    let mut gy_v = Vec::with_capacity(cap);
+    let mut luma_v = Vec::with_capacity(cap);
+    let mut raw_v = Vec::with_capacity(cap);
     for y in 1..SH - 1 {
         for x in 1..SW - 1 {
             let gx = patch[y * SW + x + 1] as f32 - patch[y * SW + x - 1] as f32;
             let gy = patch[(y + 1) * SW + x] as f32 - patch[(y - 1) * SW + x] as f32;
-            g.push(gx.abs() + gy.abs());
+            let px_v = patch[y * SW + x] as f32;
+            gx_v.push(gx);
+            gy_v.push(gy);
+            luma_v.push(px_v);
+            raw_v.push(px_v);
         }
     }
-    let n = g.len() as f32;
-    let mean = g.iter().sum::<f32>() / n;
-    let var = g.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / n;
-    let std = var.sqrt();
-    if std < 1.0 {
+    let norm = |v: &mut Vec<f32>| -> bool {
+        let n = v.len() as f32;
+        let mean = v.iter().sum::<f32>() / n;
+        let var = v.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / n;
+        let std = var.sqrt();
+        if std < 0.8 {
+            return false;
+        }
+        for x in v.iter_mut() {
+            *x = (*x - mean) / std;
+        }
+        true
+    };
+    if !norm(&mut gx_v) || !norm(&mut gy_v) || !norm(&mut luma_v) {
         return None;
     }
-    for v in g.iter_mut() {
-        *v = (*v - mean) / std;
-    }
-    Some(g)
+    Some((gx_v, gy_v, luma_v, raw_v))
 }
 
 fn ncc(a: &[f32], b: &[f32]) -> f32 {

@@ -26,6 +26,8 @@ pub struct Motion {
     pub w: usize,
     pub h: usize,
     bg: Vec<f32>,
+    /// Per-pixel natural noise floor from empty-room calibration (0.0 when uncalibrated).
+    bg_std: Vec<f32>,
     blur: Vec<u8>,
     raw: Vec<u8>,
     pub mask: Vec<u8>,
@@ -42,6 +44,7 @@ impl Motion {
             w: 0,
             h: 0,
             bg: Vec::new(),
+            bg_std: Vec::new(),
             blur: Vec::new(),
             raw: Vec::new(),
             mask: Vec::new(),
@@ -55,6 +58,26 @@ impl Motion {
 
     pub fn reset(&mut self) {
         self.ready = false;
+    }
+
+    /// Seeds the background model and per-pixel noise floor from a calibrated
+    /// empty-room snapshot, eliminating ghost blobs from furniture/bedding/monitors.
+    pub fn apply_baseline(&mut self, mean: &[u8], std: &[u8], w: usize, h: usize) {
+        let n = w * h;
+        if n == 0 || mean.len() < n || std.len() < n {
+            return;
+        }
+        self.w = w;
+        self.h = h;
+        self.blur = vec![0; n];
+        self.raw = vec![0; n];
+        self.mask = vec![0; n];
+        self.bg = mean[..n].iter().map(|&v| v as f32).collect();
+        self.bg_std = std[..n].iter().map(|&v| v as f32).collect();
+        self.ignore = vec![0; n];
+        self.ignore_key = vec![NRect::new(-1.0, -1.0, 0.0, 0.0)];
+        self.ready = true;
+        self.settle = 0;
     }
 
     /// Skip and relearn for a few frames, used while a PTZ camera turns.
@@ -75,6 +98,7 @@ impl Motion {
             self.mask = vec![0; n];
             box_blur(gray, w, h, &mut self.blur);
             self.bg = self.blur.iter().map(|&v| v as f32).collect();
+            self.bg_std = vec![0.0; n];
             self.ignore = vec![0; n];
             self.ignore_key = vec![NRect::new(-1.0, -1.0, 0.0, 0.0)];
             self.ready = true;
@@ -129,7 +153,8 @@ impl Motion {
         let mut count = 0usize;
         for i in 0..n {
             let d = ((self.blur[i] as f32 - self.bg[i]) - illum_shift).abs();
-            let on = d > thr && self.ignore[i] == 0;
+            let pthr = thr + 2.5 * self.bg_std.get(i).copied().unwrap_or(0.0);
+            let on = d > pthr && self.ignore[i] == 0;
             self.raw[i] = on as u8;
             if on {
                 count += 1;

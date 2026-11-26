@@ -113,20 +113,30 @@ pub struct VoicePlayer {
     gap_samples: u32,
     /// 0 = muted, 1..=7 = volume steps (default 5).
     level: u8,
+    /// Short 4 ms ramp to zero when speech is interrupted so there is never a click/pop.
+    last_out: f32,
+    fade_left: u32,
+    fade_len: u32,
+    fade_start: f32,
 }
 
 impl VoicePlayer {
     pub fn new(sr: f32) -> VoicePlayer {
         // Touch the ROM once so the map is ready before real-time audio.
         let _ = bank();
+        let sr = sr.max(8000.0);
         VoicePlayer {
-            sr: sr.max(8000.0),
+            sr,
             queue: VecDeque::new(),
             cur: None,
             pos: 0.0,
             gap_left: 0,
-            gap_samples: (sr.max(8000.0) * 0.130) as u32,
+            gap_samples: (sr * 0.075) as u32,
             level: 5,
+            last_out: 0.0,
+            fade_left: 0,
+            fade_len: (sr * 0.004) as u32 + 1,
+            fade_start: 0.0,
         }
     }
 
@@ -134,7 +144,15 @@ impl VoicePlayer {
         self.level = level.min(7);
     }
 
+    fn begin_fade(&mut self) {
+        if self.last_out.abs() > 1e-4 {
+            self.fade_start = self.last_out;
+            self.fade_left = self.fade_len;
+        }
+    }
+
     pub fn speak(&mut self, tokens: Vec<String>) {
+        self.begin_fade();
         self.queue.clear();
         self.cur = None;
         self.pos = 0.0;
@@ -152,6 +170,7 @@ impl VoicePlayer {
     }
 
     pub fn stop(&mut self) {
+        self.begin_fade();
         self.queue.clear();
         self.cur = None;
         self.pos = 0.0;
@@ -162,13 +181,26 @@ impl VoicePlayer {
         self.cur.is_some() || !self.queue.is_empty() || self.gap_left > 0
     }
 
+    pub fn is_active(&self) -> bool {
+        self.is_speaking() || self.fade_left > 0
+    }
+
     pub fn next(&mut self) -> f32 {
+        if self.fade_left > 0 {
+            self.fade_left -= 1;
+            let t = self.fade_left as f32 / self.fade_len as f32;
+            let y = self.fade_start * t;
+            self.last_out = y;
+            return y;
+        }
         if self.level == 0 {
             self.stop();
+            self.last_out = 0.0;
             return 0.0;
         }
         if self.gap_left > 0 {
             self.gap_left -= 1;
+            self.last_out = 0.0;
             return 0.0;
         }
         if self.cur.is_none() {
@@ -182,6 +214,7 @@ impl VoicePlayer {
             }
         }
         let Some(data) = self.cur else {
+            self.last_out = 0.0;
             return 0.0;
         };
         let i0 = self.pos as usize;
@@ -190,6 +223,7 @@ impl VoicePlayer {
             if !self.queue.is_empty() {
                 self.gap_left = self.gap_samples;
             }
+            self.last_out = 0.0;
             return 0.0;
         }
         let i1 = (i0 + 1).min(data.len() - 1);
@@ -198,6 +232,8 @@ impl VoicePlayer {
         let s1 = ulaw_to_f32(data[i1]);
         self.pos += ROM_RATE / self.sr;
         let gain = 0.28 + 0.72 * (self.level as f32 / 7.0);
-        (s0 + (s1 - s0) * frac) * gain * 0.92
+        let y = (s0 + (s1 - s0) * frac) * gain * 0.92;
+        self.last_out = y;
+        y
     }
 }

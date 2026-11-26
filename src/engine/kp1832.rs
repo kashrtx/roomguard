@@ -579,7 +579,14 @@ impl Panel {
                     }
                     let hh: u32 = buf[0..2].parse().unwrap_or(99);
                     let mm: u32 = buf[2..4].parse().unwrap_or(99);
-                    if hh > 23 || mm > 59 {
+                    let bad_date = if it == 1 {
+                        let mon: u32 = buf[4..6].parse().unwrap_or(99);
+                        let day: u32 = buf[6..8].parse().unwrap_or(99);
+                        !(1..=12).contains(&mon) || !(1..=31).contains(&day)
+                    } else {
+                        false
+                    };
+                    if hh > 23 || mm > 59 || bad_date {
                         self.error_tone();
                     } else if it == 1 {
                         self.clock_offset_ms = util::offset_to_time(util::now_ms(), hh, mm);

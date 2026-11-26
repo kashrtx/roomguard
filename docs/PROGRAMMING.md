@@ -1,10 +1,10 @@
 # Programming reference
 
-Both panels are programmed the way the real ones are: from the keypad, with the real section numbers. Everything you change is saved per panel and kept across updates.
+All three panels are programmed the way the real ones are: from the keypad, with the real section and field numbers. Everything you change is saved per panel and kept across updates.
 
-You don't have to memorize any of this. In **Settings**, **About**, tap the version number five times and an **Installer** tab appears. It shows every section of the panel you're using in plain English: what it's set to, the factory value, what each option means and the keys to change it.
+You don't have to memorize any of this. Open **Settings -> Panel** for plain-English controls (delays, chime, quick arm, zone types, buzzer/voice levels) synced live with the keypad, or open **Settings -> About** and tap the version number five times to reveal the full raw **Installer** section/field table.
 
-Default codes: master code `1234` until you set your own during setup. Installer code `1500` on the **RmG Classic PC1550** (LED keypad) and `5555` on the **GuardSeries PC1832** (LCD keypad).
+Default codes: master code `1234` until you set your own during setup. Installer code `1500` on **RmG Classic (`PC1550`)**, `5555` on **GuardSeries (`PC1832`)**, and `4112` on **VistaGuard 20P (`VISTA-20P`)**.
 
 ## Everyday keys (both panels)
 
@@ -93,7 +93,7 @@ Enter installer programming with `*` `8` `1500`, then a two digit section. Zone 
 | 31 | 4th system options (4 bypass status while armed) | all off |
 | 32 | 5th system options (3 home-away zones get an entry delay, 4 quick exit, 6 standard pulsed fire, off means Temporal Three) | lights 3 and 6 on |
 | 33 | Answering machine double call timer | 060 |
-| 34 | 6th system options (1 audible exit delay with urgency, 2 squawk on exit, 3 audible exit fault, 4 entry urgency, 5 squawk on entry, 6 `F` key off) | all off |
+| 34 | 6th system options (1 audible exit delay with urgency, 2 squawk on exit, 3 audible exit fault, 4 entry urgency, 5 squawk on entry, 6 `F` key off) | light 4 on (entry urgency in last 10s) |
 | 35 | LINKS1000 test reporting code | FF |
 | 36 | Keypad lockout: wrong codes, minutes | 00 00, which is off |
 | 90, 91 | Installer's lockout on and off | |
@@ -112,7 +112,7 @@ Enter installer programming with `*` `8` `5555`, then a three digit section. The
 | 012 | Keypad lockout: wrong codes, minutes | 000 000, which is off |
 | 013 | 1st system options (3 all troubles while armed, 5 auto arm schedule in `*` `6`, 6 audible exit fault, 7 event buffer follows swinger, 8 Temporal Three fire) | 3, 5, 6 and 7 on |
 | 014 | 2nd system options (1 to 5 bell squawks, 6 audible exit with urgency, 7 exit delay termination, 8 continuous residential fire bell) | 6 on |
-| 015 | 3rd system options (1 fire key, 2 panic audible, 3 quick exit, 4 quick arm, 5 code to bypass, 6 master locked, 7 TLM, 8 TLM audible when armed) | 1, 4 and 7 on |
+| 015 | 3rd system options (1 fire key, 2 panic audible, 3 quick exit, 4 quick arm, 5 code to bypass, 6 master locked, 7 TLM, 8 TLM audible when armed) | 1, 2, 4 and 7 on |
 | 016 | 4th system options (1 AC trouble shown, 5 backlight, 7 bypass status while armed) | 1 and 5 on |
 | 017 | 5th system options | 1 on |
 | 018 | 6th system options (5 keypad buzzer follows bell, 7 exit delay restart, 8 AC trouble beeps) | all off |
@@ -136,6 +136,34 @@ Enter installer programming with `*` `8` `5555`, then a three digit section. The
 Keypad programming: `*` `8` `5555`, then `*`. Sections `074`, `076` and `077` hold key and display options, and `201` to `208` pick each zone's door chime sound (six beeps, bing bing, ding dong or alarm tone).
 
 User codes on the PC1832: `*` `5` `1234`, then a two digit user number (`01` to `39`, `40` is the master, `41` to `71`), then four digits. `*` as the first digit erases. Enter `99` first to change a user's attributes (1 supervisor, 2 duress, 3 bypass, 7 bell squawk, 8 one time use).
+
+## VistaGuard 20P fields (`VISTA-20P` / `VG6160V`)
+
+Enter installer programming with `4112` `8` `0` `0`. Type `*field` to edit a field, `#field` to review a field read-only, `*97` to restore factory defaults, `*98` to exit with installer lockout, or `*99` to exit normally.
+
+| Field | Contents | Default |
+| --- | --- | --- |
+| `*20` | Installer code (4 digits) | `4112` |
+| `*21` | Quick arm enable (`#` + Away/Stay/Max/Instant without a code) | `0` (off) |
+| `*23` | Quick / forced bypass (`[Code] + 6 + #`) | `0` (off) |
+| `*26` | Chime by zone | `0` |
+| `*32`, `*33` | Fire sounder timeout and Bell timeout (`1` = 4 min, `2` = 8 min, `3` = 12 min, `4` = 16 min) | `0`, `1` |
+| `*34`, `*35`, `*36` | Exit delay, Entry delay 1, Entry delay 2 (seconds; `97` = 120 s) | `60`, `30`, `30` |
+| `*37` | Audible exit warning (slow beeps, ramping to rapid beeps in the last 10 s) | `1` (on) |
+| `*38` | Confirmation of arming ding on external bell | `0` (off) |
+| `*41`, `*42`, `*43` | Primary phone, secondary phone, Partition 1 account code | `5551234`, blank, `1234` |
+| `*50` | Burglary dialer delay (`0` none, `1` 15 s, `2` 30 s, `3` 45 s) | `2` (30 s) |
+| `*56` | Zone types (2 digits per zone: `01` entry/exit 1, `02` entry/exit 2, `03` perimeter, `04` interior follower, `05` trouble/day, `06`/`07`/`08` 24 h, `09` fire, `10` interior w/ delay, `14` CO, `16` fire w/ verify) | `01 04 03 01 04 09 02 10` |
+| `*57` | Function keys A-D (2 digits per key; key D defaults to `03` single-button Away; `04` Stay, `05` Night-Stay, `06` Step arming, `08` Comm test) | `00 00 00 03` |
+| `*59` | Exit error report code | `0` |
+| `*81` | Night-Stay zones (zone list 05, 1 digit per zone: `0`/`1`) | `00000000` |
+| `*84` | Auto-Stay arming (converts Away to Stay, or Maximum to Instant, if no door opens during exit) | `3` (on) |
+| `*86` | Cancel verify display (`Alarm Canceled` when clearing alarm memory) | `1` (on) |
+| `*91` | Option selection (bit `8` enables exit delay restart via `*` or reopening the door) | `8` |
+| `*93` | Reports in armed period (swinger limit) | `1` |
+| `*197` | Show live exit countdown seconds on LCD | `0` (off) |
+
+Voice keypad commands: `#` `0` `2` opens voice volume (`3` louder, `6` quieter, `4` toggle voice status/chime on or off, `#` save). `#` `*` or `#` `0` `*` announces current system status.
 
 ## Updating a panel saved by an older RoomGuard
 

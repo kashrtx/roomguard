@@ -3,87 +3,40 @@
 Every release lists what changed. The release workflow copies the section for
 each version onto its GitHub release page.
 
-## [2.1.0-beta.1] - 2026-11-25
+## [2.1.0] - 2026-11-25
 
-### VISTA-20P, checked against official programming and user guides
+RoomGuard 2.1.0 introduces the **VistaGuard 20P** voice keypad, guided empty-room calibration with lighting-invariant closed-door detection, limb-aware person tracking with an **Ignore desk** workflow, studio-matched sirens and keypad acoustics, zero-delay keystroke audio, and line-by-line manual accuracy across all three panels.
 
-Checked line by line against the VISTA-15P/20P User Guide (K5309-1V7), Programming Guide (K5305-1PRV5) and Installation Guide.
+### Highlights & New Features
 
-- Keypad sounds follow the user guide's audible notification table, with the actual sounds measured from recordings of a real 6160V. The burglary alarm warbles between 1360 Hz and 1019 Hz every 505 ms without a break. Key beeps are 46 ms at 1360 Hz, the exit warning is 500 ms on and 510 ms off, and the single confirmation beep is a low 1019 Hz tone of about 340 ms, with the voice about 750 ms after it. The sounder's tone was rebuilt to match the real keypad's harmonics within a few dB (it was pitched at 2180 Hz and much buzzier). The entry and exit delays beep slowly (500 ms on, 510 ms off) and then rapidly (90 ms on, 70 ms off) for their last ten seconds, as filmed on a real keypad. The entry delay beeps rapidly all the way if an alarm happened while you were out. A trouble beeps rapidly until any key is pressed. Away and Maximum give two beeps, or the exit warning when *37 is on. A wrong code is silent, and arming with a zone open gives one short beep and shows the zone.
-- During the entry delay or an alarm, the code alone is enough: the beeps stop, and the system disarms about 15 seconds later even without OFF. A fire alarm is silenced by OFF alone.
-- NIGHT-STAY is code + STAY + STAY. It keeps the zones in the Night-Stay list (*81 here, zone list 05 on the real panel) armed.
-- Pressing * while armed Stay or Instant really restarts the exit delay (*91), and reopening the door during an Away exit delay resets it once.
-- Bypassing only adds zones. Code + 6 alone shows the bypassed zones, and code + OFF removes them all.
-- Test mode is code + 5 + 0 (1 is the dialer test). It beeps once about every 30 seconds, three times for each faulted zone, and ends itself after four hours with double beeps in the last five minutes.
-- After an alarm, the first code + OFF keeps the alarm on the display, and the second shows Alarm Canceled for a moment, then Ready to Arm (*86), as filmed on a real keypad. The low confirmation beep comes about a second after OFF, like the real panel's answer.
-- Zone descriptions start at a fixed column like the real display ("FIRE 95  FIRE" over "PANIC"), and the fire panic now shows its description.
-- The 6160V says "Disarmed", "Ready to arm", "Not ready to arm" and "Exit now" in the real keypad's own voice, cut from recordings and cleaned up.
-- Keys must come within 5 seconds of each other, or the entry starts over. Chime only works while disarmed. Changing the master code takes the new code twice, and # 0 deletes a user.
-- Installer programming steps to the next field after each entry, and an invalid field shows ENTRY ERROR.
-- Factory defaults corrected: quick arm *21 and quick bypass *23 off, entry delay 2 *36 30 seconds, function keys A, B and C on 00 (the panic keys) with D on 03, so it arms Away as its printed AWAY label says, *59 is the exit error report code (exit error is always active), auto-stay *84 3, exit time display *197 off. Added *32, *39, *50 (30 second dialer delay), *81 and *93. Saved panels get these once; anything you changed yourself is kept.
-- A camera that's blocked or offline shows as CHECK plus the zone.
+- **VistaGuard 20P (`VISTA-20P` / `VG6160V`) Voice Keypad:**
+  - Authentic `[Code] + [Action Key]` firmware: `1` OFF (two-step alarm memory clear + `*86` `Alarm Canceled`), `2` AWAY (with `*84` Auto-Stay), `3` STAY (and `3` again for NIGHT-STAY with `*81`), `4` MAXIMUM (Away with zero entry delay, Auto-Stay to INSTANT), `5` TEST (`0` walk test, `1` dialer test), `6` BYPASS (`01`–`08` or `#` quick bypass `*23`), `7` INSTANT, `8` CODE (user management), `9` CHIME (with spoken zone names), `*` fault viewer / exit restart (`*91`), `# + 0 + 2` voice volume & toggle, `# + 0 + *` voice status, and `4112 + 8 + 0 + 0` installer programming.
+  - Real 6160V voice ROM (`Disarmed`, `Ready to arm`, `Not ready to arm`, `Exit now` preserved from original recordings, plus natural adult female zone/status vocabulary matched to the 1-inch plastic speaker frequency curve).
+  - Measured 6160V speaker acoustics: 1360 Hz / 1019 Hz continuous burglary warble, 46 ms key chirp, 1019 Hz confirmation tone, 10-second any-key keypad silence during alarm, and live ready-state evaluation right when announcing status after disarm.
+- **Guided Empty-Room Calibration & Door Contact:**
+  - Click **Calibrate empty room** (or **Recalibrate empty room**) on the Camera card: a 5-second countdown lets you close the door and step out of view, pauses automatically if anyone is still visible, and scans 36 frames to save your room's exact background, per-pixel noise floor, and closed-door image permanently to disk.
+  - `DoorWatch` matches the calibrated `160×mh` baseline 1:1 with lighting-invariant signed gradients + intensity correlation + mean-adjusted pixel change, eliminating false "Open" readings on shut doors.
+- **Smart Person & Limb Detection + Ignore Desk Box:**
+  - Powered by pure-Rust RTMDet-Nano + RTMPose-Tiny 17-joint body tracking: static objects, clothes, posters, and brightness shifts are ignored, while full bodies and partial limbs (arms/wrists/legs) reaching into the doorway or room trigger immediately.
+  - Putting an **Ignore desk** box over your chair/desk lets you arm effortlessly while seated without masking arms reaching into the doorway or walking out into the room.
+- **Live Settings -> Panel Tab:**
+  - Plain-English controls for delays, bell cut-off, door chime, quick arm, buzzer/voice volume, auto-arm schedule, and zone definitions synced live both ways with keypad programming.
 
-### PC1832 keypad sounds, measured from real PK5500 recordings
+### Audio Latency, Sync & Sirens
 
-- The PK5500 now sounds at 2295 Hz at its factory buzzer level (12), measured from recordings of a real PK5500 keypad, instead of about 2980 Hz. Buzzer Control still steps the tone up and down from there. Its notes now rise in about 7 ms, like the real disc.
-- Key beeps are 65 ms, and confirmation beeps are 67 ms on and 50 ms off.
-- A code arms it with six quick beeps, as recorded (and as the PC1550 manual says).
-- The exit delay beeps once every 996 ms. Its last ten seconds ("3 times a second" in the manual) are a burst of three quick beeps each second, not evenly spaced beeps.
-- The entry delay is a steady tone, and its "pulsing tone" for the last ten seconds is beep, beep, beeeep every second (94 ms, 94 ms, then 731 ms, with 26 ms gaps).
+- **Zero-delay keystroke audio:** Moved Windows/OS default-device switching onto a dedicated low-priority watcher thread so device enumeration never stalls a keypress beep. Switching speakers or headphones moves live audio seamlessly within ~1 second.
+- **Zero overlap & pop-free speech:** Keypresses smoothly fade out in-progress 6160V speech (4 ms ramp), cancel stale pending status announcements, and cut cleanly through steady entry, last-10-second pulsing entry, and Hi-Lo burglary tones.
+- **Rebuilt sirens & keypads from real hardware measurements:**
+  - **WAVE-2F Horn Siren:** 2082 Hz steady; 8.4 Hz RC-rise warble (1570–2230 Hz).
+  - **Master Blaster Motor Siren:** 1833 Hz rotor with realistic spin-up, coast-down, and 2nd/3rd harmonics.
+  - **RX-7C Indoor Piezo:** 3555 Hz (±230 Hz) warble at 15.4 Hz with oscillator start swoop.
+  - **PK5500 (`PC1832`) & PC1500RK (`PC1550`):** 2295 Hz PK5500 piezo tone, 6-beep code arming, 1 Hz -> 3-beep-burst exit urgency, and `beep-beep-beeeep` last-10-second entry delay urgency on both panels.
 
-### Sound output
+### Manual Accuracy, Performance & Reliability
 
-- Switching speakers or headphones no longer leaves RoomGuard silent. It follows the system's default output within about a second, keeps an alarm sounding through the switch, and still plays a beep you pressed while it changed over.
-
-
-> **Beta pre-release:** RoomGuard is a new project and this build is marked as a beta while remaining kinks are worked out. Feedback and bug reports are welcome!
-
-### Smoother, no more freezes
-- Saving now happens in the background. Before, every save forced a full flush to the disk on the window or panel thread, which antivirus or a synced folder could stall. That was the freezing, and it's why a keypress sometimes didn't beep until the second try.
-- The laptop battery is read on its own thread, so the panel's clock never waits on slow firmware.
-- Closing waits for the room map and every save to be written.
-- Two slow memory leaks are gone: font sizes from window resizing, and every chat photo staying loaded forever.
-- The sound engine no longer bogs down while it sits idle. Leftover numbers too tiny to hear made the CPU work dozens of times harder in every filter, which could cause crackles and late beeps.
-- The keypad's lights and screen now change the instant its key beeps, instead of up to a few frames later.
-- The window no longer slows down the longer you use it. History drew all of its rows on every frame and the monitoring chat drew every message, each converting its time to your time zone, so every arm and disarm made each frame a little heavier. Now only what's on screen is drawn, and the chat shows the newest 60 messages with a button for older ones.
-- Body tracking runs at background priority and takes a breather between looks, so it can't hold a CPU core at 100% and heat a laptop until everything throttles.
-- On Windows the panel, its sound and the window always get the CPU before background work.
-- Drawing happens on the graphics card through Direct3D 12, Vulkan or Metal, falling back to OpenGL if needed. Settings has a switch to use OpenGL.
-- The panel, the camera and body tracking recover from an internal error instead of stopping. Before, one rare bug could end the panel's thread and leave the keypad silent and frozen.
-- The first keypress after a quiet spell beeps. An inaudible 30 Hz signal keeps speakers and headphones from powering down, it gets a little stronger as your pointer reaches the keypad, and if Windows resets the sound device, it reconnects in a moment and still plays the beep you just pressed.
-- A sound output that reconnects within a few seconds no longer shows a bell circuit trouble.
-
-### Body tracking that only sees people
-- Every frame gets a full look plus up to two zoomed looks where something moved, so people far across the room are found too.
-- The detector and the 17 joint skeleton have to agree, and nothing becomes a person until it's been seen clearly several times and has moved. Posters, photos and coats on hooks never count. Tested against real photos, including torso only, dark, blurred and noisy ones, and against a real bedroom full of clothes.
-- Ignored areas apply to bodies, so a person on a TV you've ignored isn't in the room.
-- The room zone works like a real motion detector: it follows people moving, so you can stand at the keypad, get a Ready light and arm.
-- The camera card shows whether body tracking is on and how long each look takes.
-
-### Closer to the real panels
-- Factory defaults now match the manuals. On the PC1832 that's sections [012], [013], [014], [015], [017], [018], [102], [105], [106], [199], [377], [380], [381] and [702], and on the PC1550 [29] and [36]. Panels saved by 2.0.0 get the fix once, and only for sections you never changed.
-- The zone attribute defaults follow the manual's table, so stay/away zones can be force armed like the real ones.
-- [*][1] while armed Stay brings the room back after the exit delay time, not instantly.
-- The PC1832 exit delay is silent when [014] option 6 is off, and a silent exit delay runs twice as long, up to 255 seconds.
-- [014] option 8 keeps the fire bell ringing past bell cut-off instead of changing its pattern.
-- Holding 1 to 5 for two seconds on the PowerSeries works like the function keys.
-- Holding F, A or P closes any open menu, and function keys inside a menu give the error tone.
-- Zones respect the loop response time: 500 ms on the PC1550, 400 ms on the PC1832, faster for fast zones.
-- Keypresses are 80 ms, and the last digit of a code is heard before "beep beep beep" instead of being cut off.
-- Feature off tones are a full 2 seconds on the PC1832.
-- A force armed zone that's open when the exit delay ends is left out until it closes.
-- The entry-delay keypad piezo now stops when the external burglary siren takes over, and PC1832 section [018] option 5 (Keypad Buzzer Follows Bell) controls whether the keypad buzzer follows the bell.
-- On the PK5500 LCD keypad, the green Ready light turns off immediately when the exit delay begins and returns on disarm.
-
-### Easier to use
-- A line under the keypad says what the panel is waiting for in each menu, like "type the zone as two digits".
-- Bypass zone numbers on the PC1832 are two digits, 02 for zone 2, like the real keypad.
-- A hidden Installer tab (tap the version in About five times) shows every programming section in plain English: current value, factory value, what each option does and the keys to change it.
-- Start over erases everything and restarts into the setup wizard.
-- Updates check that the download really is a program before installing it, and leftover downloads are cleaned up.
-- Only one copy of RoomGuard runs at a time. Opening it again brings the open window to the front, even when it's minimized. Restarting after an update or Start over still works, because the new copy waits for the old one to close.
-- Three wrong codes in a row save a snapshot of whoever is guessing, even with the keypad lockout off.
-- The PC1550 now shows camera troubles like the PC1832 does. Cover or unplug the webcam and the Trouble light comes on with two beeps every 10 seconds until you press #. In [*][2] the camera's zone light flashes, while the six real trouble lights keep their meanings. The status bar and zones list say whether the camera is blocked or offline.
+- **1:1 manual fidelity across all three panels:** Verified factory defaults, zone attribute tables, loop response times (500 ms / 400 ms / 350 ms), silent double-length PC1832 Stay exit delay, `[015]` opt 2 audible Panic, `[018]` opt 5 buzzer-follows-bell, PC1550 `[32]` opt 1 AC trouble option & `[34]` opt 2/4 exit squawk and entry urgency, PC1832 `[*][6]` date validation, PK5500 LCD `[kp076]` options and `0–9` brightness/contrast levels, and Vista contextual hints.
+- **Smooth & freeze-free:** Background atomic saving, dedicated battery polling thread, non-blocking 3-second cap on offline armed-shutdown alerts, virtualized event history & chat rendering, GPU rendering with OpenGL fallback, panic recovery on engine/camera/UI threads, and single-instance window focus.
+- **Cross-platform builds:** Native builds for Windows (`x86_64`), macOS universal (`Apple Silicon + Intel .dmg` with explicit HFS+ staging size), and Linux (`x86_64`).
 
 ## [2.0.0] - 2026-11-24
 

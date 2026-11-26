@@ -63,7 +63,7 @@ pub fn draw(
         xf.s(6.0),
         dim(Color32::from_rgb(0xFB, 0xFA, 0xF7), l),
         dim(Color32::from_rgb(0xE1, 0xDF, 0xD9), l),
-        Some(Stroke::new(1.2, dim(Color32::from_rgb(0xC2, 0xBF, 0xB8), l))),
+        Some(Stroke::new(1.2_f32, dim(Color32::from_rgb(0xC2, 0xBF, 0xB8), l))),
     );
     // Subtle glossy top specular rim
     p.line_segment(
@@ -101,7 +101,7 @@ pub fn draw(
         xf.s(5.0),
         dim(Color32::from_rgb(0xF6, 0xF5, 0xF2), l),
         dim(Color32::from_rgb(0xEA, 0xE8, 0xE3), l),
-        Some(Stroke::new(0.9, dim(Color32::from_rgb(0xD0, 0xCD, 0xC6), l))),
+        Some(Stroke::new(0.9_f32, dim(Color32::from_rgb(0xD0, 0xCD, 0xC6), l))),
     );
     let led_ready = view.lcd_leds[0];
     let led_armed = view.lcd_leds[1];
@@ -120,7 +120,7 @@ pub fn draw(
     p.add(Shape::convex_polygon(
         visor_pts.clone(),
         dim(Color32::from_rgb(0xF5, 0xF4, 0xF0), l),
-        Stroke::new(1.0, dim(Color32::from_rgb(0xCC, 0xC9, 0xC2), l)),
+        Stroke::new(1.0_f32, dim(Color32::from_rgb(0xCC, 0xC9, 0xC2), l)),
     ));
     p.line_segment(
         [xf.p(SPLIT_X + 3.0, SEAM_Y), xf.p(BX + BW - 4.0, SEAM_Y)],
@@ -135,7 +135,7 @@ pub fn draw(
         xf.s(4.0),
         dim(Color32::from_rgb(0xCF, 0xCC, 0xC4), l),
         dim(Color32::from_rgb(0xF6, 0xF5, 0xF1), l),
-        Some(Stroke::new(0.9, dim(Color32::from_rgb(0xB2, 0xAF, 0xA8), l))),
+        Some(Stroke::new(0.9_f32, dim(Color32::from_rgb(0xB2, 0xAF, 0xA8), l))),
     );
     let lcd = bezel.shrink2(Vec2::new(xf.s(5.0), xf.s(5.0)));
     draw_lcd(&p, &xf, lcd, &view.lcd, bl, view.contrast, l, view.all_on);
@@ -156,7 +156,7 @@ pub fn draw(
         xf.s(3.0),
         dim(Color32::from_rgb(0xD8, 0xD6, 0xD0), l),
         dim(Color32::from_rgb(0xEB, 0xE9, 0xE4), l),
-        Some(Stroke::new(0.8, dim(Color32::from_rgb(0xBE, 0xBB, 0xB4), l))),
+        Some(Stroke::new(0.8_f32, dim(Color32::from_rgb(0xBE, 0xBB, 0xB4), l))),
     );
     for (row, (key, label)) in fn_keys.iter().enumerate() {
         let kr = xf.r(SPLIT_X + 28.0, SEAM_Y + 12.0 + row as f32 * 30.0, 40.0, 24.0);
@@ -188,7 +188,7 @@ pub fn draw(
 
     // Embossed molded "RmG" nameplate recess in lower-right
     let badge = xf.r(BX + BW - 94.0, BY + BH - 20.0, 74.0, 14.0);
-    p.rect_stroke(badge, xf.s(2.0), Stroke::new(0.8, dim(Color32::from_rgb(0xC8, 0xC5, 0xBE), l)));
+    p.rect_stroke(badge, xf.s(2.0), Stroke::new(0.8_f32, dim(Color32::from_rgb(0xC8, 0xC5, 0xBE), l)));
     p.text(
         badge.center(),
         Align2::CENTER_CENTER,
@@ -240,7 +240,7 @@ fn draw_oval_led(p: &Painter, xf: &Xf, x: f32, y: f32, label: &str, state: Led, 
         paint::glow(p, led_rect.center(), xf.s(15.0), alpha(lit_col, 0.34));
     }
     p.rect_filled(led_rect, xf.s(3.1), lens_col);
-    p.rect_stroke(led_rect, xf.s(3.1), Stroke::new(0.8, dim(Color32::from_rgb(0x90, 0x8E, 0x88), l)));
+    p.rect_stroke(led_rect, xf.s(3.1), Stroke::new(0.8_f32, dim(Color32::from_rgb(0x90, 0x8E, 0x88), l)));
     if on {
         p.circle_filled(led_rect.center() - Vec2::new(xf.s(2.0), xf.s(0.8)), xf.s(1.6), alpha(Color32::WHITE, 0.75));
     }
@@ -251,7 +251,7 @@ fn draw_lcd(p: &Painter, xf: &Xf, lcd: Rect, lines: &[String; 2], bl: f32, contr
     let bg_dark = dim(Color32::from_rgb(0x4E, 0x69, 0x3E), l.max(0.22));
     let bg_top = mix(bg_dark, Color32::from_rgb(0x7B, 0xD6, 0x34), bl);
     let bg_bot = mix(bg_dark, bg_lit, bl);
-    paint::grad_rrect(p, lcd, xf.s(2.5), bg_top, bg_bot, Some(Stroke::new(1.0, Color32::from_rgb(0x2A, 0x3B, 0x1E))));
+    paint::grad_rrect(p, lcd, xf.s(2.5), bg_top, bg_bot, Some(Stroke::new(1.0_f32, Color32::from_rgb(0x2A, 0x3B, 0x1E))));
 
     // Subtle green backlight glow onto the bezel when lit in dark room
     if bl > 0.2 {
@@ -332,7 +332,7 @@ fn draw_vista_key(
         xf.s(2.8),
         top_col,
         bot_col,
-        Some(Stroke::new(0.9, dim(Color32::from_rgb(0x8A, 0x8E, 0x88), l.max(0.35)))),
+        Some(Stroke::new(0.9_f32, dim(Color32::from_rgb(0x8A, 0x8E, 0x88), l.max(0.35)))),
     );
     let ink = dim(Color32::from_rgb(0x1E, 0x22, 0x20), l.max(0.55));
     if is_fn {
@@ -381,7 +381,7 @@ fn draw_flip_cover(ui: &mut egui::Ui, p: &Painter, xf: &Xf, open: f32, l: f32) -
         let cut_y1 = SEAM_Y + 134.0;
         let fill_top = dim(Color32::from_rgb(0xF8, 0xF7, 0xF3), l);
         let fill_bot = dim(Color32::from_rgb(0xE6, 0xE4, 0xDE), l);
-        let stroke = Stroke::new(1.0, dim(Color32::from_rgb(0xC0, 0xBD, 0xB6), l));
+        let stroke = Stroke::new(1.0_f32, dim(Color32::from_rgb(0xC0, 0xBD, 0xB6), l));
 
         // Left strip before A-D cutout
         let left_r = Rect::from_min_max(door_rect.left_top(), Pos2::new(xf.p(cut_x0, 0.0).x, door_rect.bottom()));
@@ -402,10 +402,10 @@ fn draw_flip_cover(ui: &mut egui::Ui, p: &Painter, xf: &Xf, open: f32, l: f32) -
         p.rect_stroke(door_rect, xf.s(3.0), stroke);
         if open < 0.15 {
             let cut_r = xf.r(cut_x0, cut_y0, cut_x1 - cut_x0, cut_y1 - cut_y0);
-            p.rect_stroke(cut_r, xf.s(2.5), Stroke::new(1.1, dim(Color32::from_rgb(0xAE, 0xAB, 0xA4), l)));
+            p.rect_stroke(cut_r, xf.s(2.5), Stroke::new(1.1_f32, dim(Color32::from_rgb(0xAE, 0xAB, 0xA4), l)));
             // Embossed RmG badge on closed cover
             let badge = xf.r(BX + BW - 94.0, BY + BH - 24.0, 74.0, 15.0);
-            p.rect_stroke(badge, xf.s(2.0), Stroke::new(0.8, dim(Color32::from_rgb(0xC8, 0xC5, 0xBE), l)));
+            p.rect_stroke(badge, xf.s(2.0), Stroke::new(0.8_f32, dim(Color32::from_rgb(0xC8, 0xC5, 0xBE), l)));
             p.text(badge.center(), Align2::CENTER_CENTER, "RmG", theme::semi(xf.s(10.0)), dim(Color32::from_rgb(0xA4, 0xA0, 0x97), l.max(0.45)));
             p.text(
                 Pos2::new(right_r.center().x, right_r.center().y - xf.s(4.0)),
@@ -430,7 +430,7 @@ fn draw_flip_cover(ui: &mut egui::Ui, p: &Painter, xf: &Xf, open: f32, l: f32) -
             xf.s(4.0),
             dim(Color32::from_rgb(0xE8, 0xE6, 0xE0), l),
             dim(Color32::from_rgb(0xF6, 0xF5, 0xF1), l),
-            Some(Stroke::new(1.1, dim(Color32::from_rgb(0xBC, 0xB9, 0xB2), l))),
+            Some(Stroke::new(1.1_f32, dim(Color32::from_rgb(0xBC, 0xB9, 0xB2), l))),
         );
         // Hinge bar
         p.line_segment(
@@ -444,7 +444,7 @@ fn draw_flip_cover(ui: &mut egui::Ui, p: &Painter, xf: &Xf, open: f32, l: f32) -
                 Vec2::new(xf.s(50.0), door_rect.height() - xf.s(24.0)),
             );
             p.rect_filled(hole, xf.s(2.0), dim(Color32::from_rgb(0xC6, 0xC1, 0xB4), l));
-            p.rect_stroke(hole, xf.s(2.0), Stroke::new(1.0, dim(Color32::from_rgb(0xAA, 0xA6, 0x9E), l)));
+            p.rect_stroke(hole, xf.s(2.0), Stroke::new(1.0_f32, dim(Color32::from_rgb(0xAA, 0xA6, 0x9E), l)));
 
             // Printed Quick Operating Instructions card
             let card = Rect::from_min_max(
@@ -452,7 +452,7 @@ fn draw_flip_cover(ui: &mut egui::Ui, p: &Painter, xf: &Xf, open: f32, l: f32) -
                 door_rect.right_bottom() - Vec2::new(xf.s(10.0), xf.s(10.0)),
             );
             p.rect_filled(card, xf.s(2.0), dim(Color32::from_rgb(0xF8, 0xF7, 0xF4), l));
-            p.rect_stroke(card, xf.s(2.0), Stroke::new(0.7, dim(Color32::from_rgb(0xD2, 0xCF, 0xC8), l)));
+            p.rect_stroke(card, xf.s(2.0), Stroke::new(0.7_f32, dim(Color32::from_rgb(0xD2, 0xCF, 0xC8), l)));
 
             let ink = dim(Color32::from_rgb(0x32, 0x36, 0x3B), l.max(0.45));
             let mut y = card.top() + xf.s(6.0);

@@ -787,7 +787,7 @@ impl RoomGuardApp {
         });
 
         let modal = self.setup.is_some() || self.settings.open || self.close_dialog;
-        if !modal && self.input.keyboard(ctx, &self.engine, view.model) {
+        if !modal && self.input.keyboard(ctx, &self.engine, &self.audio, view.model) {
             // Auto-open the keypad cover when the user types on their physical keyboard.
             match view.model {
                 Model::Pc1550 if !self.cfg.ui.door_open_1550 => {

@@ -47,6 +47,7 @@ pub enum ArmHow {
     Code,
     StayKey,
     AwayKey,
+    MaxKey,
     NoEntry,
     Quick,
     Auto,
@@ -229,6 +230,7 @@ pub struct PanelSave {
     pub contrast: u8,
     pub buzzer: u8,
     pub voice_level: u8,
+    pub voice_on: bool,
     pub clean_exit: bool,
 }
 
@@ -251,6 +253,7 @@ impl Default for PanelSave {
             contrast: 5,
             buzzer: 12,
             voice_level: 5,
+            voice_on: true,
             clean_exit: true,
         }
     }
@@ -429,7 +432,7 @@ impl Panel {
             vista_code_disarm: None,
             vista_night: false,
             vista_test_since: None,
-            vista_voice_on: true,
+            vista_voice_on: save.voice_on,
             vista_pending_status: None,
         };
         // Like a real panel after a power cut, come back armed if it was armed.
@@ -475,8 +478,8 @@ impl Panel {
             auto_arm_hm: self.auto_arm_hm,
             armed: self.armed.map(|a| SavedArm { mode: a.mode, no_entry: a.no_entry, user: a.user }).or_else(|| {
                 self.exit.map(|e| SavedArm {
-                    mode: if e.how == ArmHow::StayKey || e.how == ArmHow::NoEntry { ArmMode::Stay } else { ArmMode::Away },
-                    no_entry: e.how == ArmHow::NoEntry,
+                    mode: if matches!(e.how, ArmHow::StayKey | ArmHow::NoEntry) { ArmMode::Stay } else { ArmMode::Away },
+                    no_entry: matches!(e.how, ArmHow::NoEntry | ArmHow::MaxKey),
                     user: e.user,
                 })
             }),
@@ -490,6 +493,7 @@ impl Panel {
             contrast: self.contrast,
             buzzer: self.buzzer,
             voice_level: self.vista_voice_level,
+            voice_on: self.vista_voice_on,
             clean_exit,
         }
     }
@@ -804,20 +808,26 @@ impl Panel {
             return false;
         }
         let audible_stay = self.model == Model::Pc1832 && self.ee.toggle(self.model, "022", 8);
-        let silent = self.model == Model::Pc1832
-            && !audible_stay
-            && matches!(how, ArmHow::StayKey | ArmHow::NoEntry);
+        let silent = match self.model {
+            Model::Pc1832 => !audible_stay && matches!(how, ArmHow::StayKey | ArmHow::NoEntry),
+            // The Vista's exit warning is for AWAY and MAXIMUM only. "Arming in
+            // the Stay mode still provides an exit delay period, but there is
+            // no audible warning."
+            Model::Vista20p => matches!(how, ArmHow::StayKey | ArmHow::NoEntry),
+            Model::Pc1550 => false,
+        };
         let mut secs = self.exit_secs();
         // PC1832 manual: "If the Exit Delay is silent (Section 14, Option 6 or
         // Stay Function Key Arming), the exit delay must be twice the
         // programmed value. It cannot, however, exceed 255 seconds."
-        let silent_exit = silent || (self.model == Model::Pc1832 && !self.ee.toggle(self.model, "014", 6));
+        let silent_exit = self.model == Model::Pc1832 && (silent || !self.ee.toggle(self.model, "014", 6));
         if silent_exit {
             secs = (secs * 2).min(255);
         }
         if how == ArmHow::Auto {
             secs = 0;
         }
+        self.vista_pending_status = None;
         self.shift_memory();
         self.mem_flash_until = None;
         self.memory_flag = false;
@@ -852,12 +862,14 @@ impl Panel {
         let user_squawk = self.model == Model::Pc1832
             && user > 0
             && (self.ee.attrs(&format!("{:02}", user)) & (1 << 6)) != 0;
-        if self.squawk_on() || user_squawk {
+        let pc1550_exit_squawk = self.model == Model::Pc1550 && self.ee.toggle(self.model, "34", 2);
+        if self.squawk_on() || user_squawk || pc1550_exit_squawk {
             self.squawk(1);
         }
         let what = match how {
             ArmHow::StayKey => "Stay arming",
             ArmHow::AwayKey => "Away arming",
+            ArmHow::MaxKey => "Maximum arming (no entry delay)",
             ArmHow::NoEntry => "Arming with no entry delay",
             ArmHow::Auto => "Auto arming",
             _ => "Arming",
@@ -877,10 +889,12 @@ impl Panel {
         let Some(ex) = self.exit.take() else {
             return;
         };
+        let no_entry = matches!(ex.how, ArmHow::NoEntry | ArmHow::MaxKey);
         let mode = match ex.how {
-            ArmHow::AwayKey => {
-                // VISTA-20P Auto-Stay (*84 = 1): if armed Away from keypad and
-                // no Entry/Exit door opened during exit delay, auto-convert to Stay.
+            ArmHow::AwayKey | ArmHow::MaxKey => {
+                // VISTA-20P Auto-Stay (*84): if armed AWAY or MAXIMUM from keypad
+                // and no Entry/Exit door opened during exit delay, auto-convert to
+                // STAY (for AWAY) or INSTANT (for MAXIMUM, keeping no_entry = true).
                 if self.model == Model::Vista20p
                     && self.ee.entry_or(Model::Vista20p, "84", 0, 1) != 0
                     && !ex.delay_seen
@@ -910,17 +924,18 @@ impl Panel {
         }
         self.armed = Some(ArmedRt {
             mode,
-            no_entry: ex.how == ArmHow::NoEntry,
+            no_entry,
             user: ex.user,
             since: now,
             quick_exit: None,
             shunt_until: None,
             reactivate_at: None,
         });
-        let text = match (mode, ex.how == ArmHow::NoEntry) {
-            (ArmMode::Stay, true) => "Armed, no entry delay",
+        let text = match (mode, no_entry) {
+            (ArmMode::Stay, true) => "Armed instant, no entry delay",
+            (ArmMode::Away, true) => "Armed maximum, no entry delay",
             (ArmMode::Stay, false) => "Armed stay, interior zones bypassed",
-            (ArmMode::Away, _) => "Armed away",
+            (ArmMode::Away, false) => "Armed away",
         };
         self.log(EvKind::Arm, text);
         self.out.push(Out::Save);
@@ -991,12 +1006,10 @@ impl Panel {
         }
         if had_alarm && self.model == Model::Pc1832 && self.ee.toggle(self.model, "381", 1) {
             self.beeps(8);
-        } else if was_on {
-            if self.model == Model::Vista20p {
-                self.vista_confirm_beep();
-            } else {
-                self.beeps(3);
-            }
+        } else if was_on && self.model != Model::Vista20p {
+            // Vista confirmation tone + live status voice are handled cleanly by vista_off()
+            // so we never queue a redundant tone before the 1.1 s panel answer beep.
+            self.beeps(3);
         }
         self.log(EvKind::Disarm, format!("Disarmed by {}", self.who(user)));
         self.report(ReportKind::Opening, 401, user as u16, format!("Opening by {}", self.who(user)), 0);
@@ -1010,6 +1023,7 @@ impl Panel {
         if self.entry.is_some() {
             return;
         }
+        self.vista_pending_status = None;
         let kind = self.cfg(zone as usize).kind;
         let secs = self.entry_secs(kind);
         self.entry = Some(EntryRt { started: now, dur: Duration::from_secs(secs), zone, exit_fault, followers: Vec::new() });
@@ -1026,6 +1040,7 @@ impl Panel {
     }
 
     pub fn trigger(&mut self, kind: AlarmKind, zone: u8, audible: bool, buzzer: bool, now: Instant) {
+        self.vista_pending_status = None;
         if zone > 0 && (zone as usize) <= self.n() {
             let limit = self.swinger_limit();
             let r = &mut self.zones[zone as usize - 1];
@@ -1074,9 +1089,7 @@ impl Panel {
         for a in self.alarms.iter_mut() {
             a.silenced = true;
         }
-        if self.model == Model::Vista20p {
-            self.vista_confirm_beep();
-        } else {
+        if self.model != Model::Vista20p {
             self.beeps(3);
         }
         self.log(EvKind::Disarm, format!("Alarm silenced by {}", self.who(user)));
@@ -1187,6 +1200,58 @@ impl Panel {
     /// One line of plain help about what the keypad is waiting for, shown
     /// under it. Empty when there's nothing to explain.
     pub fn hint(&self) -> String {
+        if self.model == Model::Vista20p {
+            let text: &str = match &self.vista_mode {
+                VistaKp::Command { quick: true, .. } => {
+                    "Quick prefix #: press * for voice status, 0+2 for voice volume, or 2/3/4/7 to quick arm (when *21 is enabled)."
+                }
+                VistaKp::Command { quick: false, .. } => {
+                    "Code accepted: press 1 OFF, 2 AWAY, 3 STAY, 4 MAX, 5 TEST, 6 BYPASS, 7 INSTANT, 8 CODE, or 9 CHIME."
+                }
+                VistaKp::Bypass { buf, .. } => {
+                    if buf.is_empty() {
+                        "Zone bypass: enter a 2-digit zone (01-08), or press # for quick bypass (*23). Wait 5 s to view bypassed zones."
+                    } else {
+                        "Zone bypass: enter the second digit of the zone number."
+                    }
+                }
+                VistaKp::TestWait => "Test mode: press 0 for Walk Test (Code + 1 ends it), or 1 for Dialer Test.",
+                VistaKp::UserCode { slot, buf, first } => {
+                    if slot.len() < 2 {
+                        "User codes: enter a 2-digit user number (02 = master, 03-49 = users)."
+                    } else if buf == "#" {
+                        "User codes: press 0 to delete this user code."
+                    } else if !first.is_empty() {
+                        "User codes: re-enter the new 4-digit master code to confirm."
+                    } else {
+                        "User codes: enter the new 4-digit code, or press # 0 to delete this user."
+                    }
+                }
+                VistaKp::Program { field, review, .. } => match (field, *review) {
+                    (None, _) => "Installer programming: press *XX to edit a field, #XX to review, *97 factory reset, *99 to exit.",
+                    (Some(_), true) => "Reviewing field: press *XX to edit another field, #XX to view another, or *99 to exit.",
+                    (Some(_), false) => "Editing field: enter the new value digits (press # to finish a phone number), or *99 to exit.",
+                },
+                VistaKp::Volume => "Voice volume: press 3 louder, 6 quieter, 4 toggle voice status/chime on or off, # when done.",
+                VistaKp::NightWait { .. } => "Armed STAY: press 3 (STAY) again within 5 seconds for NIGHT-STAY.",
+                VistaKp::Normal => {
+                    if self.entry.is_some() {
+                        "Entry delay: enter your 4-digit code + 1 (OFF) to disarm."
+                    } else if self.exit.map_or(false, |e| matches!(e.how, ArmHow::StayKey | ArmHow::NoEntry)) {
+                        "Exit delay: arming Stay / Instant."
+                    } else if self.exit.map_or(false, |e| e.how == ArmHow::MaxKey) {
+                        "Exit delay: arming Maximum (no entry delay). Leave through the doorway before time expires."
+                    } else if self.exit.is_some() {
+                        "Exit delay: leave through the doorway to arm Away, or stay inside for Auto-Stay."
+                    } else if self.vista_alarm_mem_zone.is_some() {
+                        "Alarm memory displayed: enter [Code] + 1 (OFF) a second time to clear."
+                    } else {
+                        ""
+                    }
+                }
+            };
+            return text.to_string();
+        }
         let lcd = self.model == Model::Pc1832;
         let text: &str = match &self.kp {
             KpMode::Bypass { buf, .. } => {
@@ -2427,7 +2492,13 @@ impl Panel {
             Model::Vista20p => 2,
         };
         self.log(EvKind::Disarm, format!("Recognized {} at the camera", name));
-        self.disarm(master, now);
+        if self.model == Model::Vista20p {
+            self.vista_mode = VistaKp::Normal;
+            self.buf.clear();
+            self.vista_off("02", master, now);
+        } else {
+            self.disarm(master, now);
+        }
         true
     }
 
@@ -2502,7 +2573,7 @@ impl Panel {
         if i.battery_low {
             t |= tb::LOW_BATT;
         }
-        if !i.ac_ok {
+        if !i.ac_ok && !(self.model == Model::Pc1550 && self.ee.toggle(self.model, "32", 1)) {
             t |= tb::AC;
         }
         if !i.audio_ok {

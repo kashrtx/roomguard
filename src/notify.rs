@@ -133,10 +133,14 @@ fn header_safe(s: &str) -> String {
 }
 
 pub fn send_now(cfg: &NtfyCfg, job: &NotifyJob) -> Result<(), String> {
+    send_now_timeout(cfg, job, Duration::from_secs(15))
+}
+
+pub fn send_now_timeout(cfg: &NtfyCfg, job: &NotifyJob, timeout: Duration) -> Result<(), String> {
     if cfg.topic.is_empty() {
         return Err("no topic is set".to_string());
     }
-    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(15)).build();
+    let agent = ureq::AgentBuilder::new().timeout(timeout).build();
     let mut req = agent
         .put(&cfg.topic_url())
         .set("Title", &header_safe(&job.title))

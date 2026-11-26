@@ -429,6 +429,10 @@ impl Engine {
             && !self.panel.walk_test
             && self.panel.bell_test_until.is_none()
             && self.panel.util_until.is_none()
+            && self.panel.temp_msg.is_none()
+            && self.panel.vista_pending_status.is_none()
+            && self.panel.vista_code_disarm.is_none()
+            && matches!(self.panel.vista_mode, kp_vista::VistaKp::Normal)
             && self.save_due.is_none()
             && self.zone_pend.iter().all(|p| p.is_none())
             && self.op.call_view().is_none()
@@ -585,8 +589,8 @@ impl Engine {
         let m = self.panel.model;
         match edit {
             PanelEdit::SetKeypadLevels { brightness, contrast, buzzer } => {
-                self.panel.brightness = brightness.min(15);
-                self.panel.contrast = contrast.min(15);
+                self.panel.brightness = brightness.min(9);
+                self.panel.contrast = contrast.min(9);
                 self.panel.buzzer = buzzer.min(20);
                 if self.panel.buzzer != self.last_buzzer {
                     self.last_buzzer = self.panel.buzzer;
@@ -1056,7 +1060,7 @@ impl Engine {
                     photo: None,
                     test: false,
                 };
-                if let Err(e) = notify::send_now(&cfg, &job) {
+                if let Err(e) = notify::send_now_timeout(&cfg, &job, Duration::from_secs(3)) {
                     util::log(&format!("could not send the shutdown alert: {}", e));
                 }
             }

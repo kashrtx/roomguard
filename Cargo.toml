@@ -1,11 +1,11 @@
 [package]
 name = "roomguard"
-version = "2.1.0-beta.1"
+version = "2.1.0"
 edition = "2021"
 rust-version = "1.80"
 authors = ["Kaushal Bhingaradia"]
 license = "Apache-2.0"
-description = "A camera based room alarm with faithful RmG Classic PC1550 and GuardSeries PC1832 keypad replicas."
+description = "A camera based room alarm with faithful RmG Classic PC1550, GuardSeries PC1832, and VistaGuard 20P keypad replicas."
 readme = "README.md"
 build = "build.rs"
 

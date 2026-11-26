@@ -870,10 +870,10 @@ pub fn ui(ui: &mut egui::Ui, prog: &ProgView, armed: bool, engine: &EngineHandle
     // --- 2. Common Behavior & Options ---
     section_hdr(ui, "Keypad & alarm behavior");
     let mut chime = prog.chime;
-    let chime_lbl = if m == Model::Vista20p {
-        "Door chime enabled  ([Code] + 9)"
-    } else {
-        "Door chime enabled  ([*][4])"
+    let chime_lbl = match m {
+        Model::Vista20p => "Door chime enabled  ([Code] + 9)",
+        Model::Pc1832 => "Door chime enabled  ([*][4])",
+        Model::Pc1550 => "Door chime enabled  ([*][6][Master][6])",
     };
     if ui.checkbox(&mut chime, chime_lbl).changed() {
         engine.send(EngineMsg::EditPanel(PanelEdit::SetChime(chime)));
@@ -912,9 +912,13 @@ pub fn ui(ui: &mut egui::Ui, prog: &ProgView, armed: bool, engine: &EngineHandle
             if ui.checkbox(&mut scroll_clock, "Display clock on LCD while idle  ([kp076] opt 2)").changed() {
                 engine.send(EngineMsg::EditPanel(PanelEdit::SetToggle { key: "kp076".into(), opt: 2, on: scroll_clock }));
             }
-            let mut scroll_open = toggle_on(prog, "kp076", 3);
-            if ui.checkbox(&mut scroll_open, "Auto-scroll open zones on LCD  ([kp076] opt 3)").changed() {
-                engine.send(EngineMsg::EditPanel(PanelEdit::SetToggle { key: "kp076".into(), opt: 3, on: scroll_open }));
+            let mut clock_24h = toggle_on(prog, "kp076", 3);
+            if ui.checkbox(&mut clock_24h, "24-hour clock format on LCD  ([kp076] opt 3)").changed() {
+                engine.send(EngineMsg::EditPanel(PanelEdit::SetToggle { key: "kp076".into(), opt: 3, on: clock_24h }));
+            }
+            let mut scroll_open = toggle_on(prog, "kp076", 8);
+            if ui.checkbox(&mut scroll_open, "Auto-scroll open zones on LCD  ([kp076] opt 8)").changed() {
+                engine.send(EngineMsg::EditPanel(PanelEdit::SetToggle { key: "kp076".into(), opt: 8, on: scroll_open }));
             }
         } else if m == Model::Vista20p {
             let mut qa = read_entry(&raw_val(prog, "21"), 0, 1, 1) != 0;
@@ -1039,13 +1043,13 @@ pub fn ui(ui: &mut egui::Ui, prog: &ProgView, armed: bool, engine: &EngineHandle
         let mut lvl_changed = false;
         egui::Grid::new("pk5500-levels").num_columns(3).spacing([12.0, 6.0]).show(ui, |ui| {
             ui.label("Backlight brightness");
-            lvl_changed |= ui.add(egui::Slider::new(&mut br, 0..=15)).changed();
-            ui.label(theme::muted("[*][6] Brightness"));
+            lvl_changed |= ui.add(egui::Slider::new(&mut br, 0..=9)).changed();
+            ui.label(theme::muted("[*][6] Brightness (0 to 9)"));
             ui.end_row();
 
             ui.label("LCD contrast");
-            lvl_changed |= ui.add(egui::Slider::new(&mut co, 0..=15)).changed();
-            ui.label(theme::muted("[*][6] Contrast"));
+            lvl_changed |= ui.add(egui::Slider::new(&mut co, 0..=9)).changed();
+            ui.label(theme::muted("[*][6] Contrast (0 to 9)"));
             ui.end_row();
 
             ui.label("Buzzer tone / level");

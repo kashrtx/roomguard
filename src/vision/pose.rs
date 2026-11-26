@@ -182,11 +182,19 @@ impl Person {
                 return Evidence::None;
             }
         }
+        // Partial-limb path: an arm (elbows/wrists 7..=10) or leg (hips/knees/ankles
+        // 11..=16) reaching into the doorway or room counts as a real person even
+        // when shoulders are outside the camera frame.
+        let arm_sure = [7usize, 8, 9, 10].iter().filter(|&&i| self.sure(i)).count();
+        let leg_sure = [11usize, 12, 13, 14, 15, 16].iter().filter(|&&i| self.sure(i)).count();
+        let limb_sure = arm_sure + leg_sure;
         if self.score >= 0.55 && shoulder >= 0.40 && n_sure >= 3 && top8 >= 0.44 {
             Evidence::Strong
-        } else if self.score >= det_thr && shoulder >= 0.52 && n_sure >= 5 && top8 >= 0.50 {
+        } else if self.score >= 0.62 && limb_sure >= 2 && top8 >= 0.36 {
+            Evidence::Strong
+        } else if self.score >= det_thr && ((shoulder >= 0.52 && n_sure >= 5 && top8 >= 0.50) || (limb_sure >= 2 && top8 >= 0.32)) {
             Evidence::Normal
-        } else if self.score >= DET_MIN && shoulder >= 0.45 && n_sure >= 4 && top8 >= 0.46 {
+        } else if self.score >= DET_MIN && ((shoulder >= 0.45 && n_sure >= 4 && top8 >= 0.46) || limb_sure >= 2) {
             Evidence::Weak
         } else {
             Evidence::None

@@ -48,6 +48,8 @@ struct Snap {
     mapping: Option<f32>,
     ptz_status: String,
     door_learned: bool,
+    calib: Option<vision::CalibView>,
+    room_calibrated: bool,
 }
 
 fn full_uv() -> Rect {
@@ -82,6 +84,8 @@ impl CameraView {
                     mapping: s.mapping_progress,
                     ptz_status: s.ptz_status.clone(),
                     door_learned: s.door_learned,
+                    calib: s.calib.clone(),
+                    room_calibrated: s.room_calibrated,
                 }
             }
             Err(_) => return,
@@ -118,13 +122,13 @@ impl CameraView {
         });
         ui.add_space(4.0);
         if self.tab == 0 {
-            self.live(ui, &snap, cfg, changed, show_motion, show_tracks);
+            self.live(ui, &snap, cam, cfg, changed, show_motion, show_tracks);
         } else {
             self.map_ui(ui, &snap, cam, cfg, changed);
         }
     }
 
-    fn live(&mut self, ui: &mut egui::Ui, snap: &Snap, cfg: &mut CameraCfg, changed: &mut bool, show_motion: bool, show_tracks: bool) {
+    fn live(&mut self, ui: &mut egui::Ui, snap: &Snap, cam: &CameraHandle, cfg: &mut CameraCfg, changed: &mut bool, show_motion: bool, show_tracks: bool) {
         let w = ui.available_width();
         let aspect = self.size[1] as f32 / self.size[0].max(1) as f32;
         let h = (w * aspect).clamp(140.0, 420.0);
@@ -169,7 +173,11 @@ impl CameraView {
             if resp.hovered() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
             }
-            let hint = if self.draw == Draw::Doorway { "Drag a box around the doorway" } else { "Drag a box around the area to ignore" };
+            let hint = if self.draw == Draw::Doorway {
+                "Drag a box around the doorway"
+            } else {
+                "Drag a box over your desk/chair or any area to ignore"
+            };
             let g = p.fonts(|f| f.layout_no_wrap(hint.to_string(), theme::semi(12.0), theme::BLUE));
             let pill = Rect::from_min_size(rect.left_top() + Vec2::new(8.0, 8.0), g.size() + Vec2::new(14.0, 6.0));
             p.rect_filled(pill, 5.0, Color32::from_black_alpha(165));
@@ -204,8 +212,44 @@ impl CameraView {
             }
         }
 
+        if let Some(cal) = &snap.calib {
+            let col = match cal.phase {
+                vision::CalibPhase::Countdown => theme::AMBER,
+                vision::CalibPhase::WaitingClear => theme::RED,
+                vision::CalibPhase::Capturing => theme::GREEN,
+            };
+            let g = p.fonts(|f| f.layout_no_wrap(cal.prompt.clone(), theme::semi(12.5), col));
+            let pill_w = (g.size().x + 20.0).min(rect.width() - 16.0);
+            let pill_h = g.size().y + if cal.phase == vision::CalibPhase::Capturing { 16.0 } else { 10.0 };
+            let pill = Rect::from_min_size(Pos2::new(rect.center().x - pill_w * 0.5, rect.top() + 8.0), Vec2::new(pill_w, pill_h));
+            p.rect_filled(pill, 6.0, Color32::from_black_alpha(205));
+            p.rect_stroke(pill, 6.0, Stroke::new(1.0f32, col.gamma_multiply(0.75)));
+            p.galley(Pos2::new(pill.center().x - g.size().x * 0.5, pill.top() + 5.0), g, col);
+            if cal.phase == vision::CalibPhase::Capturing {
+                let bar_bg = Rect::from_min_size(Pos2::new(pill.left() + 8.0, pill.bottom() - 7.0), Vec2::new(pill.width() - 16.0, 3.5));
+                p.rect_filled(bar_bg, 2.0, Color32::from_white_alpha(35));
+                let fill = Rect::from_min_size(bar_bg.min, Vec2::new(bar_bg.width() * cal.progress.clamp(0.0, 1.0), bar_bg.height()));
+                p.rect_filled(fill, 2.0, theme::GREEN);
+            }
+        }
+
         ui.add_space(6.0);
         ui.horizontal_wrapped(|ui| {
+            if snap.calib.is_some() {
+                if ui.button(RichText::new("Cancel calibration").color(theme::AMBER)).clicked() {
+                    cam.send(CamCmd::CancelCalibrate);
+                }
+            } else {
+                let cal_lbl = if snap.room_calibrated { "Recalibrate empty room" } else { "Calibrate empty room" };
+                let btn = if snap.room_calibrated {
+                    egui::Button::new(cal_lbl)
+                } else {
+                    egui::Button::new(RichText::new(cal_lbl).color(theme::GREEN))
+                };
+                if ui.add_enabled(running, btn).clicked() {
+                    cam.send(CamCmd::CalibrateRoom);
+                }
+            }
             let door_label = if cfg.doorway.is_some() { "Redraw doorway" } else { "Mark the doorway" };
             if ui.selectable_label(self.draw == Draw::Doorway, door_label).clicked() {
                 self.draw = if self.draw == Draw::Doorway { Draw::Off } else { Draw::Doorway };
@@ -222,9 +266,36 @@ impl CameraView {
                 *changed = true;
             }
         });
+        // Friendly, zero-jargon arming tip when no ignore area is set yet.
+        if running && cfg.ignore.is_empty() && snap.calib.is_none() {
+            ui.add_space(4.0);
+            egui::Frame::none()
+                .fill(theme::BLUE.gamma_multiply(0.10))
+                .stroke(Stroke::new(1.0f32, theme::BLUE.gamma_multiply(0.32)))
+                .rounding(6.0)
+                .inner_margin(egui::Margin::symmetric(8.0, 5.0))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            RichText::new("Tip: Put an Ignore box over your desk/chair so you can arm easily while seated.")
+                                .size(11.5)
+                                .color(theme::TEXT),
+                        );
+                        if ui.small_button("Ignore desk").clicked() {
+                            self.draw = Draw::Ignore;
+                        }
+                    });
+                });
+        }
         let mut info = if snap.name.is_empty() { "No camera".to_string() } else { snap.name.clone() };
         if running {
             info.push_str(&format!("  \u{00b7}  {:.0} fps", snap.fps));
+            if snap.room_calibrated {
+                info.push_str("  \u{00b7}  Room calibrated");
+            } else {
+                info.push_str("  \u{00b7}  Calibrate empty room for best accuracy");
+            }
             if let Some(pv) = &snap.preview {
                 let body = match pv.ov.pose_state {
                     vision::pose::POSE_READY if pv.ov.pose_ms > 0.5 => format!("Body tracking on, {:.0} ms", pv.ov.pose_ms),

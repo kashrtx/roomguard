@@ -1219,3 +1219,247 @@ fn pc1550_entry_delay_pulses_in_last_10_seconds_and_vista_speaks_live_ready() {
     p18.tick(t0 + Duration::from_millis(2100), 0);
     assert_eq!(p18.bell_sent, BellPattern::Steady, "PC1832 Panic key should sound the siren out of the box");
 }
+
+#[test]
+fn the_vista_stay_exit_delay_is_quiet_and_away_beeps_faster_at_the_end() {
+    let t0 = Instant::now();
+    let mut p = panel(Model::Vista20p);
+    keys(&mut p, "12343", t0);
+    p.tick(t0 + secs(2), 0);
+    assert!(p.exit.is_some());
+    assert_eq!(p.sounder_sent, Pattern::Off, "STAY gives three beeps, then a quiet exit delay");
+    keys(&mut p, "12341", t0 + secs(10));
+    assert!(p.exit.is_none() && p.armed.is_none());
+    keys(&mut p, "12342", t0 + secs(20));
+    p.tick(t0 + secs(22), 0);
+    assert!(matches!(p.sounder_sent, Pattern::Beeps { on_ms: 500, period_ms: 1010, .. }), "AWAY gets the slow exit warning");
+    p.tick(t0 + secs(72), 0);
+    assert!(matches!(p.sounder_sent, Pattern::Beeps { on_ms: 90, period_ms: 160, .. }), "rapid for the last ten seconds");
+}
+
+#[test]
+fn the_sirens_play_their_measured_pitches() {
+    let sr = 48_000.0;
+    // Pitch from the autocorrelation peak between half and 1.5 times the
+    // expected pitch. Strong harmonics can't fool it the way they fool zero
+    // crossings (the Master Blaster crosses zero three times a cycle).
+    let pitch = |model: SirenModel, warble: bool, skip_s: f32, len_s: f32, expect: f32| {
+        let mut s = crate::audio::synth::Synth::new(sr);
+        s.apply(AudioCmd::Siren { model, warble });
+        s.apply(AudioCmd::Bell(BellPattern::Steady));
+        for _ in 0..(skip_s * sr) as usize {
+            s.next();
+        }
+        let v: Vec<f32> = (0..(len_s * sr) as usize).map(|_| s.next()).collect();
+        let lo = (sr / (expect * 1.5)) as usize;
+        let hi = (sr / (expect * 0.66)) as usize + 1;
+        let n = v.len() - hi - 1;
+        let corr = |lag: usize| -> f32 { (0..n).map(|i| v[i] * v[i + lag]).sum() };
+        let c: Vec<f32> = (lo - 1..=hi + 1).map(corr).collect();
+        let mut best = 1;
+        for k in 1..c.len() - 1 {
+            if c[k] > c[best] {
+                best = k;
+            }
+        }
+        let (a, b, d) = (c[best - 1], c[best], c[best + 1]);
+        let shift = if a - 2.0 * b + d != 0.0 { 0.5 * (a - d) / (a - 2.0 * b + d) } else { 0.0 };
+        sr / ((lo - 1 + best) as f32 + shift)
+    };
+    let steady = pitch(SirenModel::Wave2F, false, 0.3, 0.5, 2082.0);
+    assert!((steady - 2082.0).abs() < 25.0, "WAVE2 steady {}", steady);
+    let blaster = pitch(SirenModel::MasterBlaster, false, 2.0, 0.5, 1833.0);
+    assert!((blaster - 1833.0).abs() < 40.0, "Master Blaster at full speed {}", blaster);
+    let rx = pitch(SirenModel::Rx7c, false, 0.3, 0.5, 3555.0);
+    assert!((rx - 3555.0).abs() < 200.0, "RX-7C warble center {}", rx);
+}
+
+#[test]
+fn empty_room_baseline_stabilizes_door_contact_and_noise_floor() {
+    use crate::config::NRect;
+    use crate::vision::map::{DoorWatch, RoomBaseline};
+    use crate::vision::motion::Motion;
+
+    let (w, h) = (160usize, 120usize);
+    let door_rect = NRect::new(0.65, 0.05, 0.30, 0.90);
+
+    // Draw a synthetic white paneled door with frame & handle on the right side.
+    let make_room = |door_open: bool, bright_shift: i32| -> Vec<u8> {
+        let mut g = vec![145u8; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let mut v = 145i32;
+                if x >= 106 && x <= 150 && y >= 8 && y <= 112 {
+                    if door_open {
+                        // Dark open hallway instead of the white paneled door
+                        v = if x < 120 { 55 } else { 35 + ((y / 8) as i32 * 3) };
+                    } else {
+                        // White painted door with vertical frame, recessed panels, and dark handle
+                        v = 215;
+                        if x == 106 || x == 107 || x == 149 || x == 150 {
+                            v = 115; // door jamb edge
+                        } else if (x >= 114 && x <= 142) && ((y >= 18 && y <= 52) || (y >= 64 && y <= 100)) {
+                            v = 192; // paneled recess
+                        }
+                        if x >= 110 && x <= 116 && y >= 56 && y <= 60 {
+                            v = 60; // door handle
+                        }
+                    }
+                }
+                g[y * w + x] = (v + bright_shift).clamp(0, 255) as u8;
+            }
+        }
+        g
+    };
+
+    let empty = make_room(false, 0);
+    let mut std_map = vec![1u8; w * h];
+    // Simulate a noisy monitor/bed area on the left (high natural std)
+    for y in 60..110 {
+        for x in 10..50 {
+            std_map[y * w + x] = 14;
+        }
+    }
+    let base = RoomBaseline { w, h, mean: empty.clone(), std: std_map };
+
+    // 1. DoorWatch locked from baseline stays closed under lighting shifts, opens when door opens, closes when shut.
+    let mut dw = DoorWatch::new();
+    assert!(dw.set_from_baseline(&base, door_rect));
+    let t0 = Instant::now();
+    let shifted = make_room(false, -28);
+    assert_eq!(dw.update(&shifted, w, h, door_rect, false, t0), None);
+    assert_eq!(dw.update(&shifted, w, h, door_rect, false, t0 + secs(2)), None);
+    assert!(!dw.open, "lighting shift on closed door must NOT flip open (score={})", dw.score);
+
+    let opened = make_room(true, 0);
+    let _ = dw.update(&opened, w, h, door_rect, false, t0 + secs(3));
+    let ev = dw.update(&opened, w, h, door_rect, false, t0 + secs(4));
+    assert_eq!(ev, Some(true), "opening the door must trip DoorWatch (score={})", dw.score);
+    assert!(dw.open);
+
+    let _ = dw.update(&shifted, w, h, door_rect, false, t0 + secs(5));
+    let ev2 = dw.update(&shifted, w, h, door_rect, false, t0 + secs(6));
+    assert_eq!(ev2, Some(false), "closing the door must restore DoorWatch (score={})", dw.score);
+    assert!(!dw.open);
+
+    // 2. Motion with calibrated per-pixel noise floor suppresses static jitter in noisy area.
+    let mut mot = Motion::new();
+    mot.apply_baseline(&base.mean, &base.std, base.w, base.h);
+    let mut jitter = empty.clone();
+    for y in 65..105 {
+        for x in 15..45 {
+            jitter[y * w + x] = jitter[y * w + x].saturating_add(24);
+        }
+    }
+    let out = mot.process(&jitter, w, h, 3, Some(door_rect), &[]);
+    assert!(out.valid);
+    assert!(out.room_frac < 0.005, "calibrated per-pixel noise floor should suppress noisy static area (got {})", out.room_frac);
+}
+
+#[test]
+fn final_audit_audio_sync_vista_maximum_and_manual_rules() {
+    use crate::audio::{synth::Synth, AudioCmd, KeypadVoice};
+
+    // 1. KeyBeep cleanly dips continuous last-10s pulsing entry tone (ShortShortLong) & HiLo alarm,
+    //    and cleanly stops in-progress 6160V voice without resuming mid-syllable.
+    let mut s = Synth::new(48_000.0);
+    s.apply(AudioCmd::Voice(KeypadVoice::Pk5500));
+    s.apply(AudioCmd::Sounder(Pattern::ShortShortLong { short_ms: 94, gap_ms: 26, long_ms: 731 }));
+    for _ in 0..16_000 {
+        s.next();
+    }
+    s.apply(AudioCmd::KeyBeep);
+    for _ in 0..800 {
+        s.next();
+    }
+    let dip_peak = (0..400).map(|_| s.next().abs()).fold(0.0f32, f32::max);
+    assert!(dip_peak < 0.02, "KeyBeep must dip cleanly through ShortShortLong entry urgency (got {})", dip_peak);
+
+    let mut sv = Synth::new(48_000.0);
+    sv.apply(AudioCmd::Voice(KeypadVoice::Vista6160));
+    sv.apply(AudioCmd::Speak(vec!["disarmed".into(), "ready_to_arm".into()]));
+    for _ in 0..4_800 {
+        sv.next();
+    }
+    // Pressing a key mid-speech interrupts the phrase cleanly instead of resuming later.
+    sv.apply(AudioCmd::KeyBeep);
+    for _ in 0..6_000 {
+        sv.next();
+    }
+    let after_key = (0..12_000).map(|_| sv.next().abs()).fold(0.0f32, f32::max);
+    assert!(after_key < 0.01, "6160V voice must stay stopped after KeyBeep interruption (got {})", after_key);
+
+    // 2. VISTA-20P MAXIMUM ([Code] + 4): shows ARMED *MAXIMUM* during exit, stays Away + no_entry
+    //    when door opens, or Auto-Stays to INSTANT (Stay + no_entry) when door never opens.
+    let t0 = Instant::now();
+    let mut v = panel(Model::Vista20p);
+    keys(&mut v, "12344", t0);
+    assert!(v.exit.is_some());
+    assert!(v.lcd_vista(t0 + secs(1), 0).lines[0].contains("MAXIMUM"), "LCD should show MAXIMUM during exit");
+    v.set_zone(1, true, false, false, t0 + secs(5));
+    v.set_zone(1, false, false, false, t0 + secs(8));
+    v.tick(t0 + secs(65), 0);
+    assert!(matches!(v.armed, Some(a) if a.mode == ArmMode::Away && a.no_entry), "MAXIMUM must arm Away with no_entry");
+    // Opening door triggers instant alarm (no entry delay).
+    v.set_zone(1, true, false, false, t0 + secs(70));
+    v.tick(t0 + secs(70), 0);
+    assert!(v.entry.is_none(), "MAXIMUM must have zero entry delay");
+    assert!(v.alarm_sounding(t0 + secs(70)));
+
+    // 3. VISTA-20P any-key silences keypad sounder for 10s while external bell stays steady.
+    keys(&mut v, "9", t0 + secs(71));
+    v.tick(t0 + secs(72), 0);
+    assert_eq!(v.sounder_sent, Pattern::Off, "any key mutes 6160V keypad sounder for 10s");
+    assert_eq!(v.bell_sent, BellPattern::Steady, "external siren keeps sounding until disarmed");
+    v.tick(t0 + secs(82), 0);
+    assert!(matches!(v.sounder_sent, Pattern::HiLo { .. }), "keypad sounder resumes after 10s if not disarmed");
+
+    // 4. Disarming Vista emits exactly ONE confirmation tone (no duplicate from Panel::disarm),
+    //    and pressing a key cancels pending post-OFF status voice so it never overlaps.
+    v.set_zone(1, false, false, false, t0 + secs(83));
+    v.out.clear();
+    keys(&mut v, "12341", t0 + secs(84)); // 1st OFF silences alarm
+    let tones = v.out.iter().filter(|o| matches!(o, Out::Audio(AudioCmd::Tone { .. }))).count();
+    assert_eq!(tones, 1, "Vista disarm must emit exactly one confirmation tone (got {})", tones);
+    keys(&mut v, "12341", t0 + secs(86)); // 2nd OFF clears alarm memory & schedules vista_pending_status
+    assert!(v.vista_pending_status.is_some());
+    keys(&mut v, "1", t0 + secs(87)); // new keypress cancels pending status
+    assert!(v.vista_pending_status.is_none(), "new keypress must cancel pending status voice");
+
+    // 5. Vista MAXIMUM without opening door converts to INSTANT (Stay + no_entry) via *84.
+    let mut v2 = panel(Model::Vista20p);
+    keys(&mut v2, "12344", t0);
+    v2.tick(t0 + secs(65), 0);
+    assert!(matches!(v2.armed, Some(a) if a.mode == ArmMode::Stay && a.no_entry), "MAXIMUM + *84 with no exit becomes INSTANT");
+    // Face-disarm on Vista disarms cleanly and schedules status voice.
+    v2.set_zone(3, true, false, false, t0 + secs(70)); // instant alarm so face_recognized can disarm
+    v2.tick(t0 + secs(70), 0);
+    assert!(v2.face_recognized("Tester", t0 + secs(71)));
+    assert!(v2.armed.is_none());
+
+    // 6. PC1550 [32] opt 1 suppresses AC trouble, [34] opt 2 squawks bell on exit.
+    let mut p15 = panel(Model::Pc1550);
+    p15.ee.sections.insert("32".into(), "136".into());
+    p15.inputs.ac_ok = false;
+    p15.tick(t0 + secs(1), 0);
+    assert!(p15.trouble_list().iter().all(|t| !t.contains("AC")), "PC1550 [32] opt 1 suppresses AC trouble");
+    p15.ee.sections.insert("34".into(), "24".into());
+    p15.out.clear();
+    keys(&mut p15, "1234", t0 + secs(2));
+    assert!(p15.out.iter().any(|o| matches!(o, Out::Audio(AudioCmd::Squawk(1)))), "PC1550 [34] opt 2 squawks on exit");
+
+    // 7. PC1832 [*][6][Master][1] rejects invalid month/day (99/99) and accepts valid date.
+    let mut p18 = panel(Model::Pc1832);
+    p18.out.clear();
+    keys(&mut p18, "*6123411230999926", t0);
+    assert!(
+        p18.out.iter().any(|o| matches!(o, Out::Audio(AudioCmd::Beeps { count: 1, on_ms: 2000, .. }))),
+        "invalid date 99/99 must produce error tone"
+    );
+    p18.out.clear();
+    keys(&mut p18, "11230112526", t0 + secs(1));
+    assert!(
+        p18.out.iter().any(|o| matches!(o, Out::Audio(AudioCmd::Beeps { count: 3, .. }))),
+        "valid date 11/25/26 must save with 3 confirmation beeps"
+    );
+}

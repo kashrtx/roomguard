@@ -9,7 +9,7 @@ pub mod voice;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::engine::types::SirenModel;
@@ -150,7 +150,7 @@ impl State {
 
     /// Sounds that matter if they're missed while the output reconnects.
     fn worth_replaying(c: &AudioCmd) -> bool {
-        matches!(c, AudioCmd::KeyBeep | AudioCmd::Beeps { .. } | AudioCmd::Chime(_) | AudioCmd::Tone { .. })
+        matches!(c, AudioCmd::KeyBeep | AudioCmd::Beeps { .. } | AudioCmd::Chime(_) | AudioCmd::Tone { .. } | AudioCmd::Speak(_))
     }
 
     fn replay(&self) -> Vec<AudioCmd> {
@@ -162,18 +162,57 @@ impl State {
 }
 
 fn run(rx: Receiver<AudioCmd>, ok: Arc<AtomicBool>) {
+    // Keep the command forwarder responsive so keypress beeps reach the
+    // real-time callback immediately without contending with background work.
+    util::set_thread_priority(util::prio::PANEL);
+
+    // Watch for OS default-device changes (e.g. speakers -> headphones) on a
+    // separate low-priority thread. On Windows WASAPI, querying the default
+    // MMDevice endpoint can block 40-150 ms; isolating it here guarantees
+    // device polling NEVER stalls a KeyBeep on the hot forwarding path.
+    let active_device: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let switch_flag = Arc::new(AtomicBool::new(false));
+    let stop_watch = Arc::new(AtomicBool::new(false));
+    {
+        let active2 = active_device.clone();
+        let switch2 = switch_flag.clone();
+        let stop2 = stop_watch.clone();
+        let _ = std::thread::Builder::new().name("audio-watch".into()).spawn(move || {
+            util::set_thread_priority(util::prio::BACKGROUND);
+            while !stop2.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(1200));
+                if stop2.load(Ordering::Relaxed) {
+                    break;
+                }
+                let cur = active2.lock().ok().and_then(|g| g.clone());
+                if let Some(using) = cur {
+                    if let Some(now_default) = default_output_name() {
+                        if using != now_default {
+                            util::log(&format!("sound output switched to {}", now_default));
+                            switch2.store(true, Ordering::Release);
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     let mut state = State::default();
     let mut logged = false;
-    // A beep asked for while the output was being rebuilt (Windows resets it
-    // when the device changes or wakes up). It still plays if it's fresh.
-    let mut pending: Option<(AudioCmd, Instant)> = None;
+    // Short burst commands asked for while the output was rebuilding (Windows
+    // resets it when a device changes or wakes up). Replayed if still fresh.
+    let mut pending: Vec<(AudioCmd, Instant)> = Vec::new();
     let mut backoff = Duration::from_millis(100);
     loop {
+        switch_flag.store(false, Ordering::Relaxed);
         let failed = Arc::new(AtomicBool::new(false));
         let (itx, irx) = mpsc::channel::<AudioCmd>();
         let built = build_stream(irx, failed.clone());
         // Which output this stream plays into, to notice a switch.
         let using = built.as_ref().ok().and_then(|(_, name)| name.clone());
+        if let Ok(mut g) = active_device.lock() {
+            *g = using.clone();
+        }
         let stream = built.map(|(s, _)| s);
         match &stream {
             Ok(_) => {
@@ -186,8 +225,8 @@ fn run(rx: Receiver<AudioCmd>, ok: Arc<AtomicBool>) {
                 for c in state.replay() {
                     let _ = itx.send(c);
                 }
-                if let Some((c, at)) = pending.take() {
-                    if at.elapsed() < Duration::from_millis(600) {
+                for (c, at) in pending.drain(..) {
+                    if at.elapsed() < Duration::from_millis(700) {
                         let _ = itx.send(c);
                     }
                 }
@@ -200,45 +239,56 @@ fn run(rx: Receiver<AudioCmd>, ok: Arc<AtomicBool>) {
                 }
             }
         }
-        let mut checked = Instant::now();
         let mut switched = false;
         loop {
-            match rx.recv_timeout(Duration::from_millis(200)) {
+            match rx.recv_timeout(Duration::from_millis(150)) {
                 Ok(cmd) => {
                     state.remember(&cmd);
                     let alive = stream.is_ok() && !failed.load(Ordering::Relaxed);
                     if alive {
                         let _ = itx.send(cmd);
                     } else if State::worth_replaying(&cmd) {
-                        pending = Some((cmd, Instant::now()));
+                        if pending.len() >= 4 {
+                            pending.remove(0);
+                        }
+                        pending.push((cmd, Instant::now()));
+                    }
+                    // Drain any commands queued back-to-back in the same turn
+                    // (e.g. KeyBeep + Tone + Speak) without looping timeout.
+                    while let Ok(more) = rx.try_recv() {
+                        state.remember(&more);
+                        if alive {
+                            let _ = itx.send(more);
+                        } else if State::worth_replaying(&more) {
+                            if pending.len() >= 4 {
+                                pending.remove(0);
+                            }
+                            pending.push((more, Instant::now()));
+                        }
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => return,
+                Err(RecvTimeoutError::Disconnected) => {
+                    stop_watch.store(true, Ordering::Relaxed);
+                    return;
+                }
             }
             if stream.is_err() || failed.load(Ordering::Relaxed) {
                 break;
             }
-            // A stream stays on the device it opened. Pick another output
-            // (speakers to headphones, say) while the old one is still plugged
-            // in and nothing fails, so RoomGuard would keep playing into the old
-            // one and you'd hear nothing. It follows the system's output instead.
-            if using.is_some() && checked.elapsed() >= Duration::from_secs(1) {
-                checked = Instant::now();
-                if let Some(now_default) = default_output_name() {
-                    if using.as_deref() != Some(now_default.as_str()) {
-                        util::log(&format!("sound output switched to {}", now_default));
-                        switched = true;
-                        break;
-                    }
-                }
+            if switch_flag.swap(false, Ordering::Acquire) {
+                switched = true;
+                break;
             }
+        }
+        if let Ok(mut g) = active_device.lock() {
+            *g = None;
         }
         drop(stream);
         ok.store(false, Ordering::Relaxed);
         // Reconnect fast. A device that's just waking up is usually back in a
         // moment, and a waiting beep gets the quickest retry of all.
-        let wait = if switched || pending.is_some() { Duration::from_millis(50) } else { backoff };
+        let wait = if switched || !pending.is_empty() { Duration::from_millis(50) } else { backoff };
         std::thread::sleep(wait);
         backoff = if switched { Duration::from_millis(100) } else { (backoff * 2).min(Duration::from_millis(1500)) };
     }

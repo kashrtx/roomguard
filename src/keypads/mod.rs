@@ -174,7 +174,7 @@ impl KeyInput {
 
     /// Typing on the computer keyboard presses keypad keys, as long as no
     /// text box has focus. Returns true if any keypad key was pressed.
-    pub fn keyboard(&mut self, ctx: &egui::Context, engine: &EngineHandle, model: Model) -> bool {
+    pub fn keyboard(&mut self, ctx: &egui::Context, engine: &EngineHandle, audio: &AudioHandle, model: Model) -> bool {
         if ctx.memory(|m| m.focused().is_some()) {
             return false;
         }
@@ -229,6 +229,10 @@ impl KeyInput {
                 }
                 _ => {}
             }
+        }
+        if any && now - self.last_wake > 1.5 {
+            self.last_wake = now;
+            audio.send(AudioCmd::Wake);
         }
         any
     }
