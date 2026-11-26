@@ -367,6 +367,18 @@ pub struct EventRow {
     pub ts: i64,
     pub kind: EvKind,
     pub text: String,
+    /// Contact ID event code (e.g. 401, 130, 625) for the VISTA-20P #60 event log.
+    #[serde(default)]
+    pub cid: u16,
+    /// Contact ID qualifier ('E' = new event / opening, 'R' = restore / closing).
+    #[serde(default)]
+    pub qual: char,
+    /// Zone or user number associated with the event (0 for system events).
+    #[serde(default)]
+    pub zu: u16,
+    /// True if `zu` is a user number ('U'), false if a zone ('Z').
+    #[serde(default)]
+    pub is_user: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

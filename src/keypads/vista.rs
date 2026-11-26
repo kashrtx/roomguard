@@ -138,7 +138,7 @@ pub fn draw(
         Some(Stroke::new(0.9_f32, dim(Color32::from_rgb(0xB2, 0xAF, 0xA8), l))),
     );
     let lcd = bezel.shrink2(Vec2::new(xf.s(5.0), xf.s(5.0)));
-    draw_lcd(&p, &xf, lcd, &view.lcd, bl, view.contrast, l, view.all_on);
+    draw_lcd(&p, &xf, lcd, &view.lcd, view.lcd_cursor, bl, view.contrast, l, t, view.all_on);
 
     // 8. Lower-right keypad bay (always draw keys underneath; closed cover masks numeric keys)
     let keys_interactive = open > 0.45;
@@ -246,7 +246,19 @@ fn draw_oval_led(p: &Painter, xf: &Xf, x: f32, y: f32, label: &str, state: Led, 
     }
 }
 
-fn draw_lcd(p: &Painter, xf: &Xf, lcd: Rect, lines: &[String; 2], bl: f32, contrast: f32, l: f32, all_on: bool) {
+#[allow(clippy::too_many_arguments)]
+fn draw_lcd(
+    p: &Painter,
+    xf: &Xf,
+    lcd: Rect,
+    lines: &[String; 2],
+    cursor: Option<(usize, usize)>,
+    bl: f32,
+    contrast: f32,
+    l: f32,
+    t: f64,
+    all_on: bool,
+) {
     let bg_lit = Color32::from_rgb(0x6D, 0xC6, 0x2A);
     let bg_dark = dim(Color32::from_rgb(0x4E, 0x69, 0x3E), l.max(0.22));
     let bg_top = mix(bg_dark, Color32::from_rgb(0x7B, 0xD6, 0x34), bl);
@@ -267,6 +279,7 @@ fn draw_lcd(p: &Painter, xf: &Xf, lcd: Rect, lines: &[String; 2], bl: f32, contr
     let row_h = inner.height() / 2.0;
     let dot_w = (cell_w * 0.82) / 5.0;
     let dot_h = (row_h * 0.80) / 7.0;
+    let blink_on = (t * 2.0) as u64 % 2 == 0;
 
     for (row, text) in lines.iter().enumerate() {
         let chars: Vec<char> = text.chars().take(16).collect();
@@ -291,6 +304,14 @@ fn draw_lcd(p: &Painter, xf: &Xf, lcd: Rect, lines: &[String; 2], bl: f32, contr
                         p.rect_filled(r, 0.0, ink_ghost);
                     }
                 }
+            }
+            // Authentic HD44780 blinking underline cursor for Time/Date, Schedule, and Macro editing
+            if blink_on && cursor == Some((row, col)) {
+                let cur = Rect::from_min_size(
+                    Pos2::new(ox, oy + 7.2 * dot_h),
+                    Vec2::new(dot_w * 5.0 - 0.5, (dot_h * 0.85).max(1.1)),
+                );
+                p.rect_filled(cur, 0.0, ink_on);
             }
         }
     }

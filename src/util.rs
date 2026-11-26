@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use chrono::{Datelike, Timelike};
+use chrono::{Datelike, TimeZone, Timelike};
 
 static LOG: Mutex<Option<std::fs::File>> = Mutex::new(None);
 static BACKED_UP: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
@@ -449,4 +449,52 @@ pub fn offset_to_time(now_ms: i64, hour: u32, minute: u32) -> i64 {
         d += 86_400;
     }
     d * 1000
+}
+
+/// Day of week index matching VISTA-20P SMTWTFS order (0=Sun .. 6=Sat).
+pub fn weekday_idx(ms: i64) -> u8 {
+    local(ms).weekday().num_days_from_sunday() as u8
+}
+
+/// 3-letter uppercase weekday matching the 6160V TIME/DATE display.
+pub fn weekday_abbr(ms: i64) -> &'static str {
+    match weekday_idx(ms) {
+        0 => "SUN",
+        1 => "MON",
+        2 => "TUE",
+        3 => "WED",
+        4 => "THU",
+        5 => "FRI",
+        _ => "SAT",
+    }
+}
+
+/// Authentic VISTA-20P 6160V Time/Date display lines:
+/// Line 1: `TIME/DATE   THU`
+/// Line 2: `10:12PM 07/11/19`
+pub fn fmt_vista_time_date(ms: i64) -> (String, String) {
+    let p = parts(ms);
+    let (h12, ampm) = match p.hour {
+        0 => (12, "AM"),
+        1..=11 => (p.hour, "AM"),
+        12 => (12, "PM"),
+        _ => (p.hour - 12, "PM"),
+    };
+    let l1 = format!("TIME/DATE   {}", weekday_abbr(ms));
+    let l2 = format!("{:02}:{:02}{} {:02}/{:02}/{:02}", h12, p.minute, ampm, p.month, p.day, p.year.rem_euclid(100));
+    (l1, l2)
+}
+
+/// Authentic VISTA-20P `#60` Event Log timestamp line: `12:34AM 01/02/00`.
+pub fn fmt_vista_event_time(ms: i64) -> String {
+    fmt_vista_time_date(ms).1
+}
+
+/// How far to shift the panel clock so it reads the exact local date and time right now.
+/// Returns `None` if the calendar date or time is invalid (e.g. Feb 30).
+pub fn offset_to_datetime(now_ms: i64, year: i32, month: u32, day: u32, hour24: u32, minute: u32) -> Option<i64> {
+    let date = chrono::NaiveDate::from_ymd_opt(year, month, day)?;
+    let dt = date.and_hms_opt(hour24, minute, 0)?;
+    let local_dt = chrono::Local.from_local_datetime(&dt).earliest()?;
+    Some(local_dt.timestamp_millis() - now_ms)
 }

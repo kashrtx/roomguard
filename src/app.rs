@@ -64,7 +64,7 @@ pub fn prepare_demo_data() {
         (5_400_000, EvKind::Camera, "Door opened (seen by the camera)"),
         (5_390_000, EvKind::Camera, "Door closed (seen by the camera)"),
     ] {
-        panel.events.push(EventRow { ts: now - ago, kind, text: text.to_string() });
+        panel.events.push(EventRow { ts: now - ago, kind, text: text.to_string(), cid: 0, qual: '\0', zu: 0, is_user: false });
     }
     util::save_json(&dir.join("panel-pc1832.json"), &panel);
     let chat = vec![

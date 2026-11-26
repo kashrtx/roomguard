@@ -949,10 +949,55 @@ pub fn ui(ui: &mut egui::Ui, prog: &ProgView, armed: bool, engine: &EngineHandle
             if ui.checkbox(&mut eerr, "Send exit error report code to monitoring  (*59)").changed() {
                 engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: "59".into(), value: if eerr { "1" } else { "0" }.into() }));
             }
-            let mut cd = read_entry(&raw_val(prog, "197"), 0, 1, 0) != 0;
-            if ui.checkbox(&mut cd, "Show live exit delay seconds countdown on LCD  (*197)").changed() {
-                engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: "197".into(), value: if cd { "1" } else { "0" }.into() }));
+            let mut cd = read_entry(&raw_val(prog, "197"), 0, 1, 0);
+            ui.horizontal(|ui| {
+                ui.label("Exit countdown display interval  (*197)");
+                if ui.add(egui::DragValue::new(&mut cd).range(0..=5).suffix(" s")).changed() {
+                    engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: "197".into(), value: format!("{}", cd) }));
+                }
+                ui.label(theme::muted(if cd == 0 { "0 = 'You may exit now'" } else { "1-5 s refresh step" }));
+            });
+            let mut part_disp = read_entry(&raw_val(prog, "198"), 0, 1, 0) != 0;
+            if ui.checkbox(&mut part_disp, "Show partition number prefix on idle LCD  (*198)").changed() {
+                engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: "198".into(), value: if part_disp { "1" } else { "0" }.into() }));
             }
+            let mut cbz = read_entry(&raw_val(prog, "26"), 0, 1, 0) != 0;
+            if ui.checkbox(&mut cbz, "Chime by zone using Zone List 03  (*26)").changed() {
+                engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: "26".into(), value: if cbz { "1" } else { "0" }.into() }));
+            }
+            // Function Key D (*57 entry 3) quick selector
+            let raw57 = raw_val(prog, "57");
+            let cur_d = raw57.get(6..8).unwrap_or("03");
+            const VISTA_FN_CHOICES: &[(&str, &str)] = &[
+                ("00", "00 Default (Paging)"),
+                ("01", "01 Paging (999-9999)"),
+                ("02", "02 Display Time/Date"),
+                ("03", "03 Arm AWAY"),
+                ("04", "04 Arm STAY"),
+                ("05", "05 Arm NIGHT-STAY"),
+                ("06", "06 Step Arming"),
+                ("07", "07 Output Device Toggle"),
+                ("08", "08 Comm Test (CID 601)"),
+                ("09", "09 Macro 1"),
+                ("10", "10 Macro 2"),
+                ("11", "11 Macro 3"),
+                ("12", "12 Macro 4"),
+            ];
+            let cur_d_lbl = VISTA_FN_CHOICES.iter().find(|(c, _)| *c == cur_d).map(|(_, l)| *l).unwrap_or(cur_d);
+            ui.horizontal(|ui| {
+                ui.label("Function key D hold action  (*57)");
+                egui::ComboBox::from_id_salt("vista-fn-d")
+                    .selected_text(cur_d_lbl)
+                    .width(190.0)
+                    .show_ui(ui, |ui| {
+                        for &(code_str, label) in VISTA_FN_CHOICES {
+                            if ui.selectable_label(cur_d == code_str, label).clicked() {
+                                let next = replace_entry_str(&raw57, 4, 2, 3, code_str);
+                                engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: "57".into(), value: next }));
+                            }
+                        }
+                    });
+            });
         } else {
             let mut audible_exit = toggle_on(prog, "34", 1);
             if ui.checkbox(&mut audible_exit, "Audible exit delay with urgency beeps  ([34] opt 1)").changed() {

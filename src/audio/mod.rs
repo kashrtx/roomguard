@@ -80,6 +80,9 @@ pub enum AudioCmd {
     Preview { model: SirenModel, warble: bool, ms: u32 },
     /// One pitched keypad beep, e.g. the Vista's low 1019 Hz confirmation.
     Tone { hz: u16, on_ms: u16, off_ms: u16, delay_ms: u16 },
+    /// A run of pitched beeps (hz, on, off) after a pause: the 6160's low
+    /// "tu-tu-tu" when it arms STAY, NIGHT-STAY or INSTANT.
+    ToneSeq { delay_ms: u16, tones: Vec<(u16, u16, u16)> },
     Silence,
     /// The pointer is near the keypad: make sure the output is awake.
     Wake,
@@ -150,7 +153,7 @@ impl State {
 
     /// Sounds that matter if they're missed while the output reconnects.
     fn worth_replaying(c: &AudioCmd) -> bool {
-        matches!(c, AudioCmd::KeyBeep | AudioCmd::Beeps { .. } | AudioCmd::Chime(_) | AudioCmd::Tone { .. } | AudioCmd::Speak(_))
+        matches!(c, AudioCmd::KeyBeep | AudioCmd::Beeps { .. } | AudioCmd::Chime(_) | AudioCmd::Tone { .. } | AudioCmd::ToneSeq { .. } | AudioCmd::Speak(_))
     }
 
     fn replay(&self) -> Vec<AudioCmd> {

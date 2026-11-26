@@ -180,9 +180,12 @@ pub const VISTA20P: &[Spec] = &[
     Spec { key: "81", name: "Night-Stay Zones (List 05)", kind: d(8, 1), default: "00000000" },
     Spec { key: "84", name: "Auto-Stay Arming", kind: d(1, 1), default: "3" },
     Spec { key: "86", name: "Cancel Verify Display", kind: d(1, 1), default: "1" },
+    Spec { key: "90", name: "Event Log Enables", kind: d(1, 2), default: "15" },
     Spec { key: "91", name: "Option Selection", kind: d(1, 1), default: "8" },
     Spec { key: "93", name: "Reports In Armed Period", kind: d(1, 1), default: "1" },
     Spec { key: "197", name: "Exit Time Display Interval", kind: d(1, 1), default: "0" },
+    Spec { key: "198", name: "Display Partition Number", kind: d(1, 1), default: "0" },
+    Spec { key: "chime_list", name: "Chime By Zone (List 03)", kind: d(8, 1), default: "10110010" },
     Spec { key: "resp", name: "Zone Response Times (0-3)", kind: d(8, 1), default: "11111111" },
     Spec { key: "97", name: "Reset Factory Defaults", kind: Kind::Action, default: "" },
     Spec { key: "98", name: "Exit Programming (Lockout)", kind: Kind::Action, default: "" },
@@ -619,6 +622,6 @@ pub fn is_master(model: Model, ee: &Eeprom, slot: &str) -> bool {
     match model {
         Model::Pc1550 => slot == "1" || slot == "m2",
         Model::Pc1832 => slot == "40" || (ee.attrs(slot) & 1) != 0,
-        Model::Vista20p => slot == "02",
+        Model::Vista20p => slot == "02" || (ee.attrs(slot) & 0x07) == 4,
     }
 }

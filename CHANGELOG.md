@@ -5,30 +5,44 @@ each version onto its GitHub release page.
 
 ## [2.2.0] - 2026-11-26
 
-RoomGuard 2.2.0 adds intuitive multi-zone drawing directly on both the **Room map** and **Live** camera views, runs a fresh empty-room calibration on every launch with clear on-screen guidance, embeds native app icons on Windows, macOS, and Linux builds, and fixes false zone-bypass indicators and unexpected instant alarms.
+RoomGuard 2.2.0 brings wire-level panel accuracy across all three emulated keypads, a rebuilt VG6160V voice bank with real keypad recordings and uniform loudness, full VistaGuard 20P advanced keypad functions (clock, event log, schedules, macros, outputs, and message center), multi-zone drawing on both the Room map and Live camera views, automatic fresh empty-room calibration on every launch, and native platform app icons.
 
-### Highlights & New Features
+### Voice Keypad & VistaGuard 20P Upgrades
+
+- **Rebuilt VG6160V Voice Bank & Loudness Equalization:**
+  - Keeps 8 real keypad voice words (`disarmed`, `not ready to arm`, `ready to arm`, `exit now`, `armed`, `stay`, `away`, `fire`) alongside pitch-matched, band-limited generated vocabulary so mixed phrases sound like the same speaker.
+  - Perceptual loudness equalization balances all 76 voice ROM words within 0.6 dB so every word ("Armed", "Instant", "Stay", "Away", zone names) plays at uniform volume.
+  - Added the authentic low 1019 Hz `tu-tu-tu` arming confirmation cadence for Stay, Night-Stay, and Instant modes, full arming start and completion voice announcements (including `exit now` only when leaving), and keypress sounder ducking so typing a code never overlaps with countdown beeps.
+  - Authentic bypass voice behavior: quiet confirmation beep only during bypass entry, `"disarmed, bypassed"` / `"armed <mode>, zone bypassed"` on status and arming (only for manual bypasses, never Stay auto-bypass), and silent voice chime on bypassed zones.
+- **Full VistaGuard 20P Keypad Features & Bus Accuracy:**
+  - Added `[Master] + # + 63` Real-Time Clock view and edit with blinking HD44780 underline cursor, plus `*57` function key option `02` (one-touch Time/Date display), `07` (Output toggle), and `09`-`12` (Macro keys).
+  - Added `[Master] + # + 60` 100-Event Contact ID History Log viewer (`*` older, `#` newer, `*90` event log filter), `# + 64` live schedules, `# + 66` 4-slot macro programming, `# + 7` / `# + 8` output device control (`01`-`18`), Voice Message Center (`# + 0 + 1` record, `1` stop, `# + 0 + 3` play with steady/flashing `MSG` LED), user attributes and authority levels 0-4 (Arm-Only, Guest, Duress CID 121, Partition Master), dialer test (`PHONE OKAY` / `COMM. FAILURE`), `[Code] + 6 + 00` bypass clear, `# + 3 + 3` quick Night-Stay, `*197` exit countdown interval, `*198` partition display, GoTo Partition, `*26` Chime by Zone, and double-`*` fault announcements.
+  - Multi-condition LCD cycling rotates latched Alarm Memory with Disarmed every 2.5 s until the second `[Code] + 1`, cycles multiple simultaneous troubles (`AC LOSS`, `SYSTEM LO BAT`, `BELL FAILURE`, `COMM. FAILURE`, `CHECK XX`), and reports Exit Error (`0xEA` / CID 374) and authentic closing Contact ID codes (`401`, `403`, `408`, `441`, `459`).
+
+### RmG Classic (PC1550) & GuardSeries (PC1832 / PK5500) Wire-Level Accuracy
+
+- **GuardSeries PC1832 / PK5500:**
+  - Implemented exact wire status screens across normal, arming, and menu states: `System Ready / Force Arm` (`0x02`), distinct `Armed Stay / No Entry Delay` (`0x06`) and `Armed Away / No Entry Delay` (`0x16`), `Arming / No Entry Delay` (`0x09`), continuous `Quick Exit in / Progress` (`0x0B`), `Entry Delay / After Alarm` (`0x0D`) with immediate pulsing urgency tone, `Invalid / Access Code` (`0x8F`), `Function Not / Available` (`0x0E`/`0x8E`), `Command O/P` active display (`0x33`), and confirmation banners for Door Chime, Auto-Arm, and Stay/Away reactivation.
+  - Armed `*` menu (`0xB8`) filters to the 6 armed-valid functions only.
+  - Implemented Keypad Blanking (`[016]` options 3 & 4: blanks LCD, backlight, and LEDs after 30 s idle, flashing Trouble when present, with optional access-code wake) and 6-digit access codes (`[701]` option 5, seamlessly matching legacy 4-digit codes with trailing `00`).
+  - Idle scroll now includes `Bypass Active / (*1) to View`, armed scroll honors `[016]` option 7, and armed Trouble LED honors `[013]` option 3.
+- **RmG Classic PC1550 / PC1500RK:**
+  - Immediate prompt LED feedback on `*5`/`*6`/`*8` (Memory + Bypass + Trouble flashing), `*1` (Bypass flashing), and `*9` (Armed flashing), armed Memory/Fire trouble LED accuracy, clock trouble clearing on `*6`, and measured 100 ms key beep timing.
+
+### Multi-Zone Drawing, Calibration & Platform Polish
 
 - **Intuitive Multi-Zone Drawing (Map & Live Views):**
-  - Draw, redraw, or remove any active panel zone (`Z01`–`Z06` on PC1550; `Z01`–`Z08` on PC1832 and VistaGuard 20P) directly on either the **Room map** or **Live** camera view using the color-coded zone picker, one-click **Draw** / **Redraw** buttons in the **Zones** sidebar, or by assigning learned map portals to any zone.
-  - Each drawn zone gets a distinct color pill on the video/map, an interactive chip with one-click redraw and remove (`×`), and a per-zone **Contact / Motion** toggle so doors and windows can watch open/closed visual state while interior areas watch people and motion.
-  - Pressing `Escape` cancels an active drag-to-draw cleanly without sending `#` to the keypad.
+  - Draw, redraw, or remove any active panel zone (`Z01`-`Z06` on PC1550; `Z01`-`Z08` on PC1832 and VistaGuard 20P) directly on either the **Room map** or **Live** camera view with per-zone **Contact / Motion** monitoring and clean `Escape` cancel.
 - **Fresh Calibration Every Launch:**
-  - RoomGuard no longer reuses stale empty-room baselines from previous sessions — every launch (and every webcam switch) begins a fresh calibration automatically once streaming while disarmed, locking today's room layout, new or moved objects, lighting, and closed contacts for every contact-enabled zone.
-  - Clear, prominent calibration banners and video overlays explain why calibration is needed and guide you through stepping out of view, with quick **Restart 5s**, **Skip for now**, and **Recalibrate** controls.
+  - Every launch and camera switch runs a guided 5-second empty-room calibration automatically once streaming while disarmed, with **Restart 5s**, **Skip for now**, and **Recalibrate** controls.
 - **Native App Icons on Every Platform:**
-  - **Windows:** Rebuilt `assets/icon/icon.ico` with standard 32-bit BGRA DIB frames (16–128 px) plus 256 px PNG, and replaced external `rc.exe`/`windres.exe` calls with a zero-dependency pure-Rust COFF `.rsrc` resource embedder in `build.rs` so the executable icon and `VS_VERSIONINFO` metadata embed reliably on every toolchain and path.
-  - **macOS:** Rebuilt `assets/icon/icon.icns` with all standard sizes (`icp4`–`ic14`), updated `Info.plist`, and fixed the release `.dmg` staging so `RoomGuard.app` (with volume icon and `/Applications` shortcut) mounts cleanly.
-  - **Linux:** Added desktop launcher & `256×256` hicolor icon installation, `StartupWMClass=roomguard` window matching, and `gio` custom-icon metadata support.
+  - Pure-Rust COFF `.rsrc` icon and version metadata embedding on Windows (`build.rs`), rebuilt multi-size `.icns` and clean `.dmg` staging on macOS, and desktop launcher/icon integration on Linux.
 
 ### Bug Fixes
 
-- **Fixed false "Zone Bypassed" display in Stay / Auto-Stay mode:** Automatic Stay-mode interior bypasses are now distinguished from manual user bypasses — VistaGuard 20P displays `** ALL SECURE **` instead of falsely flashing `ZONE BYPASSED`, and the Zones sidebar clearly shows `Stay off` instead of `Bypassed` unless you explicitly bypassed a zone.
-- **Fixed unexpected instant alarms:**
-  - Fixed a lighting-change bug in the vision limb check that could treat the entire room as active motion when brightness shifted, and tightened limb checks to require confirmed (`Normal`+) detections while excluding people still inside the doorway or seated in an Ignore desk box from prematurely tripping Zone 2.
-  - Added Delay-first zone settling with an anti-race hold in the engine so walking through a doorway never lets an Interior/Follower zone beat the Delay zone by a fraction of a second and fire a false instant alarm.
-  - Separated brief camera `fault` drops (trouble only) from true `tamper` alarms and fixed VistaGuard 20P exit-error handling so an open interior zone at exit expiry starts Entry Delay instead of an instant zero-delay alarm.
-  - Shortened camera zone release hold from `2.5s` to `1.0s` so exiting cleanly clears zones before exit delay ends.
+- **Fixed post-bell-cutoff Entry Delay across all panels:** Opening an Entry/Exit delay door after an earlier alarm's bell cut-off expired now starts Entry Delay After Alarm instead of firing an immediate burglary alarm, and swinger re-triggering works properly after bell cut-off.
+- **Fixed Stay / Away arming & false "Zone Bypassed" display:** Stay automatic interior bypasses are kept separate from manual user bypasses so VistaGuard 20P shows `** ALL SECURE **` unless you manually bypassed a zone, and Away arming behavior matches each panel's rules reliably.
+- **Fixed unexpected instant alarms & camera races:** Tightened limb checks against lighting shifts, added Delay-first zone settling to prevent Interior zones racing ahead of doorways, separated camera fault troubles from tamper alarms, and shortened camera zone release hold to 1.0 s.
 
 ## [2.1.0] - 2026-11-25
 

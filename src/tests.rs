@@ -1641,3 +1641,762 @@ fn icon_assets_have_valid_windows_dib_and_macos_chunks() {
         assert!(chunks.contains(want), "missing macOS ICNS chunk {:?}", std::str::from_utf8(want));
     }
 }
+
+#[test]
+fn vista_stay_and_instant_arm_with_the_low_tu_tu_tu() {
+    let t0 = Instant::now();
+    let tu_tu_tu = |p: &Panel| {
+        p.out.iter().any(|o| matches!(o, Out::Audio(AudioCmd::ToneSeq { tones, .. }) if tones.len() == 3 && tones.iter().all(|t| t.0 == 1019)))
+    };
+    for code in ["12343", "12347"] {
+        let mut p = panel(Model::Vista20p);
+        p.out.clear();
+        keys(&mut p, code, t0);
+        assert!(p.exit.is_some(), "{} arms", code);
+        assert!(tu_tu_tu(&p), "{} gives the low tu-tu-tu", code);
+        p.tick(t0 + secs(2), 0);
+        assert_eq!(p.sounder_sent, Pattern::Off, "{} counts down quietly", code);
+    }
+    // AWAY gets the exit beeps instead, with no tu-tu-tu.
+    let mut p = panel(Model::Vista20p);
+    p.out.clear();
+    keys(&mut p, "12342", t0);
+    assert!(p.exit.is_some());
+    assert!(!tu_tu_tu(&p), "AWAY has no tu-tu-tu");
+    p.tick(t0 + secs(2), 0);
+    assert!(matches!(p.sounder_sent, Pattern::Beeps { .. }), "AWAY beeps through its exit delay");
+}
+
+#[test]
+fn exit_expiry_supervisory_fault_does_not_false_alarm() {
+    let t0 = Instant::now();
+    // Brief camera disconnect (fault only, not open or tamper) at exit expiry
+    // must NOT start an audible exit-fault / burglary alarm.
+    let mut p = panel(Model::Vista20p);
+    keys(&mut p, "12342", t0);
+    assert!(p.exit.is_some());
+    p.set_zone(1, false, false, true, t0 + secs(5));
+    p.tick(t0 + secs(90), 0);
+    assert!(p.armed.is_some(), "panel should finish arming");
+    assert!(p.entry.is_none(), "supervisory fault alone must not trigger exit-fault entry delay");
+    assert!(p.alarms.is_empty(), "supervisory fault alone must not trigger burglary alarm");
+
+    // By contrast, a zone tamper at exit expiry must trigger a Tamper alarm immediately.
+    let mut p2 = panel(Model::Vista20p);
+    keys(&mut p2, "12342", t0);
+    p2.set_zone(1, false, true, false, t0 + secs(5));
+    p2.tick(t0 + secs(90), 0);
+    assert!(p2.alarms.iter().any(|a| a.kind == AlarmKind::Tamper), "tamper at exit expiry must trigger Tamper");
+}
+
+#[test]
+fn tone_seq_waits_before_voice_and_drains_interrupt_fade() {
+    use crate::audio::synth::Synth;
+    use crate::audio::KeypadVoice;
+    let sr = 48_000.0;
+    let mut s = Synth::new(sr);
+    s.apply(AudioCmd::Voice(KeypadVoice::Vista6160));
+    s.apply(AudioCmd::Volumes { master: 1.0, siren: 0.0, keypad: 1.0, line: 0.0 });
+    // Start speaking a real word and advance partway into voiced speech.
+    s.apply(AudioCmd::Speak(vec!["armed".into(), "stay".into()]));
+    let mut last = 0.0f32;
+    for _ in 0..8000 {
+        last = s.next();
+    }
+    // Interrupt mid-speech with a keypress + ToneSeq + new Speak (NIGHT-STAY).
+    s.apply(AudioCmd::KeyBeep);
+    s.apply(AudioCmd::ToneSeq { delay_ms: 550, tones: vec![(1019, 150, 50), (1019, 175, 75), (1019, 240, 500)] });
+    s.apply(AudioCmd::Speak(vec!["armed".into(), "stay".into()]));
+    // First 6 ms must drain the voice stop-fade immediately without a hard step.
+    let first_sample = s.next();
+    assert!((first_sample - last).abs() < 0.35, "unexpected hard click on voice interrupt: {} -> {}", last, first_sample);
+    // Advance past the 46+22 ms key beep + 550 ms delay + tu-tu-tu + 500 ms tail (~1.85 s),
+    // verifying voice actually speaks after ToneSeq completes.
+    for _ in 0..(sr as usize * 185 / 100) {
+        let _ = s.next();
+    }
+    let mut speech_peak = 0.0f32;
+    for _ in 0..(sr as usize / 2) {
+        speech_peak = speech_peak.max(s.next().abs());
+    }
+    assert!(speech_peak > 0.05, "expected spoken phrase after ToneSeq, peak={}", speech_peak);
+}
+
+#[test]
+fn voice_rom_equalizes_all_76_words_to_uniform_perceived_loudness() {
+    let rows = crate::audio::voice::audit_equalized_loudness();
+    assert_eq!(rows.len(), 76, "expected all 76 voice ROM words");
+    let armed = rows.iter().find(|r| r.0 == "armed").expect("armed token").2;
+    let stay = rows.iter().find(|r| r.0 == "stay").expect("stay token").2;
+    let away = rows.iter().find(|r| r.0 == "away").expect("away token").2;
+    let instant = rows.iter().find(|r| r.0 == "instant").expect("instant token");
+    let exit_now = rows.iter().find(|r| r.0 == "exit_now").expect("exit_now token").2;
+    assert!((armed - stay).abs() / stay < 0.03, "armed ({}) should match stay ({})", armed, stay);
+    assert!((armed - away).abs() / away < 0.03, "armed ({}) should match away ({})", armed, away);
+    assert!((armed - instant.2).abs() / instant.2 < 0.03, "armed ({}) should match instant ({})", armed, instant.2);
+    assert!(instant.1 < 0.85, "instant sharp syllable must be attenuated (gain={})", instant.1);
+    assert!((armed - exit_now).abs() / exit_now < 0.03, "armed ({}) should match exit_now ({})", armed, exit_now);
+    let min_l = rows.iter().map(|r| r.2).fold(f32::MAX, f32::min);
+    let max_l = rows.iter().map(|r| r.2).fold(0.0f32, f32::max);
+    let spread_db = 20.0 * (max_l / min_l.max(1e-6)).log10();
+    assert!(spread_db < 0.6, "all 76 equalized words must be within 0.6 dB spread (got {:.2} dB)", spread_db);
+}
+
+#[test]
+fn keypress_ducks_exit_and_entry_countdown_beeps_without_overlap() {
+    use crate::audio::synth::Synth;
+    use crate::audio::KeypadVoice;
+    let sr = 48_000.0;
+    let mut s = Synth::new(sr);
+    s.apply(AudioCmd::Voice(KeypadVoice::Vista6160));
+    s.apply(AudioCmd::Volumes { master: 1.0, siren: 0.0, keypad: 1.0, line: 0.0 });
+    // Start active exit countdown beeps (500ms on / 510ms off).
+    s.apply(AudioCmd::Sounder(Pattern::Beeps { on_ms: 500, off_ms: 0, count: 1, period_ms: 1010 }));
+    for _ in 0..4800 {
+        let _ = s.next();
+    }
+    // User presses first digit of disarm code during countdown:
+    s.apply(AudioCmd::KeyBeep);
+    // Advance past the 46ms + 22ms key chirp (~100ms).
+    for _ in 0..4800 {
+        let _ = s.next();
+    }
+    // For the next 1.2 seconds while typing the remaining digits, exit beeps must stay quiet!
+    let mut ducked_peak = 0.0f32;
+    for _ in 0..(sr as usize * 12 / 10) {
+        ducked_peak = ducked_peak.max(s.next().abs());
+    }
+    assert!(ducked_peak < 0.02, "exit countdown must stay quiet while entering code (peak={})", ducked_peak);
+    // If the user stops typing without disarming, exit beeps resume after the ~1.8s duck window.
+    for _ in 0..(sr as usize) {
+        let _ = s.next();
+    }
+    let mut resumed_peak = 0.0f32;
+    for _ in 0..(sr as usize * 12 / 10) {
+        resumed_peak = resumed_peak.max(s.next().abs());
+    }
+    assert!(resumed_peak > 0.05, "exit countdown should resume if user stops typing (peak={})", resumed_peak);
+}
+
+#[test]
+fn vista_announces_all_arming_modes_at_start_and_completion() {
+    let speaks = |p: &Panel| -> Vec<Vec<String>> {
+        p.out
+            .iter()
+            .filter_map(|o| match o {
+                Out::Audio(AudioCmd::Speak(toks)) => Some(toks.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    let t0 = Instant::now();
+
+    // 1. AWAY with door exit: "Armed away, exit now" during exit -> "Armed away" at t=0.
+    let mut p = panel(Model::Vista20p);
+    p.out.clear();
+    keys(&mut p, "12342", t0);
+    p.tick(t0 + secs(3), 0);
+    assert!(speaks(&p).contains(&vec!["armed".into(), "away".into(), "exit_now".into()]), "AWAY exit voice");
+    p.set_zone(1, true, false, false, t0 + secs(5));
+    p.set_zone(1, false, false, false, t0 + secs(8));
+    p.out.clear();
+    p.tick(t0 + secs(65), 0);
+    assert_eq!(p.armed.map(|a| a.mode), Some(ArmMode::Away));
+    assert!(speaks(&p).contains(&vec!["armed".into(), "away".into()]), "AWAY completion voice");
+
+    // 2. AWAY without door exit (*84 Auto-Stay): finishes as STAY and announces "Armed stay".
+    let mut p2 = panel(Model::Vista20p);
+    keys(&mut p2, "12342", t0);
+    p2.tick(t0 + secs(3), 0);
+    p2.out.clear();
+    p2.tick(t0 + secs(65), 0);
+    assert_eq!(p2.armed.map(|a| a.mode), Some(ArmMode::Stay));
+    assert!(speaks(&p2).contains(&vec!["armed".into(), "stay".into()]), "Auto-Stay completion voice");
+
+    // 3. STAY: "Armed stay" at start (no exit_now) -> "Armed stay" at completion.
+    let mut p3 = panel(Model::Vista20p);
+    p3.out.clear();
+    keys(&mut p3, "12343", t0);
+    assert!(speaks(&p3).contains(&vec!["armed".into(), "stay".into()]), "STAY start voice");
+    assert!(!speaks(&p3).iter().any(|v| v.contains(&"exit_now".to_string())), "STAY must not say exit_now");
+    p3.out.clear();
+    p3.tick(t0 + secs(65), 0);
+    assert!(speaks(&p3).contains(&vec!["armed".into(), "stay".into()]), "STAY completion voice");
+
+    // 4. NIGHT-STAY: "Armed night stay" at start AND at completion AND on # + 0 + * status.
+    let mut p4 = panel(Model::Vista20p);
+    p4.out.clear();
+    keys(&mut p4, "123433", t0);
+    assert!(speaks(&p4).contains(&vec!["armed".into(), "night".into(), "stay".into()]), "NIGHT-STAY start voice");
+    p4.out.clear();
+    p4.tick(t0 + secs(65), 0);
+    assert!(speaks(&p4).contains(&vec!["armed".into(), "night".into(), "stay".into()]), "NIGHT-STAY completion voice");
+    p4.out.clear();
+    keys(&mut p4, "#0*", t0 + secs(70));
+    assert!(speaks(&p4).contains(&vec!["armed".into(), "night".into(), "stay".into()]), "NIGHT-STAY status voice");
+
+    // 5. INSTANT: "Armed stay instant" at start (no exit_now) -> "Armed stay instant" at completion.
+    let mut p5 = panel(Model::Vista20p);
+    p5.out.clear();
+    keys(&mut p5, "12347", t0);
+    assert!(speaks(&p5).contains(&vec!["armed".into(), "stay".into(), "instant".into()]), "INSTANT start voice");
+    assert!(!speaks(&p5).iter().any(|v| v.contains(&"exit_now".to_string())), "INSTANT must not say exit_now");
+    p5.out.clear();
+    p5.tick(t0 + secs(65), 0);
+    assert!(speaks(&p5).contains(&vec!["armed".into(), "stay".into(), "instant".into()]), "INSTANT completion voice");
+
+    // 6. MAXIMUM with door exit: "Armed maximum, exit now" during exit -> "Armed maximum" at completion.
+    let mut p6 = panel(Model::Vista20p);
+    p6.out.clear();
+    keys(&mut p6, "12344", t0);
+    p6.tick(t0 + secs(3), 0);
+    assert!(speaks(&p6).contains(&vec!["armed".into(), "maximum".into(), "exit_now".into()]), "MAXIMUM exit voice");
+    p6.set_zone(1, true, false, false, t0 + secs(5));
+    p6.set_zone(1, false, false, false, t0 + secs(8));
+    p6.out.clear();
+    p6.tick(t0 + secs(65), 0);
+    assert!(speaks(&p6).contains(&vec!["armed".into(), "maximum".into()]), "MAXIMUM completion voice");
+}
+
+#[test]
+fn vista_6160v_bypass_voice_is_silent_on_entry_and_speaks_on_status_and_arming() {
+    let speaks = |p: &Panel| -> Vec<Vec<String>> {
+        p.out
+            .iter()
+            .filter_map(|o| match o {
+                Out::Audio(AudioCmd::Speak(toks)) => Some(toks.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    let t0 = Instant::now();
+    let mut p = panel(Model::Vista20p);
+    p.chime = true;
+
+    // 1. Bypassing zone 03 emits confirmation beep ONLY — NO spoken words!
+    p.out.clear();
+    keys(&mut p, "1234603", t0);
+    assert!(p.zones[2].bypassed && !p.zones[2].auto_bypass);
+    assert!(speaks(&p).is_empty(), "6160V must NOT speak on bypass entry, got {:?}", speaks(&p));
+
+    // 2. Opening a bypassed zone with Voice Chime ON stays completely silent!
+    p.out.clear();
+    p.set_zone(3, true, false, false, t0 + secs(2));
+    assert!(speaks(&p).is_empty(), "opening bypassed zone must stay silent even with Voice Chime ON");
+    p.set_zone(3, false, false, false, t0 + secs(3));
+
+    // 3. Pressing Status (# + 0 + *) announces "Disarmed, bypassed, ready to arm" without zone names.
+    p.out.clear();
+    keys(&mut p, "#0*", t0 + secs(5));
+    assert_eq!(
+        speaks(&p),
+        vec![vec!["disarmed".to_string(), "bypassed".to_string(), "ready_to_arm".to_string()]],
+        "disarmed status with manual bypass"
+    );
+
+    // 4. Arming STAY with manual bypass speaks "Armed stay, zone bypassed" at start, completion, and status.
+    p.out.clear();
+    keys(&mut p, "12343", t0 + secs(10));
+    assert!(speaks(&p).contains(&vec!["armed".into(), "stay".into(), "zone".into(), "bypassed".into()]));
+    p.out.clear();
+    p.tick(t0 + secs(75), 0);
+    assert!(speaks(&p).contains(&vec!["armed".into(), "stay".into(), "zone".into(), "bypassed".into()]));
+    p.out.clear();
+    keys(&mut p, "#0*", t0 + secs(80));
+    assert!(speaks(&p).contains(&vec!["armed".into(), "stay".into(), "zone".into(), "bypassed".into()]));
+
+    // 5. Disarm (removes bypass), re-arm STAY cleanly: auto-bypassed interior does NOT speak "zone bypassed"!
+    keys(&mut p, "12341", t0 + secs(85));
+    assert!(!p.manual_bypass_any());
+    p.out.clear();
+    keys(&mut p, "12343", t0 + secs(90));
+    p.tick(t0 + secs(155), 0);
+    assert!(!speaks(&p).iter().any(|v| v.contains(&"bypassed".to_string())), "Stay auto-bypass must not speak bypassed");
+}
+
+#[test]
+fn vista_time_date_63_event_log_60_and_function_key_02() {
+    let t0 = Instant::now();
+    let wall = crate::util::now_ms();
+    let mut p = panel(Model::Vista20p);
+    p.tick(t0, wall);
+
+    // 1. [Master] + # + 63 opens Time/Date display; [*] edits; typing 10:12PM 07/11/19 (THU) + [*] saves & logs CID 625!
+    keys(&mut p, "1234#63", t0 + secs(1));
+    let view1 = p.lcd_vista(t0 + secs(1), wall);
+    assert!(view1.lines[0].starts_with("TIME/DATE"), "expected TIME/DATE view, got {:?}", view1.lines);
+    assert!(view1.cursor.is_none());
+
+    keys(&mut p, "*", t0 + secs(2));
+    let edit_start = p.lcd_vista(t0 + secs(2), wall);
+    assert_eq!(edit_start.cursor, Some((1, 0)), "cursor starts under 1st hour digit");
+
+    // 10:12 PM (1=PM), year 19, month 07, day 11 -> Thursday, July 11, 2019 10:12 PM
+    keys(&mut p, "10121190711*", t0 + secs(3));
+    assert!(p.events.iter().any(|e| e.cid == 625), "setting clock must log CID 625");
+
+    // Verify #63 now displays the exact manual example: TIME/DATE   THU / 10:12PM 07/11/19!
+    keys(&mut p, "1234#63", t0 + secs(5));
+    let view2 = p.lcd_vista(t0 + secs(5), wall);
+    assert_eq!(view2.lines[0].trim_end(), "TIME/DATE   THU");
+    assert_eq!(view2.lines[1].trim_end(), "10:12PM 07/11/19");
+    // 30s inactivity timeout exits cleanly back to normal
+    p.tick(t0 + secs(36), wall);
+    assert!(p.lcd_vista(t0 + secs(36), wall).lines[0].contains("DISARMED"));
+
+    // 2. Program *57 Key D = 02 (Display Time/Date) -> holding Key D shows TIME/DATE without a code!
+    p.ee.sections.insert("57".into(), "00000002".into());
+    p.key(Key::Away, true, t0 + secs(40));
+    p.tick(t0 + secs(42) + Duration::from_millis(100), wall);
+    p.key(Key::Away, false, t0 + secs(42) + Duration::from_millis(200));
+    let fn_view = p.lcd_vista(t0 + secs(43), wall);
+    assert_eq!(fn_view.lines[0].trim_end(), "TIME/DATE   THU");
+    assert_eq!(fn_view.lines[1].trim_end(), "10:12PM 07/11/19");
+    // Function key view is view-only: pressing * exits rather than editing
+    keys(&mut p, "*", t0 + secs(44));
+    assert!(p.lcd_vista(t0 + secs(44), wall).lines[0].contains("DISARMED"));
+
+    // 3. [Master] + # + 60 opens 100-Event History Log in authentic Contact ID format; * = older, # = newer.
+    keys(&mut p, "1234603", t0 + secs(50)); // logs CID 570 bypass
+    keys(&mut p, "1234#60", t0 + secs(52));
+    let ev1 = p.lcd_vista(t0 + secs(52), wall);
+    assert!(ev1.lines[0].starts_with("001 E570 Z003 P1"), "expected bypass CID 570 first, got {:?}", ev1.lines);
+    assert_eq!(ev1.lines[1].trim_end(), "10:12PM 07/11/19");
+    keys(&mut p, "*", t0 + secs(53)); // older -> CID 625 clock change
+    let ev2 = p.lcd_vista(t0 + secs(53), wall);
+    assert!(ev2.lines[0].starts_with("002 E625 U002 P1"), "expected older CID 625 event, got {:?}", ev2.lines);
+    keys(&mut p, "#", t0 + secs(54)); // newer -> back to 001
+    assert!(p.lcd_vista(t0 + secs(54), wall).lines[0].starts_with("001 "));
+    keys(&mut p, "1", t0 + secs(55)); // any other key exits
+    assert!(p.lcd_vista(t0 + secs(55), wall).lines[0].contains("DISARMED"));
+
+    // *90 Event Log Enables filter: set *90 = 01 (alarms only) -> empty when no alarms logged!
+    p.ee.sections.insert("90".into(), "01".into());
+    assert!(p.vista_event_log_entries().is_empty());
+}
+
+#[test]
+fn vista_user_attributes_authority_levels_and_installer_master_code() {
+    let t0 = Instant::now();
+    let mut p = panel(Model::Vista20p);
+
+    // 1. Installer (4112) + 8 + 02 + 2468 sets Master code in a SINGLE entry (no double entry)!
+    keys(&mut p, "41128022468", t0);
+    assert!(p.ee.code_matches("02", "2468"), "installer must change master code in one entry");
+
+    // 2. Master adds User 03 (Arm-Only = auth 1), User 04 (Guest = auth 2), User 05 (Duress = auth 3)
+    keys(&mut p, "24688033333", t0 + secs(2));
+    keys(&mut p, "2468803#11", t0 + secs(4));
+    keys(&mut p, "24688044444", t0 + secs(6));
+    keys(&mut p, "2468804#12", t0 + secs(8));
+    keys(&mut p, "24688055555", t0 + secs(10));
+    keys(&mut p, "2468805#13", t0 + secs(12));
+    assert_eq!(p.ee.attrs("03") & 0x07, 1);
+    assert_eq!(p.ee.attrs("04") & 0x07, 2);
+    assert_eq!(p.ee.attrs("05") & 0x07, 3);
+
+    // Arm-Only (03) can arm STAY, but CANNOT disarm!
+    keys(&mut p, "33333", t0 + secs(15));
+    assert!(p.exit.is_some(), "Arm-Only user can arm");
+    keys(&mut p, "33331", t0 + secs(18));
+    assert!(p.exit.is_some(), "Arm-Only user must NOT disarm");
+
+    // Guest (04) CANNOT disarm a system armed by User 03!
+    keys(&mut p, "44441", t0 + secs(20));
+    assert!(p.exit.is_some(), "Guest must NOT disarm when another user armed");
+
+    // Master disarms cleanly; Guest arms and CAN disarm its own arming!
+    keys(&mut p, "24681", t0 + secs(22));
+    assert!(p.exit.is_none() && p.armed.is_none());
+    keys(&mut p, "44443", t0 + secs(25));
+    assert!(p.exit.is_some());
+    keys(&mut p, "44441", t0 + secs(28));
+    assert!(p.exit.is_none() && p.armed.is_none(), "Guest MUST disarm when Guest itself armed");
+
+    // Duress (05) disarms silently AND sends CID 121 Duress report!
+    keys(&mut p, "24683", t0 + secs(32));
+    p.out.clear();
+    keys(&mut p, "55551", t0 + secs(35));
+    assert!(p.exit.is_none() && p.armed.is_none(), "Duress user disarms normally");
+    assert!(
+        p.out.iter().any(|o| matches!(o, Out::Report(r) if r.cid == 121 && r.kind == ReportKind::Alarm(AlarmKind::Duress))),
+        "Duress user must silently transmit CID 121 Duress"
+    );
+}
+
+#[test]
+fn vista_macros_outputs_schedules_message_center_and_extras() {
+    let t0 = Instant::now();
+    let wall = crate::util::now_ms();
+    let mut p = panel(Model::Vista20p);
+    p.tick(t0, wall);
+
+    // 1. Output devices (#7 activate / #8 deactivate)
+    keys(&mut p, "1234#705", t0 + secs(1));
+    assert!(p.vista_outputs[4], "output 05 must activate");
+    assert!(p.lcd_vista(t0 + secs(1), wall).lines[0].contains("DEVICE 05 ON"));
+    keys(&mut p, "1234#805", t0 + secs(3));
+    assert!(!p.vista_outputs[4], "output 05 must deactivate");
+
+    // 2. Macro programming (#66) + execution via *57 Macro 1 (09): bypass zone 03 + arm STAY ("603F3")
+    keys(&mut p, "1234#661*603", t0 + secs(10));
+    p.key(Key::Away, true, t0 + secs(11)); // inserts 'F' (single press in MacroPgm!)
+    p.key(Key::Away, false, t0 + secs(11));
+    keys(&mut p, "3", t0 + secs(12));
+    p.key(Key::Away, true, t0 + secs(13)); // appends 'F'
+    p.key(Key::Away, false, t0 + secs(13));
+    p.key(Key::Away, true, t0 + secs(14)); // second D saves & exits!
+    p.key(Key::Away, false, t0 + secs(14));
+    assert_eq!(p.vista_macros[0], "603F3");
+
+    p.ee.sections.insert("57".into(), "00000009".into());
+    p.key(Key::Away, true, t0 + secs(20));
+    p.tick(t0 + secs(22) + Duration::from_millis(100), wall);
+    p.key(Key::Away, false, t0 + secs(22) + Duration::from_millis(200));
+    assert!(p.lcd_vista(t0 + secs(23), wall).lines[0].contains("ENTER USER CODE"));
+    keys(&mut p, "1234", t0 + secs(24));
+    assert!(p.zones[2].bypassed, "Macro 1 must bypass zone 03");
+    assert!(p.exit.is_some(), "Macro 1 must arm STAY");
+    keys(&mut p, "12341", t0 + secs(26)); // disarm & clear bypass
+
+    // 3. Voice Message Center (#01 Record -> MSG LED steady, 1 Stop -> flashing, #03 Play -> off)
+    keys(&mut p, "#01", t0 + secs(30));
+    assert_eq!(p.leds_vista()[2], Led::On, "MSG LED steady while recording");
+    keys(&mut p, "1", t0 + secs(32));
+    assert_eq!(p.leds_vista()[2], Led::Flash, "MSG LED flashes when memo waiting");
+    keys(&mut p, "#03", t0 + secs(34));
+    assert_eq!(p.leds_vista()[2], Led::Off, "MSG LED turns off after playback");
+
+    // 4. Double-* Voice Status announces up to 3 faulted zones
+    p.set_zone(1, true, false, false, t0 + secs(40));
+    p.set_zone(3, true, false, false, t0 + secs(40));
+    p.out.clear();
+    keys(&mut p, "#0*", t0 + secs(41));
+    assert!(p.out.iter().any(|o| matches!(o, Out::Audio(AudioCmd::Speak(t)) if t.contains(&"not_ready_to_arm".to_string()))));
+    p.out.clear();
+    keys(&mut p, "*", t0 + secs(43));
+    let fault_words: Vec<String> = p.out.iter().filter_map(|o| match o { Out::Audio(AudioCmd::Speak(t)) => Some(t.clone()), _ => None }).flatten().collect();
+    assert!(fault_words.iter().filter(|w| w.as_str() == "fault").count() == 2, "double-* must speak both faulted zones, got {:?}", fault_words);
+    p.set_zone(1, false, false, false, t0 + secs(45));
+    p.set_zone(3, false, false, false, t0 + secs(45));
+
+    // 5. Dialer Test ([Code] + 5 + 1) displays PHONE OKAY (or COMM. FAILURE when FTC)
+    keys(&mut p, "123451", t0 + secs(50));
+    assert!(p.lcd_vista(t0 + secs(50), wall).lines[0].contains("PHONE OKAY"));
+    p.inputs.ftc = true;
+    keys(&mut p, "123451", t0 + secs(55));
+    assert!(p.lcd_vista(t0 + secs(55), wall).lines[0].contains("COMM. FAILURE"));
+    p.inputs.ftc = false;
+
+    // 6. *197=2 countdown interval, *198=1 partition prefix + GoTo Partition ([Code]+*+2)
+    p.ee.sections.insert("198".into(), "1".into());
+    keys(&mut p, "1234*2", t0 + secs(60));
+    assert_eq!(p.vista_partition, 2);
+    assert!(p.lcd_vista(t0 + secs(64), wall).lines[0].starts_with("2 "));
+    p.ee.sections.insert("197".into(), "2".into());
+    keys(&mut p, "12342", t0 + secs(66));
+    let l2 = p.lcd_vista(t0 + secs(67), wall).lines[1].clone(); // 59 s left -> rounds up to 60 in 2s step!
+    assert_eq!(l2.trim_end(), "May Exit Now 60");
+    keys(&mut p, "12341", t0 + secs(68));
+
+    // 7. Schedules (#64): program Schedule 01 as Event 07 (Reminder) at current clock + 2 min & trigger!
+    let target_ms = wall + 120_000;
+    let tp = crate::util::parts(target_ms);
+    let (h12, pm) = match tp.hour {
+        0 => (12, '2'),
+        1..=11 => (tp.hour, '2'),
+        12 => (12, '1'),
+        _ => (tp.hour - 12, '1'),
+    };
+    let seq = format!("1234#640107{:02}{:02}{}*1111111*100", h12, tp.minute, pm);
+    keys(&mut p, &seq, t0 + secs(70));
+    assert_eq!(p.vista_schedules.len(), 1);
+    p.tick(t0 + secs(72), target_ms);
+    assert!(p.vista_reminder_until.is_some(), "Schedule 01 Reminder must fire at matching clock time");
+    assert_eq!(p.lcd_vista(t0 + secs(72), target_ms).lines[1].trim_end(), "REMINDER");
+
+    // 8. Chime by Zone (*26 = 1): Zone 2 (Interior) chimes when enabled in chime_list!
+    p.chime = true;
+    p.ee.sections.insert("26".into(), "1".into());
+    p.ee.sections.insert("chime_list".into(), "01000000".into());
+    p.out.clear();
+    p.set_zone(2, true, false, false, t0 + secs(80));
+    assert!(p.out.iter().any(|o| matches!(o, Out::Audio(AudioCmd::Beeps { count: 3, .. }))), "*26 chime by zone must chime Zone 2");
+}
+
+#[test]
+fn wire_protocol_pc1550_classic_bus_frames_and_led_accuracy() {
+    use crate::engine::bus::*;
+    use crate::engine::panel::tb;
+
+    let t0 = Instant::now();
+    let mut p = panel(Model::Pc1550);
+
+    // 1. Disarmed ready Classic bus frame: Ready bit set, Armed/Trouble/Memory/Bypass off.
+    let f0 = p.classic_bus_frame(t0);
+    assert_eq!(f0.zones_byte, 0);
+    assert_eq!(f0.status_byte & CLASSIC_READY, CLASSIC_READY);
+    assert_eq!(f0.status_byte & (CLASSIC_ARMED | CLASSIC_MEMORY | CLASSIC_BYPASS | CLASSIC_TROUBLE), 0);
+
+    // 2. Entering [*][5] / [*][8] / [*][9] immediately flashes the authentic Classic prompt LEDs.
+    keys(&mut p, "*5", t0 + secs(1));
+    let l5 = p.leds_1550(t0 + secs(1));
+    assert_eq!(l5[2], Led::Flash, "PC1550 *5 NeedCode must flash Memory LED");
+    assert_eq!(l5[3], Led::Flash, "PC1550 *5 NeedCode must flash Bypass LED");
+    assert_eq!(l5[4], Led::Flash, "PC1550 *5 NeedCode must flash Trouble LED");
+    keys(&mut p, "#", t0 + secs(2));
+
+    keys(&mut p, "*9", t0 + secs(3));
+    assert_eq!(p.leds_1550(t0 + secs(3))[1], Led::Flash, "PC1550 *9 NeedCode must flash Armed LED");
+    keys(&mut p, "#", t0 + secs(4));
+
+    // 3. Setting clock via [*][6][Master][1][HHMM] clears tb::CLOCK trouble!
+    p.troubles |= tb::CLOCK;
+    keys(&mut p, "*6123411430#", t0 + secs(5));
+    assert_eq!(p.troubles & tb::CLOCK, 0, "PC1550 *6 clock set must clear CLOCK trouble");
+
+    // 4. Arming -> exit delay shows BOTH Ready + Armed bits on Classic wire (dscClassic.cpp:438).
+    keys(&mut p, "1234", t0 + secs(10));
+    let f_exit = p.classic_bus_frame(t0 + secs(11));
+    assert_ne!(f_exit.status_byte & CLASSIC_READY, 0, "Classic exit delay keeps Ready lit");
+    assert_ne!(f_exit.status_byte & CLASSIC_ARMED, 0, "Classic exit delay lights Armed");
+
+    // 5. After exit completes and an alarm triggers while armed, Memory LED turns ON while armed.
+    p.set_zone(1, true, false, false, t0 + secs(15));
+    p.set_zone(1, false, false, false, t0 + secs(18));
+    p.tick(t0 + secs(140), 0);
+    assert!(p.armed.is_some());
+    p.set_zone(3, true, false, false, t0 + secs(145)); // Instant zone alarm
+    p.tick(t0 + secs(146), 0);
+    assert_eq!(p.leds_1550(t0 + secs(146))[2], Led::On, "Classic Memory LED must light while armed after alarm");
+    assert_ne!(p.classic_bus_frame(t0 + secs(146)).status_byte & CLASSIC_MEMORY, 0);
+}
+
+#[test]
+fn wire_protocol_pc1832_pk5500_status_codes_blanking_6digit_and_menus() {
+    use crate::engine::bus::*;
+
+    let t0 = Instant::now();
+    let mut p = panel(Model::Pc1832);
+    p.ee.sections.insert("014".into(), "67".into()); // fast 5s exit termination for test speed
+    p.ee.sections.insert("015".into(), "12347".into()); // enable Quick Exit (opt 3) + Quick Arm (opt 4)
+
+    // 1. Wire status 0x01 (Ready), 0x02 (Force-armable Zone 2 open while Ready!), 0x03 (Zone 1 open).
+    let ps0 = p.powerseries_05_frame(t0);
+    assert_eq!(ps0.status, 0x01);
+    assert_ne!(ps0.lights & PS_LIGHT_READY, 0);
+    assert_ne!(ps0.lights & PS_LIGHT_BACKLIGHT, 0);
+    assert_eq!(ps0.tone_0x75, 0x00);
+    p.set_zone(2, true, false, false, t0 + secs(1)); // Zone 2 is Stay/Away with force_arm = true
+    assert!(p.ready());
+    assert_eq!(p.powerseries_status_code(t0 + secs(1)), 0x02, "Force-armable open zone must emit status 0x02");
+    assert_eq!(p.lcd_1832(t0 + secs(1), 0).lines[1].trim(), "Force Arm");
+    p.set_zone(1, true, false, false, t0 + secs(2));
+    assert_eq!(p.powerseries_status_code(t0 + secs(2)), 0x03);
+    p.set_zone(1, false, false, false, t0 + secs(3));
+    p.set_zone(2, false, false, false, t0 + secs(3));
+
+    // 2. Wire status 0x8F: wrong code shows "Invalid / Access Code".
+    keys(&mut p, "9999", t0 + secs(5));
+    let inv = p.lcd_1832(t0 + secs(5), 0);
+    assert_eq!(inv.lines[0].trim(), "Invalid");
+    assert_eq!(inv.lines[1].trim(), "Access Code");
+
+    // 3. Wire status 0xA3 / 0xA4 (Door Chime) and 0xAC / 0xAD (Auto-Arm) banners + Bypass scroll.
+    keys(&mut p, "*4", t0 + secs(8));
+    assert_eq!(p.lcd_1832(t0 + secs(8), 0).lines[1].trim(), "Feature ON");
+    keys(&mut p, "*4", t0 + secs(9));
+    assert_eq!(p.lcd_1832(t0 + secs(9), 0).lines[1].trim(), "Feature OFF");
+    keys(&mut p, "*612342", t0 + secs(10));
+    assert_eq!(p.lcd_1832(t0 + secs(10), 0).lines[0].trim(), "Auto-Arm");
+    assert_eq!(p.lcd_1832(t0 + secs(10), 0).lines[1].trim(), "Enabled");
+    keys(&mut p, "2#", t0 + secs(11));
+
+    // 4. Wire status 0x33: Command Output [*][7][1] shows "Command O/P 1 / Active" -> "In Progress".
+    keys(&mut p, "*71", t0 + secs(15));
+    assert_eq!(p.powerseries_status_code(t0 + secs(15)), 0x33);
+    assert_eq!(p.lcd_1832(t0 + secs(15), 0).lines[0].trim(), "Command O/P 1");
+    p.tick(t0 + secs(18), 0); // past 2s temp_msg, still within 5s [170] PGM timer
+    assert_eq!(p.lcd_1832(t0 + secs(18), 0).lines[1].trim(), "In Progress");
+    p.tick(t0 + secs(22), 0); // expired
+
+    // 5. Wire status 0x09 (Arming No Entry Delay) -> 0x06 (Armed Stay No Entry) -> 0x8A (*1) -> 0x16 (Armed Away No Entry)!
+    keys(&mut p, "*91234", t0 + secs(30));
+    assert_eq!(p.powerseries_status_code(t0 + secs(31)), 0x09);
+    assert_eq!(p.lcd_1832(t0 + secs(31), 0).lines[0].trim(), "Arming");
+    assert_eq!(p.lcd_1832(t0 + secs(31), 0).lines[1].trim(), "No Entry Delay");
+    // Wait out doubled silent exit delay (240s)
+    p.tick(t0 + secs(280), 0);
+    let ps_stay_ne = p.powerseries_05_frame(t0 + secs(280));
+    assert_eq!(ps_stay_ne.status, 0x06);
+    assert_ne!(ps_stay_ne.lights & PS_LIGHT_ARMED, 0);
+    assert_ne!(ps_stay_ne.lights & PS_LIGHT_BYPASS, 0);
+    p.key(Key::Right, true, t0 + secs(281));
+    p.key(Key::Right, false, t0 + secs(281));
+    assert_eq!(p.lcd_1832(t0 + secs(281), 0).lines[0].trim(), "Armed Stay    <>");
+    assert_eq!(p.lcd_1832(t0 + secs(281), 0).lines[1].trim(), "No Entry Delay");
+
+    // 6. Wire status 0xB8: Armed [*] menu only lists the 6 armed-valid functions & rejects *5!
+    keys(&mut p, "*", t0 + secs(290));
+    assert_eq!(p.powerseries_status_code(t0 + secs(290)), 0xB8);
+    let mut armed_labels = Vec::new();
+    for step in 0..6 {
+        armed_labels.push(p.lcd_1832(t0 + secs(290 + step), 0).lines[1].trim().to_string());
+        p.key(Key::Right, true, t0 + secs(290 + step));
+        p.key(Key::Right, false, t0 + secs(290 + step));
+    }
+    assert!(!armed_labels.iter().any(|s| s.contains("Access Codes")), "armed * menu must exclude Access Codes");
+    assert!(armed_labels.contains(&"Quick Exit".to_string()));
+    keys(&mut p, "5", t0 + secs(297)); // *5 while armed -> Function Not Available (0x8E)
+    assert_eq!(p.lcd_1832(t0 + secs(297), 0).lines[0].trim(), "Function Not");
+
+    // 7. Wire status 0x0B: Quick Exit [*][0] stays displayed during entire Quick Exit window!
+    keys(&mut p, "*0", t0 + secs(300));
+    assert_eq!(p.powerseries_status_code(t0 + secs(310)), 0x0B);
+    assert_eq!(p.lcd_1832(t0 + secs(310), 0).lines[0].trim(), "Quick Exit in");
+
+    // 8. Wire status 0x8A: [*][1] activates Stay/Away zones -> Armed Away No Entry (0x16)!
+    p.tick(t0 + secs(430), 0); // Quick Exit expires
+    keys(&mut p, "*1", t0 + secs(435));
+    assert_eq!(p.lcd_1832(t0 + secs(435), 0).lines[1].trim(), "Stay/Away Zones");
+    p.tick(t0 + secs(565), 0); // Stay/Away reactivation completes
+    assert_eq!(p.powerseries_status_code(t0 + secs(565)), 0x16);
+    keys(&mut p, "#", t0 + secs(566)); // reset scroll to 0
+    p.key(Key::Right, true, t0 + secs(566));
+    p.key(Key::Right, false, t0 + secs(566));
+    assert_eq!(p.lcd_1832(t0 + secs(566), 0).lines[0].trim(), "Armed Away    <>");
+    keys(&mut p, "1234", t0 + secs(575)); // disarm
+
+    // 9. Wire status 0x0D (Entry Delay After Alarm) + CID 459 (Recent Closing within 2 min)!
+    keys(&mut p, "1234", t0 + secs(600));
+    p.set_zone(1, true, false, false, t0 + secs(602));
+    p.set_zone(1, false, false, false, t0 + secs(604));
+    p.tick(t0 + secs(612), 0); // armed away
+    p.set_zone(3, true, false, false, t0 + secs(630)); // alarm 18s after arming -> Recent Closing CID 459!
+    p.set_zone(3, false, false, false, t0 + secs(632));
+    assert!(p.events.iter().any(|e| e.cid == 459), "alarm within 2 min of arming must log Recent Closing CID 459");
+    // Bell cutoff expires, then door opens -> Entry Delay After Alarm (0x0D) + pulsing sounder!
+    p.tick(t0 + secs(900), 0);
+    p.set_zone(1, true, false, false, t0 + secs(905));
+    p.tick(t0 + secs(905), 0);
+    assert_eq!(p.powerseries_status_code(t0 + secs(905)), 0x0D);
+    assert_eq!(p.lcd_1832(t0 + secs(905), 0).lines[1].trim(), "After Alarm");
+    assert!(matches!(p.sounder_sent, Pattern::ShortShortLong { .. }), "0x0D Entry After Alarm must pulse sounder");
+    keys(&mut p, "1234", t0 + secs(910)); // disarm
+    p.set_zone(1, false, false, false, t0 + secs(911));
+    keys(&mut p, "#", t0 + secs(912)); // exit alarm memory screen
+
+    // 10. Wire status 0x40 / 0x17: Keypad Blanking ([016] Opt 3 & Opt 4)!
+    p.ee.sections.insert("016".into(), "1345".into()); // Opt 3 blanking + Opt 4 code to wake
+    p.tick(t0 + secs(945), 0); // >30s idle
+    assert!(p.is_blanked_1832(t0 + secs(945)));
+    assert_eq!(p.powerseries_status_code(t0 + secs(945)), 0x40);
+    assert_eq!(p.lcd_1832(t0 + secs(945), 0).lines[0].trim(), "");
+    assert_eq!(p.leds_5500(t0 + secs(945)), [Led::Off, Led::Off, Led::Off, Led::Off]);
+    // With a trouble present, blanking switches to wire 0x17 and flashes Trouble LED!
+    p.inputs.battery_low = true;
+    p.tick(t0 + secs(946), 0);
+    assert_eq!(p.powerseries_status_code(t0 + secs(946)), 0x17);
+    assert_eq!(p.leds_5500(t0 + secs(946))[2], Led::Flash);
+    // Pressing a key prompts for access code to wake (Opt 4) without arming!
+    keys(&mut p, "1", t0 + secs(950));
+    assert!(p.pc1832_blank_wake);
+    assert_eq!(p.powerseries_status_code(t0 + secs(950)), 0x9F);
+    keys(&mut p, "234", t0 + secs(951));
+    assert!(!p.pc1832_blank_wake, "valid access code wakes blanked keypad");
+    assert!(p.exit.is_none(), "waking a blanked keypad must NOT arm the panel");
+    p.inputs.battery_low = false;
+    p.ee.sections.insert("016".into(), "15".into());
+
+    // 11. Wire status 0xBC: 6-Digit Access Codes ([701] Opt 5)!
+    p.ee.sections.insert("701".into(), "5".into());
+    assert_eq!(p.code_len(), 6);
+    // Legacy 4-digit master code 1234 works as 123400!
+    keys(&mut p, "*5123400", t0 + secs(960));
+    keys(&mut p, "01", t0 + secs(961));
+    assert_eq!(p.powerseries_status_code(t0 + secs(961)), 0xBC, "*5 6-digit code entry must emit wire status 0xBC");
+    keys(&mut p, "654321#", t0 + secs(962));
+    keys(&mut p, "654321", t0 + secs(965));
+    assert!(p.exit.is_some(), "new 6-digit user code must arm PC1832");
+    keys(&mut p, "654321", t0 + secs(966));
+    assert!(p.exit.is_none(), "new 6-digit user code must disarm PC1832");
+}
+
+#[test]
+fn wire_protocol_vista_20p_ecp_f7_frames_cycling_and_extras() {
+    use crate::engine::bus::*;
+
+    let t0 = Instant::now();
+    let wall = crate::util::now_ms();
+    let mut p = panel(Model::Vista20p);
+    p.tick(t0, wall);
+
+    // 1. Disarmed ready 0xF7 ECP wire frame: valid 45-byte packet with exact two's-complement checksum!
+    let f7 = p.vista_f7_frame(t0, wall);
+    assert_eq!(f7.beeps(), 0);
+    assert_ne!(f7.byte7_status1 & ECP_B2_READY, 0);
+    assert_ne!(f7.byte8_status2 & ECP_B3_AC_POWER, 0);
+    assert!(f7.backlight);
+    let wire = f7.to_wire_bytes([0x00, 0x00, 0x01, 0x00]); // keypad addr 16
+    assert_eq!(wire[0], 0xF7);
+    let cksum: u8 = wire.iter().fold(0u8, |a, &b| a.wrapping_add(b));
+    assert_eq!(cksum, 0, "VISTA 0xF7 wire checksum must sum to 0 mod 256");
+
+    // 2. [Code] + 6 + 00 clears active bypasses and logs CID 570 R.
+    keys(&mut p, "1234603", t0 + secs(1));
+    assert!(p.zones[2].bypassed);
+    assert_ne!(p.vista_f7_frame(t0 + secs(5), wall).byte8_status2 & ECP_B3_BYPASS, 0);
+    keys(&mut p, "1234600", t0 + secs(6));
+    assert!(!p.zones[2].bypassed, "[Code]+6+00 must clear all bypassed zones");
+    assert!(p.events.iter().any(|e| e.cid == 570 && e.qual == 'R'));
+
+    // 3. #33 Quick-Arm Night-Stay (when *21=1) sets ECP_B1_NIGHT + ECP_B2_ARMED_STAY & reports CID 441!
+    p.ee.sections.insert("21".into(), "1".into());
+    p.out.clear();
+    keys(&mut p, "#33", t0 + secs(10));
+    let f_night = p.vista_f7_frame(t0 + secs(11), wall);
+    assert_ne!(f_night.byte6_beeps_night & ECP_B1_NIGHT, 0, "#33 must set ECP NIGHT bit");
+    assert_ne!(f_night.byte7_status1 & ECP_B2_ARMED_STAY, 0, "#33 must set ECP ARMED_STAY bit");
+    assert!(p.out.iter().any(|o| matches!(o, Out::Report(r) if r.cid == 441)), "STAY arming must send Contact ID 441");
+    keys(&mut p, "12341", t0 + secs(13));
+
+    // 4. Multiple simultaneous troubles cycle every 2.5 s instead of hiding each other!
+    p.inputs.ac_ok = false;
+    p.inputs.battery_low = true;
+    p.inputs.audio_ok = false;
+    p.tick(t0 + secs(20), wall);
+    let s0 = p.lcd_vista(t0 + secs(20), wall).lines[0].trim().to_string();
+    let s1 = p.lcd_vista(t0 + secs(23), wall).lines[0].trim().to_string();
+    let s2 = p.lcd_vista(t0 + secs(26), wall).lines[0].trim().to_string();
+    assert_ne!(s0, s1, "multiple Vista troubles must cycle (got {} and {})", s0, s1);
+    assert_ne!(s1, s2, "third Vista trouble must also cycle (got {}, {}, {})", s0, s1, s2);
+    p.inputs.ac_ok = true;
+    p.inputs.battery_low = false;
+    p.inputs.audio_ok = true;
+    p.tick(t0 + secs(28), wall);
+
+    // 5. Exit Error sets zone_bcd = 0xEA, logs CID 374, and alternates EXIT ALARM on LCD!
+    keys(&mut p, "12342", t0 + secs(30));
+    p.set_zone(1, true, false, false, t0 + secs(35)); // door left open at end of exit!
+    p.tick(t0 + secs(95), wall);
+    assert!(p.vista_exit_alarm);
+    assert_eq!(p.vista_f7_frame(t0 + secs(95), wall).zone_bcd, 0xEA, "Vista Exit Error must encode zone_bcd 0xEA");
+    assert!(p.events.iter().any(|e| e.cid == 374), "Exit Error must log CID 374");
+    assert_eq!(p.lcd_vista(t0 + secs(97), wall).lines[0].trim(), "EXIT ALARM");
+    p.set_zone(1, false, false, false, t0 + secs(98));
+    // Let entry expire into alarm, then 1st OFF latches alternating alarm memory!
+    p.tick(t0 + secs(135), wall);
+    assert!(p.alarm_sounding(t0 + secs(135)));
+    keys(&mut p, "12341", t0 + secs(136));
+    assert!(p.lcd_vista(t0 + secs(136), wall).lines[0].starts_with("ALARM 01"));
+    assert!(p.lcd_vista(t0 + secs(139), wall).lines[0].contains("DISARMED"), "1st OFF must alternate ALARM XX and DISARMED");
+    keys(&mut p, "12341", t0 + secs(140)); // 2nd OFF clears memory
+    assert!(p.vista_alarm_mem_zone.is_none());
+
+    // 6. Installer Programming emits ECP_B3_PROGRAM flag AND non-zero prompt_pos cursor!
+    keys(&mut p, "4112800", t0 + secs(150));
+    let f_pgm = p.vista_f7_frame(t0 + secs(150), wall);
+    assert_ne!(f_pgm.byte8_status2 & ECP_B3_PROGRAM, 0);
+    assert!(f_pgm.prompt_pos >= 16, "Programming mode must place blinking cursor on Line 2 (got {})", f_pgm.prompt_pos);
+    keys(&mut p, "*99", t0 + secs(151));
+}

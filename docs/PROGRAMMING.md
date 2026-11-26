@@ -154,16 +154,25 @@ Enter installer programming with `4112` `8` `0` `0`. Type `*field` to edit a fie
 | `*41`, `*42`, `*43` | Primary phone, secondary phone, Partition 1 account code | `5551234`, blank, `1234` |
 | `*50` | Burglary dialer delay (`0` none, `1` 15 s, `2` 30 s, `3` 45 s) | `2` (30 s) |
 | `*56` | Zone types (2 digits per zone: `01` entry/exit 1, `02` entry/exit 2, `03` perimeter, `04` interior follower, `05` trouble/day, `06`/`07`/`08` 24 h, `09` fire, `10` interior w/ delay, `14` CO, `16` fire w/ verify) | `01 04 03 01 04 09 02 10` |
-| `*57` | Function keys A-D (2 digits per key; key D defaults to `03` single-button Away; `04` Stay, `05` Night-Stay, `06` Step arming, `08` Comm test) | `00 00 00 03` |
+| `*57` | Function keys A-D (2 digits per key; `00` default panic/page, `01` paging, `02` Display Time/Date, `03` Away [Key D default], `04` Stay, `05` Night-Stay, `06` Step arming, `07` Output toggle, `08` Comm test, `09`–`12` Macros 1–4) | `00 00 00 03` |
 | `*59` | Exit error report code | `0` |
 | `*81` | Night-Stay zones (zone list 05, 1 digit per zone: `0`/`1`) | `00000000` |
 | `*84` | Auto-Stay arming (converts Away to Stay, or Maximum to Instant, if no door opens during exit) | `3` (on) |
 | `*86` | Cancel verify display (`Alarm Canceled` when clearing alarm memory) | `1` (on) |
+| `*90` | Event log enables (`00`–`15` bitmask: `1` alarms, `2` troubles, `4` bypasses, `8` open/close) | `15` (all) |
 | `*91` | Option selection (bit `8` enables exit delay restart via `*` or reopening the door) | `8` |
 | `*93` | Reports in armed period (swinger limit) | `1` |
-| `*197` | Show live exit countdown seconds on LCD | `0` (off) |
+| `*197` | Exit time display interval (`0` = `You may exit now`, `1`–`5` = live seconds countdown step) | `0` (off) |
+| `*198` | Display partition number prefix on idle LCD (`0` off, `1` on) | `0` (off) |
 
-Voice keypad commands: `#` `0` `2` opens voice volume (`3` louder, `6` quieter, `4` toggle voice status/chime on or off, `#` save). `#` `*` or `#` `0` `*` announces current system status.
+Advanced 6160V keypad commands:
+- **Voice & Message Center:** `#` `0` `2` voice volume (`3` louder, `6` quieter, `4` voice status/chime on/off, `#` save); `#` `0` `*` or `#` `*` voice status (press `*` again within 10 s to announce up to 3 faulted zones); `#` `0` `1` record voice memo (`1` stops, flashing `MSG` LED); `#` `0` `3` play & clear voice memo.
+- **Time & Date (`#63`):** `[Master]` + `#` + `63` shows `TIME/DATE` for 30 s; press `*` while disarmed to edit (`HH:MM`, `1`=PM/`2`=AM, `YY/MM/DD`, `*` forward/save at last digit, `#` back). Program `*57` option `02` for one-touch Time/Date viewing without a code.
+- **100-Event History Log (`#60`):** `[Master/Installer]` + `#` + `60` displays events in Contact ID format (`001 E401 U002 P1` / timestamp); `*` = older, `#` = newer.
+- **Schedules (`#64`):** `[Master/Installer]` + `#` + `64` configures schedules (`01`–`16` user, `17`–`32` installer) for Output On (`01`), Forced Stay (`04`), Forced Away (`05`), Auto Disarm (`06`), Reminder (`07`), or Periodic Test (`11`). `[Installer]` + `#` + `0` + `0`/`1`/`2` sets 24h / 7d / 28d test intervals.
+- **Macros (`#66`) & Outputs (`#7`/`#8`):** `[Master]` + `#` + `66` programs Macros 1–4 (`AWAY`/D inserts `F` separator and saves on second press); `[Code]` + `#` + `7`/`8` + `[01-18]` activates/deactivates virtual outputs.
+- **User Attributes:** `[Master]` + `8` + `[03-49]` + `#` + `0` (delete), `#` + `1` + `0`–`4` (authority: `0` Standard, `1` Arm-Only, `2` Guest, `3` Duress CID 121, `4` Partition Master), `#` + `2` + `0`–`8` (access group), `#` + `3` + `0` + `1`–`3` + `#` (partition), `#` + `5` + `0`/`1` (pager). `[Installer]` + `8` + `02` + `[4-digit]` sets the Master code in a single entry.
+- **Partition Commands:** `[Code]` + `*` + `0`–`3` GoTo Partition; `[Code]` + `0` + `1`/`2`/`3`/`4`/`7` Multi-Partition global command.
 
 ## Updating a panel saved by an older RoomGuard
 

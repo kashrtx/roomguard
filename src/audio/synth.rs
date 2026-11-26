@@ -718,6 +718,9 @@ pub struct Synth {
     keepalive: f32,
     ka_phase: f32,
     wake_left: u32,
+    /// Quiets active countdown / entry / trouble sounder beeps while the user is
+    /// typing keys so keypress chirps never overlap with exit/entry delay tones.
+    key_duck_left: u32,
 }
 
 impl Synth {
@@ -758,6 +761,7 @@ impl Synth {
             keepalive: 1.0 / 32_000.0,
             ka_phase: 0.0,
             wake_left: 0,
+            key_duck_left: 0,
         }
     }
 
@@ -813,14 +817,26 @@ impl Synth {
             AudioCmd::Speak(tokens) => {
                 self.voice_player.speak(tokens);
             }
-            AudioCmd::Sounder(p) => self.sounder.set(p),
+            AudioCmd::Sounder(p) => {
+                // Starting a brand-new sounder (e.g. exit delay right after arming)
+                // or turning it off clears any keypress ducking window immediately.
+                // Transitions between active patterns (slow -> rapid exit beeps) keep
+                // the ducking window active so typing never gets interrupted mid-code.
+                if p == Pattern::Off || self.sounder.pat == Pattern::Off {
+                    self.key_duck_left = 0;
+                }
+                self.sounder.set(p);
+            }
             AudioCmd::KeyBeep => {
                 // A keypress is ~80 ms on PC1550, ~65 ms on PC1832, or a crisp ~46 ms
-                // chirp on Vista 6160V. During any continuous sounder tone (steady
-                // entry, last-10s pulsing entry, or HiLo alarm), dip around the beep
-                // so every digit cuts cleanly through. Pressing a key also fades out
-                // any in-progress 6160V voice phrase cleanly instead of hard-pausing
-                // mid-syllable and resuming with a click.
+                // chirp on Vista 6160V. When an exit/entry/trouble sounder is already
+                // running, duck it for 1.8 s after each keypress so typing a code never
+                // overlaps with countdown beeps. Pressing a key also fades out any
+                // in-progress 6160V voice phrase cleanly without a click.
+                let was_ducking = self.key_duck_left > 0;
+                if self.sounder.pat != Pattern::Off {
+                    self.key_duck_left = ms(self.sr, 1800);
+                }
                 self.segs.clear();
                 self.seg = None;
                 if self.voice_player.is_speaking() {
@@ -832,16 +848,36 @@ impl Synth {
                     KeypadVoice::Vista6160 => 46,
                     // Measured from a real PowerSeries keypad.
                     KeypadVoice::Pk5500 => 65,
-                    KeypadVoice::Classic => 80,
+                    // Measured on the Classic keybus (dscClassicKeypad beepInterval = 100 ms).
+                    KeypadVoice::Classic => 100,
                 };
-                if matches!(
-                    self.sounder.pat,
-                    Pattern::Steady | Pattern::ShortShortLong { .. } | Pattern::HiLo { .. }
-                ) {
+                if !was_ducking
+                    && matches!(
+                        self.sounder.pat,
+                        Pattern::Steady | Pattern::ShortShortLong { .. } | Pattern::HiLo { .. }
+                    )
+                {
                     self.segs.push_back(Seg { on: 0, off: ms(self.sr, 30).max(1), freq: f, decay: 1.0, amp: 0.0, key: true });
                     self.segs.push_back(Seg { on: ms(self.sr, dur).max(1), off: ms(self.sr, 40).max(1), freq: f, decay: 1.0, amp: 1.0, key: true });
                 } else {
                     self.segs.push_back(Seg { on: ms(self.sr, dur).max(1), off: ms(self.sr, 22), freq: f, decay: 1.0, amp: 1.0, key: true });
+                }
+            }
+            AudioCmd::ToneSeq { delay_ms, tones } => {
+                // Same as Tone, for several beeps in a row.
+                self.drop_all_but_keys();
+                if delay_ms > 0 {
+                    self.segs.push_back(Seg { on: 0, off: ms(self.sr, delay_ms as u32), freq: 1000.0, decay: 1.0, amp: 0.0, key: false });
+                }
+                for (hz, on_ms, off_ms) in tones {
+                    self.segs.push_back(Seg {
+                        on: ms(self.sr, on_ms as u32).max(1),
+                        off: ms(self.sr, off_ms as u32),
+                        freq: hz as f32,
+                        decay: 1.0,
+                        amp: 1.0,
+                        key: false,
+                    });
                 }
             }
             AudioCmd::Tone { hz, on_ms, off_ms, delay_ms } => {
@@ -927,6 +963,7 @@ impl Synth {
             AudioCmd::Wake => self.wake_left = ms(self.sr, 2500),
             AudioCmd::Silence => {
                 self.sounder.set(Pattern::Off);
+                self.key_duck_left = 0;
                 self.segs.clear();
                 self.seg = None;
                 self.voice_player.stop();
@@ -1058,7 +1095,14 @@ impl Synth {
     }
 
     pub fn next(&mut self) -> f32 {
-        let (bg_on, bg_freq) = self.sounder.next(self.sr);
+        let (bg_on_raw, bg_freq) = self.sounder.next(self.sr);
+        let key_ducked = if self.key_duck_left > 0 {
+            self.key_duck_left -= 1;
+            true
+        } else {
+            false
+        };
+        let bg_on = bg_on_raw && !key_ducked;
         let seg_out = self.seg_next();
         let has_seg = seg_out.is_some();
         let (on, freq, amp) = match seg_out {
@@ -1093,7 +1137,11 @@ impl Synth {
             // always drains smoothly so interrupting speech never clicks.
             let keypad_on = if has_seg { on } else { on && !speaking };
             let keypad = self.piezo.next(keypad_on, freq, amp) * self.vol_keypad;
-            let spoken = if has_seg && speaking { 0.0 } else { self.voice_player.next() * self.vol_keypad };
+            let spoken = if has_seg && speaking && !self.voice_player.is_fading() {
+                0.0
+            } else {
+                self.voice_player.next() * self.vol_keypad
+            };
             let siren = self.siren.next(power) * self.vol_siren;
             let mut preview = 0.0;
             if let Some((s, left)) = self.preview.as_mut() {

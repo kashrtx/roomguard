@@ -333,6 +333,7 @@ impl Panel {
                         self.error_tone();
                     } else if it == 1 {
                         self.clock_offset_ms = util::offset_to_time(util::now_ms(), hh, mm);
+                        self.troubles &= !tb::CLOCK;
                         self.beeps(3);
                         self.log(EvKind::Info, format!("Panel clock set to {:02}:{:02}", hh, mm));
                         self.out.push(Out::Save);
@@ -468,13 +469,27 @@ impl Panel {
                 }
                 return l;
             }
-            KpMode::UserFn { .. } | KpMode::NeedCode { .. } => {
-                if let KpMode::UserFn { .. } = &self.kp {
-                    l[2] = Led::Flash;
-                    l[3] = Led::Flash;
-                    l[4] = Led::Flash;
-                }
+            KpMode::UserFn { .. } => {
                 l[0] = ready;
+                l[2] = Led::Flash;
+                l[3] = Led::Flash;
+                l[4] = Led::Flash;
+                return l;
+            }
+            KpMode::NeedCode { purpose, .. } => {
+                l[0] = ready;
+                match purpose {
+                    CodeFor::UserCodes | CodeFor::UserFns | CodeFor::Installer | CodeFor::Keypad => {
+                        // Real PC1550 bus flashes Memory + Bypass + Trouble (Program state)
+                        // as soon as *5 / *6 / *8 requests the access code.
+                        l[2] = Led::Flash;
+                        l[3] = Led::Flash;
+                        l[4] = Led::Flash;
+                    }
+                    CodeFor::Bypass => l[3] = Led::Flash,
+                    CodeFor::NoEntry => l[1] = Led::Flash,
+                    _ => {}
+                }
                 return l;
             }
             KpMode::Bypass { .. } => {
@@ -546,9 +561,16 @@ impl Panel {
             }
         } else {
             // At the end of the exit delay every light goes out except Armed,
-            // unless the installer turned on bypass or alarm display.
+            // unless an alarm occurred in memory, a fire trouble is active, or
+            // the installer turned on bypass or alarm display.
+            if self.memory_flag {
+                l[2] = Led::On;
+            }
             if self.ee.toggle(self.model, "31", 4) && self.bypass_any() {
                 l[3] = Led::On;
+            }
+            if (self.troubles & tb::FIRE_LOOP) != 0 {
+                l[4] = Led::On;
             }
             if self.ee.toggle(self.model, "12", 3) {
                 for z in 1..=self.n().min(6) {

@@ -3,6 +3,7 @@
 //! sound, the camera and your phone, turns the computer's own condition into
 //! panel troubles, and publishes a snapshot of everything for the interface.
 
+pub mod bus;
 pub mod eeprom;
 mod kp1550;
 mod kp1832;
@@ -428,9 +429,11 @@ impl Engine {
             && !self.panel.walk_test
             && self.panel.bell_test_until.is_none()
             && self.panel.util_until.is_none()
+            && self.panel.cmd_out_active.is_none()
             && self.panel.temp_msg.is_none()
             && self.panel.vista_pending_status.is_none()
             && self.panel.vista_code_disarm.is_none()
+            && self.panel.vista_msg_recording.is_none()
             && matches!(self.panel.vista_mode, kp_vista::VistaKp::Normal)
             && self.save_due.is_none()
             && self.zone_pend.iter().all(|p| p.is_none())
@@ -1152,15 +1155,9 @@ impl Engine {
             Model::Pc1550 => [Led::Off; 4],
         };
         let backlight = match p.model {
-            Model::Pc1832 if !p.ee.toggle(Model::Pc1832, "016", 5) => 0.0,
+            Model::Pc1832 if !p.ee.toggle(Model::Pc1832, "016", 5) || p.is_blanked_1832(now) => 0.0,
             Model::Vista20p => {
-                // 6160V dims backlight after ~30s idle; wakes on keypress, alarm, delay, or fault.
-                let awake = now.saturating_duration_since(p.last_key_at).as_secs() < 30
-                    || p.alarm_sounding(now)
-                    || p.entry.is_some()
-                    || p.exit.is_some()
-                    || !p.open_zones().is_empty();
-                if awake { 1.0 } else { 0.30 }
+                if p.vista_backlight(now) { 1.0 } else { 0.30 }
             }
             _ => p.brightness as f32 / 9.0,
         };

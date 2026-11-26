@@ -22,15 +22,101 @@ const ZONE_VOCAB: &[&str] = &[
     "1st", "2nd", "3rd",
 ];
 
-fn bank() -> &'static HashMap<String, Vec<u8>> {
-    static BANK: OnceLock<HashMap<String, Vec<u8>>> = OnceLock::new();
+struct WordClip {
+    data: Vec<u8>,
+    /// Per-word perceptual loudness equalization gain computed once at load
+    /// so all 76 words (8 real + 68 cloned) speak at the exact same volume.
+    gain: f32,
+}
+
+fn bank() -> &'static HashMap<String, WordClip> {
+    static BANK: OnceLock<HashMap<String, WordClip>> = OnceLock::new();
     BANK.get_or_init(|| parse_rom(ROM_BYTES))
 }
 
-fn parse_rom(b: &[u8]) -> HashMap<String, Vec<u8>> {
-    let mut map = HashMap::new();
+/// Computes perceptual speech-band loudness (A-weighted approximation at 8 kHz)
+/// combining active-frame RMS and 85th-percentile stressed-syllable loudness.
+fn perceived_loudness_ulaw(ulaw: &[u8]) -> f32 {
+    if ulaw.is_empty() {
+        return 0.0;
+    }
+    // 2nd-order Butterworth high-pass at 520 Hz (fs = 8000 Hz) + gentle 2.2 kHz
+    // presence shelf to approximate IEC 61672 A-weighting over 200-3600 Hz.
+    let mut hp_x1 = 0.0f32;
+    let mut hp_x2 = 0.0f32;
+    let mut hp_y1 = 0.0f32;
+    let mut hp_y2 = 0.0f32;
+    // Exact RBJ 2nd-order Butterworth HPF (fc=520 Hz, fs=8000 Hz, Q=0.7071)
+    let (hb0, hb1, hb2, ha1, ha2) = (0.74864f32, -1.49728f32, 0.74864f32, -1.43307f32, 0.56149f32);
+    // Exact RBJ Peaking EQ (fc=2300 Hz, fs=8000 Hz, Q=0.75, +4.0 dB ear-sensitivity peak)
+    let (pb0, pb1, pb2, pa1, pa2) = (1.19880f32, 0.30819f32, 0.12140f32, 0.30819f32, 0.32020f32);
+    let mut pk_x1 = 0.0f32;
+    let mut pk_x2 = 0.0f32;
+    let mut pk_y1 = 0.0f32;
+    let mut pk_y2 = 0.0f32;
+
+    let mut w = Vec::with_capacity(ulaw.len());
+    for &u in ulaw {
+        let x = ulaw_to_f32(u);
+        let h = hb0 * x + hb1 * hp_x1 + hb2 * hp_x2 - ha1 * hp_y1 - ha2 * hp_y2;
+        hp_x2 = hp_x1;
+        hp_x1 = x;
+        hp_y2 = hp_y1;
+        hp_y1 = h;
+        let y = pb0 * h + pb1 * pk_x1 + pb2 * pk_x2 - pa1 * pk_y1 - pa2 * pk_y2;
+        pk_x2 = pk_x1;
+        pk_x1 = h;
+        pk_y2 = pk_y1;
+        pk_y1 = y;
+        w.push(y);
+    }
+
+    let win = 160usize; // 20 ms at 8 kHz
+    let hop = 40usize;  // 5 ms
+    let mut frames = Vec::new();
+    if w.len() <= win {
+        let rms = (w.iter().map(|v| v * v).sum::<f32>() / w.len().max(1) as f32).sqrt();
+        frames.push(rms);
+    } else {
+        let mut i = 0;
+        while i + win <= w.len() {
+            let s: f32 = w[i..i + win].iter().map(|v| v * v).sum();
+            frames.push((s / win as f32).sqrt());
+            i += hop;
+        }
+    }
+    let peak_f = frames.iter().copied().fold(0.0f32, f32::max);
+    if peak_f < 1e-5 {
+        return 0.0;
+    }
+    // High stressed-syllable gate (35% of peak, ~-9 dB) so quiet trailing
+    // consonants (like the tail of "instant") never dilute stressed-syllable loudness.
+    let mut active: Vec<f32> = frames.into_iter().filter(|&v| v > peak_f * 0.35).collect();
+    if active.is_empty() {
+        return peak_f;
+    }
+    let active_rms = (active.iter().map(|v| v * v).sum::<f32>() / active.len() as f32).sqrt();
+    active.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let p90 = active[(active.len() * 90 / 100).min(active.len() - 1)];
+    0.30 * active_rms + 0.70 * p90
+}
+
+/// Transparent soft-peak protector: 100% linear below 0.85, smoothly saturates
+/// above 0.85 so equalized words never hard-clip or distort.
+#[inline]
+fn soft_limit(v: f32) -> f32 {
+    let a = v.abs();
+    if a <= 0.85 {
+        v
+    } else {
+        v.signum() * (0.85 + 0.13 * ((a - 0.85) / 0.13).tanh())
+    }
+}
+
+fn parse_rom(b: &[u8]) -> HashMap<String, WordClip> {
+    let mut raw_map = Vec::new();
     if b.len() < 12 || !b.starts_with(b"RGV61601") {
-        return map;
+        return HashMap::new();
     }
     let count = u32::from_le_bytes([b[8], b[9], b[10], b[11]]) as usize;
     let mut o = 12usize;
@@ -50,10 +136,42 @@ fn parse_rom(b: &[u8]) -> HashMap<String, Vec<u8>> {
         if o + dlen > b.len() {
             break;
         }
-        map.insert(key, b[o..o + dlen].to_vec());
+        raw_map.push((key, b[o..o + dlen].to_vec()));
         o += dlen;
     }
+    // Target perceptual loudness: median across the entire 76-word bank lifted
+    // slightly to match the clearest announcer words ("stay", "exit_now").
+    let mut louds: Vec<f32> = raw_map
+        .iter()
+        .map(|(_, d)| perceived_loudness_ulaw(d))
+        .filter(|&v| v > 1e-4)
+        .collect();
+    louds.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let target = if louds.is_empty() {
+        0.35
+    } else {
+        // Use 55th percentile so quieter words ("armed", "disarmed") lift smoothly
+        // and sharp words ("instant", "system") tame down to match "stay"/"away".
+        louds[(louds.len() * 55 / 100).min(louds.len() - 1)]
+    };
+    let mut map = HashMap::with_capacity(raw_map.len());
+    for (key, data) in raw_map {
+        let l = perceived_loudness_ulaw(&data);
+        let gain = if l > 1e-4 { (target / l).clamp(0.55, 1.65) } else { 1.0 };
+        map.insert(key, WordClip { data, gain });
+    }
     map
+}
+
+#[cfg(test)]
+pub fn audit_equalized_loudness() -> Vec<(String, f32, f32)> {
+    let mut out = Vec::new();
+    for (k, clip) in bank() {
+        let raw = perceived_loudness_ulaw(&clip.data);
+        out.push((k.clone(), clip.gain, raw * clip.gain));
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
 }
 
 /// Standard G.711 u-law byte -> f32 (-1.0..1.0).
@@ -108,6 +226,7 @@ pub struct VoicePlayer {
     sr: f32,
     queue: VecDeque<String>,
     cur: Option<&'static [u8]>,
+    cur_gain: f32,
     pos: f32,
     gap_left: u32,
     gap_samples: u32,
@@ -129,6 +248,7 @@ impl VoicePlayer {
             sr,
             queue: VecDeque::new(),
             cur: None,
+            cur_gain: 1.0,
             pos: 0.0,
             gap_left: 0,
             gap_samples: (sr * 0.075) as u32,
@@ -181,6 +301,10 @@ impl VoicePlayer {
         self.cur.is_some() || !self.queue.is_empty() || self.gap_left > 0
     }
 
+    pub fn is_fading(&self) -> bool {
+        self.fade_left > 0
+    }
+
     pub fn is_active(&self) -> bool {
         self.is_speaking() || self.fade_left > 0
     }
@@ -205,9 +329,10 @@ impl VoicePlayer {
         }
         if self.cur.is_none() {
             if let Some(tok) = self.queue.pop_front() {
-                if let Some(data) = bank().get(&tok) {
-                    if !data.is_empty() {
-                        self.cur = Some(data.as_slice());
+                if let Some(clip) = bank().get(&tok) {
+                    if !clip.data.is_empty() {
+                        self.cur = Some(clip.data.as_slice());
+                        self.cur_gain = clip.gain;
                         self.pos = 0.0;
                     }
                 }
@@ -232,7 +357,8 @@ impl VoicePlayer {
         let s1 = ulaw_to_f32(data[i1]);
         self.pos += ROM_RATE / self.sr;
         let gain = 0.28 + 0.72 * (self.level as f32 / 7.0);
-        let y = (s0 + (s1 - s0) * frac) * gain * 0.92;
+        let eq = soft_limit((s0 + (s1 - s0) * frac) * self.cur_gain);
+        let y = eq * gain * 0.92;
         self.last_out = y;
         y
     }

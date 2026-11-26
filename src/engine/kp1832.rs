@@ -3,7 +3,7 @@
 //! and menus follow the PC1616/PC1832/PC1864 v4.2 manuals and the PK5500
 //! installation instructions.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::eeprom::{self, Kind};
 use super::panel::*;
@@ -25,6 +25,16 @@ const STAR_MENU: [(u8, &str); 9] = [
     (7, "Output Control"),
     (9, "No-Entry Arm"),
     (0, "Quick Arm"),
+];
+
+/// Wire status `0xB8`: `*` menu items available while the partition is armed.
+const STAR_MENU_ARMED: [(u8, &str); 6] = [
+    (1, "Interior Arm"),
+    (2, "Trouble Display"),
+    (3, "Alarm Memory"),
+    (4, "Door Chime"),
+    (7, "Output Control"),
+    (0, "Quick Exit"),
 ];
 
 const FN_MENU: [(u8, &str); 11] = [
@@ -70,7 +80,7 @@ impl Panel {
             KpMode::Normal => self.k32_normal(key, now),
             KpMode::Star { idx } => self.k32_star(idx, key, now),
             KpMode::NeedCode { purpose, buf } => self.k_need_code(purpose, buf, key, now),
-            KpMode::Bypass { buf, idx } => self.k32_bypass(buf, idx, key),
+            KpMode::Bypass { buf, idx } => self.k32_bypass(buf, idx, key, now),
             KpMode::Troubles { idx, sub, .. } => self.k32_troubles(idx, sub, key),
             KpMode::Memory { idx, .. } => self.k32_memory(idx, key),
             KpMode::UserCodes { slot, buf, idx, attrs } => self.k32_usercodes(slot, buf, idx, attrs, key),
@@ -87,15 +97,17 @@ impl Panel {
     fn k32_normal(&mut self, key: Key, now: Instant) -> KpMode {
         match key {
             Key::Digit(d) => {
+                self.temp_msg = None;
                 self.key_beep();
                 self.buf.push(char::from(b'0' + d));
-                if self.buf.len() >= 4 {
+                if self.buf.len() >= self.code_len() {
                     let code = std::mem::take(&mut self.buf);
                     self.normal_code(&code, now);
                 }
                 KpMode::Normal
             }
             Key::Star => {
+                self.temp_msg = None;
                 self.key_beep();
                 self.buf.clear();
                 KpMode::Star { idx: 0 }
@@ -109,11 +121,13 @@ impl Panel {
                 KpMode::Normal
             }
             Key::Left => {
+                self.temp_msg = None;
                 self.key_beep();
                 self.lcd_scroll -= 1;
                 KpMode::Normal
             }
             Key::Right => {
+                self.temp_msg = None;
                 self.key_beep();
                 self.lcd_scroll += 1;
                 KpMode::Normal
@@ -122,18 +136,22 @@ impl Panel {
         }
     }
 
-    fn star_label(&self, idx: usize) -> &'static str {
-        let (d, label) = STAR_MENU[idx % STAR_MENU.len()];
-        let armed = self.armed.is_some();
-        match d {
-            1 if armed => "Interior Arm",
-            0 if armed => "Quick Exit",
-            _ => label,
+    fn star_menu(&self) -> &'static [(u8, &'static str)] {
+        if self.armed.is_some() {
+            &STAR_MENU_ARMED
+        } else {
+            &STAR_MENU
         }
     }
 
+    fn star_label(&self, idx: usize) -> &'static str {
+        let menu = self.star_menu();
+        menu[idx % menu.len()].1
+    }
+
     fn k32_star(&mut self, idx: usize, key: Key, now: Instant) -> KpMode {
-        let n = STAR_MENU.len();
+        let menu = self.star_menu();
+        let n = menu.len();
         match key {
             Key::Left => {
                 self.key_beep();
@@ -145,7 +163,7 @@ impl Panel {
             }
             Key::Star => {
                 self.key_beep();
-                let d = STAR_MENU[idx % n].0;
+                let d = menu[idx % n].0;
                 self.star_function(d, now)
             }
             Key::Digit(d) => {
@@ -170,6 +188,7 @@ impl Panel {
                 }
                 if !disarmed {
                     self.error_tone();
+                    self.temp_at("Function Not", "Available", 2000, now);
                     return KpMode::Normal;
                 }
                 if self.ee.toggle(self.model, "015", 5) || self.ee.toggle(self.model, "022", 1) {
@@ -194,7 +213,7 @@ impl Panel {
                 }
             }
             4 => {
-                self.toggle_chime();
+                self.toggle_chime_at(now);
                 KpMode::Normal
             }
             5 if disarmed => KpMode::NeedCode { purpose: CodeFor::UserCodes, buf: String::new() },
@@ -209,11 +228,13 @@ impl Panel {
                     self.arm(ArmHow::Quick, 0, now);
                 } else {
                     self.error_tone();
+                    self.temp_at("Function Not", "Available", 2000, now);
                 }
                 KpMode::Normal
             }
             _ => {
                 self.error_tone();
+                self.temp_at("Function Not", "Available", 2000, now);
                 KpMode::Normal
             }
         }
@@ -234,7 +255,7 @@ impl Panel {
         self.dirty = true;
     }
 
-    fn k32_bypass(&mut self, mut buf: String, idx: usize, key: Key) -> KpMode {
+    fn k32_bypass(&mut self, mut buf: String, idx: usize, key: Key, now: Instant) -> KpMode {
         let n = self.n().max(1);
         match key {
             Key::Left => {
@@ -279,7 +300,7 @@ impl Panel {
                         if !list.is_empty() {
                             self.saved_bypass = list;
                             self.beeps(3);
-                            self.temp("Bypass Group", "Programmed", 1800);
+                            self.temp_at("Bypass Group", "Programmed", 1800, now);
                             self.log(EvKind::Info, "Bypass group saved ([95])");
                             self.out.push(Out::Save);
                         } else {
@@ -298,7 +319,7 @@ impl Panel {
                         }
                         if any {
                             self.beeps(3);
-                            self.temp("Bypass Group", "Recalled", 1800);
+                            self.temp_at("Bypass Group", "Recalled", 1800, now);
                             self.log(EvKind::Info, "Saved bypass group recalled ([91])");
                         } else {
                             self.error_tone();
@@ -538,16 +559,17 @@ impl Panel {
                 stay(None, String::new(), idx, attrs)
             }
             Key::Digit(d) => {
+                let need = self.code_len();
                 self.key_beep();
                 buf.push(char::from(b'0' + d));
-                if buf.len() < 4 {
+                if buf.len() < need {
                     return stay(Some(s), buf, idx, attrs);
                 }
                 if s == "40" && self.ee.toggle(self.model, "015", 6) {
                     self.error_tone();
                     return stay(None, String::new(), idx, attrs);
                 }
-                let taken = self.ee.find_code(&buf).map_or(false, |o| o != s);
+                let taken = self.match_code(&buf).map_or(false, |o| o != s);
                 if taken {
                     self.error_tone();
                 } else {
@@ -592,7 +614,7 @@ impl Panel {
                         self.clock_offset_ms = util::offset_to_time(util::now_ms(), hh, mm);
                         self.troubles &= !tb::CLOCK;
                         self.beeps(3);
-                        self.temp("Time and Date", "Saved", 1500);
+                        self.temp_at("Time and Date", "Saved", 1500, now);
                         self.log(EvKind::Info, format!("Panel clock set to {:02}:{:02}", hh, mm));
                         self.out.push(Out::Save);
                     } else {
@@ -654,6 +676,7 @@ impl Panel {
                     self.long_beep();
                 }
                 let on = self.auto_arm;
+                self.temp_at("Auto-Arm", if on { "Enabled" } else { "Disabled" }, 2000, now);
                 self.log(EvKind::Info, if on { "Auto arm enabled" } else { "Auto arm disabled" });
                 self.out.push(Out::Save);
                 back
@@ -664,13 +687,13 @@ impl Panel {
             }
             5 => {
                 self.beeps(3);
-                self.temp("DLS Enabled", "for 6 Hours", 2500);
+                self.temp_at("DLS Enabled", "for 6 Hours", 2500, now);
                 self.log(EvKind::Info, "Downloading window opened for six hours");
                 back
             }
             6 => {
                 self.error_tone();
-                self.temp("User Call-Up", "Not Programmed", 2500);
+                self.temp_at("User Call-Up", "Not Programmed", 2500, now);
                 back
             }
             8 => {
@@ -764,10 +787,14 @@ impl Panel {
     }
 
     fn command_output(&mut self, n: u8, now: Instant) -> KpMode {
+        let dur = self.ee.entry_or(Model::Pc1832, "170", 0, 5).clamp(1, 30) as u64;
+        self.cmd_out_active = Some((n, now + Duration::from_secs(dur)));
         if n == 2 {
             self.sensor_reset(now);
+            self.temp_at("Sensor Reset", "In Progress", 2000, now);
         } else {
             self.beeps(1);
+            self.temp_at(&format!("Command O/P {}", n), "Active", 2000, now);
             self.log(EvKind::Info, format!("Command output {} activated", n));
         }
         KpMode::Normal
@@ -777,6 +804,12 @@ impl Panel {
     pub fn leds_5500(&self, now: Instant) -> [Led; 4] {
         if self.all_on(now) || self.walk_test {
             return [Led::Flash, Led::Flash, Led::Flash, Led::On];
+        }
+        // PC1832 [016] Option 3: Keypad Blanking turns off Ready/Armed/AC LEDs (0x40),
+        // flashing Trouble only if a trouble exists (0x17).
+        if self.is_blanked_1832(now) {
+            let trb = if self.troubles != 0 { Led::Flash } else { Led::Off };
+            return [Led::Off, Led::Off, trb, Led::Off];
         }
         let ready = if self.armed.is_none() && self.exit.is_none() && self.ready() { Led::On } else { Led::Off };
         let armed = if self.armed.is_some() || self.exit.is_some() {
@@ -789,7 +822,13 @@ impl Panel {
         } else {
             Led::Off
         };
-        let trouble = if matches!(self.kp, KpMode::Troubles { .. }) && self.troubles != 0 {
+        // PC1832 [013] Option 3: Trouble LED shows all troubles while armed (OFF = fire only).
+        let show_trouble = self.armed.is_none()
+            || self.ee.toggle(Model::Pc1832, "013", 3)
+            || (self.troubles & tb::FIRE_LOOP) != 0;
+        let trouble = if !show_trouble {
+            Led::Off
+        } else if matches!(self.kp, KpMode::Troubles { .. }) && self.troubles != 0 {
             Led::Flash
         } else if self.troubles != 0 {
             Led::On
@@ -811,6 +850,9 @@ impl Panel {
             let full: String = std::iter::repeat('\u{2588}').take(16).collect();
             return LcdOut { lines: [full.clone(), full], cursor: None };
         }
+        if self.is_blanked_1832(now) {
+            return plain("", "");
+        }
         if let Some((a, b, until)) = &self.temp_msg {
             if now < *until {
                 return plain(a, b);
@@ -818,6 +860,13 @@ impl Panel {
         }
         if self.lockout_until.map_or(false, |t| now < t) {
             return plain("Keypad Lockout", "Active");
+        }
+        if self.pc1832_blank_wake {
+            let stars = "*".repeat(self.buf.len());
+            return LcdOut {
+                lines: [pad("Enter Access"), pad(&format!("Code {}", stars))],
+                cursor: Some((1, 5 + self.buf.len().min(self.code_len()))),
+            };
         }
         match &self.kp {
             KpMode::Program(p) => self.lcd_program(p),
@@ -829,7 +878,7 @@ impl Panel {
                     _ => "Enter Access",
                 };
                 let stars = "*".repeat(buf.len());
-                LcdOut { lines: [pad(title), pad(&format!("Code {}", stars))], cursor: Some((1, 5 + buf.len().min(4))) }
+                LcdOut { lines: [pad(title), pad(&format!("Code {}", stars))], cursor: Some((1, 5 + buf.len().min(self.code_len()))) }
             }
             KpMode::Bypass { buf, idx } => {
                 let i = idx % self.n().max(1);
@@ -940,11 +989,11 @@ impl Panel {
     }
 
     fn lcd_idle(&self, now: Instant, wall_ms: i64) -> LcdOut {
-        // Live asterisk feedback while typing a 4-digit code in Normal or Entry Delay mode.
+        // Live asterisk feedback while typing a 4- or 6-digit code in Normal or Entry Delay mode.
         if !self.buf.is_empty() {
             let stars = "*".repeat(self.buf.len());
             let title = if self.entry.is_some() {
-                "Entry Active"
+                if self.memory_flag { "Entry Delay" } else { "Entry Active" }
             } else if self.armed.is_some() {
                 "Enter Code to"
             } else {
@@ -952,7 +1001,7 @@ impl Panel {
             };
             return LcdOut {
                 lines: [pad(title), pad(&format!("Code {}", stars))],
-                cursor: Some((1, 5 + self.buf.len().min(4))),
+                cursor: Some((1, 5 + self.buf.len().min(self.code_len()))),
             };
         }
 
@@ -975,6 +1024,10 @@ impl Panel {
             return LcdOut { lines: [l1, pad(&self.label(a.zone as usize))], cursor: None };
         }
         if self.entry.is_some() {
+            if self.memory_flag {
+                // Wire status 0x0D: Entry Delay After Alarm
+                return plain("Entry Delay", "After Alarm");
+            }
             return plain("Entry Active", "Enter Your Code");
         }
         if let Some(ex) = &self.exit {
@@ -982,19 +1035,45 @@ impl Panel {
             if self.bypass_any() && phase % 2 == 1 {
                 return plain("* WARNING *", "Bypass Active");
             }
+            if ex.how == ArmHow::NoEntry {
+                // Wire status 0x09: Arming With No Entry Delay
+                return plain("Arming", "No Entry Delay");
+            }
             return plain("Exit Delay in", "Progress");
         }
         if self.auto_pre.is_some() {
             return plain("Auto-Arm in", "Progress");
         }
+        if let Some((out_n, until)) = self.cmd_out_active {
+            if now < until {
+                // Wire status 0x33: Command Output in Progress
+                return if out_n == 2 {
+                    plain("Sensor Reset", "In Progress")
+                } else {
+                    plain(&format!("Command O/P {}", out_n), "In Progress")
+                };
+            }
+        }
         if let Some(a) = &self.armed {
+            if a.quick_exit.map_or(false, |t| now < t) {
+                // Wire status 0x0B: Quick Exit in Progress
+                return plain("Quick Exit in", "Progress");
+            }
+            if a.reactivate_at.map_or(false, |t| now < t) {
+                return plain("Exit Delay in", "Progress");
+            }
             let mut items: Vec<(String, String)> = vec![("Enter Code to".to_string(), "Disarm System".to_string())];
-            let mode = match (a.mode, a.no_entry) {
-                (_, true) => "No Entry Delay",
-                (ArmMode::Stay, false) => "In Stay Mode",
-                (ArmMode::Away, false) => "In Away Mode",
+            // Wire status 0x04 / 0x05 / 0x06 / 0x16
+            let (arm_l1, arm_l2) = match (a.mode, a.no_entry) {
+                (ArmMode::Stay, true) => ("Armed Stay", "No Entry Delay"),
+                (ArmMode::Away, true) => ("Armed Away", "No Entry Delay"),
+                (ArmMode::Stay, false) => ("System Armed", "In Stay Mode"),
+                (ArmMode::Away, false) => ("System Armed", "In Away Mode"),
             };
-            items.push(("System Armed".to_string(), mode.to_string()));
+            items.push((arm_l1.to_string(), arm_l2.to_string()));
+            if self.ee.toggle(Model::Pc1832, "016", 7) && self.bypass_any() {
+                items.push(("Bypass Active".to_string(), "Zones Bypassed".to_string()));
+            }
             if self.ee.toggle(Model::Pc1832, "kp077", 7) {
                 for &z in &self.memory[0] {
                     items.push(("Alarm Memory".to_string(), self.label(z as usize)));
@@ -1009,12 +1088,20 @@ impl Panel {
         let mut items: Vec<(String, String)> = Vec::new();
         let open = self.open_zones();
         if self.ready() {
-            items.push(("System is".to_string(), "Ready to Arm".to_string()));
+            if !open.is_empty() {
+                // Wire status 0x02: Ready to Arm with Force-Armable / Stay zones open
+                items.push(("System Ready".to_string(), "Force Arm".to_string()));
+            } else {
+                items.push(("System is".to_string(), "Ready to Arm".to_string()));
+            }
         } else {
             items.push(("Secure System".to_string(), "Before Arming".to_string()));
         }
         for &z in &open {
             items.push((self.label(z as usize), "Open".to_string()));
+        }
+        if self.manual_bypass_any() {
+            items.push(("Bypass Active".to_string(), "(*1) to View".to_string()));
         }
         if self.memory_flag && !self.memory[0].is_empty() {
             items.push(("Alarm Memory".to_string(), "Press (*3) View".to_string()));
@@ -1115,9 +1202,14 @@ impl Panel {
                     }
                     LcdOut { lines: [pad(&format!("({}) Attributes", s)), pad(&format!("Opt {}", opts))], cursor: None }
                 } else {
+                    let hdr = if self.code_len() == 6 {
+                        format!("({}) Enter 6-Dig", s)
+                    } else {
+                        format!("({}) Enter New", s)
+                    };
                     LcdOut {
-                        lines: [pad(&format!("({}) Enter New", s)), pad(&format!("Code {}", "*".repeat(buf.len())))],
-                        cursor: Some((1, 5 + buf.len().min(4))),
+                        lines: [pad(&hdr), pad(&format!("Code {}", "*".repeat(buf.len())))],
+                        cursor: Some((1, 5 + buf.len().min(self.code_len()))),
                     }
                 }
             }

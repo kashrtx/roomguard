@@ -211,6 +211,30 @@ pub struct SavedArm {
     pub user: u8,
 }
 
+/// A VISTA-20P `#64` schedule entry (01-16 end-user, 17-32 installer).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct VistaSched {
+    /// Schedule number (1..=32).
+    pub num: u8,
+    /// Event code: 01=Output On, 04=Forced Stay Arm, 05=Forced Away Arm,
+    /// 06=Auto Disarm, 07=Display REMINDER, 11=Periodic Test Report.
+    pub event: u8,
+    /// Output device (01..=18) for event 01, or partition (1).
+    pub device: u8,
+    /// Start hour (0..=23) and minute (0..=59).
+    pub hour: u8,
+    pub minute: u8,
+    /// Day-of-week mask: bit 0=Sun, 1=Mon, ..., 6=Sat (SMTWTFS).
+    pub days: u8,
+    /// Repeat option: 0=once, 1=weekly, 2=biweekly, 3=every 3rd week, 4=every 4th week.
+    pub repeat: u8,
+    #[serde(skip)]
+    pub last_fired_ordinal: Option<u32>,
+    #[serde(skip)]
+    pub last_fired_min: Option<u16>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PanelSave {
@@ -232,6 +256,9 @@ pub struct PanelSave {
     pub voice_level: u8,
     pub voice_on: bool,
     pub clean_exit: bool,
+    pub vista_macros: [String; 4],
+    pub vista_outputs: Vec<bool>,
+    pub vista_schedules: Vec<VistaSched>,
 }
 
 impl Default for PanelSave {
@@ -255,6 +282,9 @@ impl Default for PanelSave {
             voice_level: 5,
             voice_on: true,
             clean_exit: true,
+            vista_macros: Default::default(),
+            vista_outputs: Vec::new(),
+            vista_schedules: Vec::new(),
         }
     }
 }
@@ -305,6 +335,12 @@ pub struct Panel {
     pub bell_sent: BellPattern,
     pub bell_test_until: Option<Instant>,
     pub util_until: Option<Instant>,
+    /// Active PC1832 `[*][7][1..4]` command output window (wire status `0x33`).
+    pub cmd_out_active: Option<(u8, Instant)>,
+    /// PC1832 `[016]` Opt 3 + 4: waiting for an access code to wake a blanked keypad.
+    pub pc1832_blank_wake: bool,
+    /// Prevents duplicate Contact ID 459 (Recent Closing) logs in one armed period.
+    pub recent_close_logged: bool,
     pub temp_msg: Option<(String, String, Instant)>,
     pub lcd_scroll: i32,
     pub last_bypass: Vec<u8>,
@@ -344,6 +380,32 @@ pub struct Panel {
     /// the 1.1 s panel answer + confirmation beep, so a closing door/motion zone
     /// never causes a stale "not ready to arm" announcement).
     pub vista_pending_status: Option<Instant>,
+    /// Logical relay/trigger outputs 01..=18 ([Code] + # + 7 / # + 8).
+    pub vista_outputs: [bool; 18],
+    /// Four 16-keystroke macro strings programmed via [Master] + # + 66.
+    pub vista_macros: [String; 4],
+    /// User (01-16) and Installer (17-32) schedules programmed via # + 64.
+    pub vista_schedules: Vec<VistaSched>,
+    /// Active 6160V Voice Message Center recording (# + 0 + 1, stop with 1).
+    pub vista_msg_recording: Option<Instant>,
+    /// True when a recorded 6160V voice message is waiting (# + 0 + 3 plays & clears).
+    pub vista_msg_waiting: bool,
+    /// Last voice status press (# + 0 + * or # + *): pressing * again within 10 s speaks up to 3 faults.
+    pub vista_status_at: Option<Instant>,
+    /// Which user slot armed the system (used for Guest authority level 2 enforcement).
+    pub vista_armed_by_slot: Option<String>,
+    /// Active Type 07 schedule reminder display ("REMINDER" on Line 2 until acknowledged).
+    pub vista_reminder_until: Option<Instant>,
+    /// Active partition view (1..=3 via [Code] + * + [0-3] GoTo Partition).
+    pub vista_partition: u8,
+    /// When GoTo Partition switched away from Partition 1 (returns after 120 s idle).
+    pub vista_partition_at: Option<Instant>,
+    /// Periodic test report interval in days (set via [Installer] + # + 0 + 0/1/2).
+    pub vista_periodic_test_days: u8,
+    /// Latest wall-clock ms passed into tick(), used for #63 clock editing & schedules.
+    pub vista_wall_ms: i64,
+    /// True after a VISTA-20P Exit Error Alarm (`0xEA` on the ECP wire) until disarmed.
+    pub vista_exit_alarm: bool,
 }
 
 impl Panel {
@@ -404,6 +466,9 @@ impl Panel {
             bell_sent: BellPattern::Off,
             bell_test_until: None,
             util_until: None,
+            cmd_out_active: None,
+            pc1832_blank_wake: false,
+            recent_close_logged: false,
             temp_msg: None,
             lcd_scroll: 0,
             last_bypass: save.last_bypass,
@@ -434,6 +499,25 @@ impl Panel {
             vista_test_since: None,
             vista_voice_on: save.voice_on,
             vista_pending_status: None,
+            vista_outputs: {
+                let mut arr = [false; 18];
+                for (i, &v) in save.vista_outputs.iter().take(18).enumerate() {
+                    arr[i] = v;
+                }
+                arr
+            },
+            vista_macros: save.vista_macros,
+            vista_schedules: save.vista_schedules,
+            vista_msg_recording: None,
+            vista_msg_waiting: false,
+            vista_status_at: None,
+            vista_armed_by_slot: None,
+            vista_reminder_until: None,
+            vista_partition: 1,
+            vista_partition_at: None,
+            vista_periodic_test_days: 0,
+            vista_wall_ms: util::now_ms(),
+            vista_exit_alarm: false,
         };
         // Like a real panel after a power cut, come back armed if it was armed.
         if let Some(a) = save.armed {
@@ -495,6 +579,9 @@ impl Panel {
             voice_level: self.vista_voice_level,
             voice_on: self.vista_voice_on,
             clean_exit,
+            vista_macros: self.vista_macros.clone(),
+            vista_outputs: self.vista_outputs.to_vec(),
+            vista_schedules: self.vista_schedules.clone(),
         }
     }
 
@@ -573,9 +660,13 @@ impl Panel {
     }
 
     pub fn log(&mut self, kind: EvKind, text: impl Into<String>) {
+        self.log_cid(kind, text, 0, '\0', 0, false);
+    }
+
+    pub fn log_cid(&mut self, kind: EvKind, text: impl Into<String>, cid: u16, qual: char, zu: u16, is_user: bool) {
         let text = text.into();
         util::log(&format!("[{}] {}", self.model.panel_name(), text));
-        self.events.push(EventRow { ts: util::now_ms(), kind, text });
+        self.events.push(EventRow { ts: util::now_ms(), kind, text, cid, qual, zu, is_user });
         if self.events.len() > MAX_EVENTS {
             let extra = self.events.len() - MAX_EVENTS;
             self.events.drain(0..extra);
@@ -594,6 +685,20 @@ impl Panel {
 
     pub fn report(&mut self, kind: ReportKind, cid: u16, zu: u16, text: String, delay_s: u32) -> u64 {
         self.next_report += 1;
+        let qualifier = if matches!(kind, ReportKind::Restore | ReportKind::Closing) { 'R' } else { 'E' };
+        let is_user = matches!(kind, ReportKind::Opening | ReportKind::Closing | ReportKind::Cancel | ReportKind::Alarm(AlarmKind::Duress));
+        // Backfill Contact ID metadata on the immediately preceding event log entry if unset
+        // so the VISTA-20P #60 event log always displays authentic CID codes.
+        if cid > 0 {
+            if let Some(last) = self.events.last_mut() {
+                if last.cid == 0 {
+                    last.cid = cid;
+                    last.qual = qualifier;
+                    last.zu = zu;
+                    last.is_user = is_user;
+                }
+            }
+        }
         if !self.comms_enabled() {
             return self.next_report;
         }
@@ -602,7 +707,6 @@ impl Panel {
         } else {
             String::new()
         };
-        let qualifier = if matches!(kind, ReportKind::Restore | ReportKind::Closing) { 'R' } else { 'E' };
         self.out.push(Out::Report(Report {
             id: self.next_report,
             kind,
@@ -618,8 +722,55 @@ impl Panel {
     }
 
     pub fn temp(&mut self, l1: &str, l2: &str, ms: u64) {
-        self.temp_msg = Some((l1.to_string(), l2.to_string(), Instant::now() + Duration::from_millis(ms)));
+        self.temp_at(l1, l2, ms, Instant::now());
+    }
+
+    /// Displays a temporary keypad LCD message anchored to `now` (deterministic in tests).
+    pub fn temp_at(&mut self, l1: &str, l2: &str, ms: u64, now: Instant) {
+        self.temp_msg = Some((l1.to_string(), l2.to_string(), now + Duration::from_millis(ms)));
         self.dirty = true;
+    }
+
+    /// Required access code digit length (6 digits on PC1832 when `[701]` Opt 5 is ON, else 4).
+    pub fn code_len(&self) -> usize {
+        if self.model == Model::Pc1832 && self.ee.toggle(Model::Pc1832, "701", 5) {
+            6
+        } else {
+            4
+        }
+    }
+
+    /// Matches an entered code against stored slots. On PC1832 with `[701]` Opt 5
+    /// (6-digit access codes), real panels append `"00"` to existing 4-digit codes
+    /// so factory/legacy 4-digit codes like `1234` / `5555` continue working as `123400` / `555500`.
+    pub fn match_code(&self, code: &str) -> Option<String> {
+        if let Some(s) = self.ee.find_code(code) {
+            return Some(s);
+        }
+        if self.code_len() == 6 && code.len() == 6 && code.ends_with("00") {
+            return self.ee.find_code(&code[..4]);
+        }
+        None
+    }
+
+    /// PC1832 `[016]` Option 3: keypad blanks after 30 s idle when no delay, alarm, or menu is active
+    /// (wire status `0x40` / `0x17` with Trouble flashing).
+    pub fn is_blanked_1832(&self, now: Instant) -> bool {
+        if self.model != Model::Pc1832 || !self.ee.toggle(Model::Pc1832, "016", 3) {
+            return false;
+        }
+        !self.pc1832_blank_wake
+            && now.saturating_duration_since(self.last_key_at).as_secs() >= 30
+            && matches!(self.kp, KpMode::Normal)
+            && self.buf.is_empty()
+            && self.exit.is_none()
+            && self.entry.is_none()
+            && self.alarms.is_empty()
+            && !self.all_on(now)
+            && self.auto_pre.is_none()
+            && !self.walk_test
+            && self.cmd_out_active.map_or(true, |(_, t)| now >= t)
+            && self.temp_msg.as_ref().map_or(true, |m| now >= m.2)
     }
 
     // ----- state queries -----
@@ -808,7 +959,7 @@ impl Panel {
         if !self.ready() {
             self.error_tone();
             if self.model == Model::Pc1832 {
-                self.temp("Secure System", "Before Arming <>", 2500);
+                self.temp_at("Secure System", "Before Arming <>", 2500, now);
             }
             self.log(EvKind::Info, "Arming failed because a zone is open");
             return false;
@@ -834,6 +985,8 @@ impl Panel {
             secs = 0;
         }
         self.vista_pending_status = None;
+        self.vista_exit_alarm = false;
+        self.recent_close_logged = false;
         self.shift_memory();
         self.mem_flash_until = None;
         self.memory_flag = false;
@@ -844,12 +997,13 @@ impl Panel {
         self.alarms.clear();
         self.entry = None;
         self.kp = KpMode::Normal;
+        let already_open_delay = (1..=self.n()).any(|z| self.cfg(z).kind.is_delay() && self.zones[z - 1].open);
         self.exit = Some(ExitRt {
             started: now,
             dur: Duration::from_secs(secs),
             how,
             user,
-            delay_seen: false,
+            delay_seen: already_open_delay,
             delay_closed: false,
             restarted: false,
             silent,
@@ -880,8 +1034,14 @@ impl Panel {
             ArmHow::Auto => "Auto arming",
             _ => "Arming",
         };
+        let closing_cid = match how {
+            ArmHow::Auto => 403,
+            ArmHow::Quick => 408,
+            ArmHow::StayKey | ArmHow::NoEntry => 441,
+            _ => 401,
+        };
         self.log(EvKind::Arm, format!("{} by {}", what, self.who(user)));
-        self.report(ReportKind::Closing, 401, user as u16, format!("Closing by {}", self.who(user)), 0);
+        self.report(ReportKind::Closing, closing_cid, user as u16, format!("Closing by {}", self.who(user)), 0);
         self.out.push(Out::Armed(true));
         self.out.push(Out::Save);
         self.dirty = true;
@@ -937,9 +1097,16 @@ impl Panel {
             shunt_until: None,
             reactivate_at: None,
         });
+        let auto_stayed = mode == ArmMode::Stay && !matches!(ex.how, ArmHow::StayKey | ArmHow::NoEntry);
         let text = match (mode, no_entry) {
+            (ArmMode::Stay, true) if auto_stayed => "Auto-Stay (*84): armed instant (no exit door opened during exit delay)",
             (ArmMode::Stay, true) => "Armed instant, no entry delay",
             (ArmMode::Away, true) => "Armed maximum, no entry delay",
+            (ArmMode::Stay, false) if auto_stayed && self.model == Model::Vista20p => {
+                "Auto-Stay (*84): armed stay (no exit door opened during exit delay)"
+            }
+            (ArmMode::Stay, false) if auto_stayed => "Auto-Stay: armed stay (no exit door opened during exit delay)",
+            (ArmMode::Stay, false) if self.vista_night => "Armed night-stay (perimeter + night zones active)",
             (ArmMode::Stay, false) => "Armed stay (interior zones inactive)",
             (ArmMode::Away, false) => "Armed away",
         };
@@ -956,7 +1123,13 @@ impl Panel {
             self.squawk(1);
         }
         for z in 1..=self.n() {
-            if !self.violated(z) || self.zones[z - 1].bypassed {
+            let zr = self.zones[z - 1];
+            if !self.violated(z) || zr.bypassed {
+                continue;
+            }
+            // A supervisory zone fault alone (e.g. brief camera disconnect) reports
+            // as a trouble rather than firing an exit-fault or burglary alarm.
+            if zr.fault && !zr.open && !zr.tamper {
                 continue;
             }
             let c = self.cfg(z);
@@ -966,17 +1139,32 @@ impl Panel {
             }
             // A force armed zone that's still open is left out until it
             // closes, then it works normally.
-            if c.force_arm && !kind.is_delay() {
+            if c.force_arm && !kind.is_delay() && !zr.tamper {
                 continue;
             }
-            if (kind.is_delay() || (self.model == Model::Vista20p && kind.is_stay_away())) && self.entry.is_none() {
+            if !zr.tamper && (kind.is_delay() || (self.model == Model::Vista20p && kind.is_stay_away())) && self.entry.is_none() {
                 if exit_fault {
-                    self.log(EvKind::Alarm, format!("Audible exit fault, {} left open", self.label(z)));
+                    if self.model == Model::Vista20p {
+                        self.vista_exit_alarm = true;
+                    }
+                    self.log_cid(
+                        EvKind::Alarm,
+                        format!("Audible exit fault, {} left open", self.label(z)),
+                        374,
+                        'E',
+                        z as u16,
+                        false,
+                    );
                 }
                 self.start_entry(z as u8, now, exit_fault);
             } else {
                 self.zone_tripped(z, now);
             }
+        }
+        // Announce final armed mode on the 6160V once the exit delay finishes
+        // (unless an exit-error entry delay or alarm is already speaking).
+        if self.model == Model::Vista20p && self.entry.is_none() && self.alarms.is_empty() {
+            self.vista_speak_armed(mode, no_entry);
         }
     }
 
@@ -988,6 +1176,8 @@ impl Panel {
         self.entry = None;
         self.alarms.clear();
         self.auto_pre = None;
+        self.vista_exit_alarm = false;
+        self.recent_close_logged = false;
         for z in self.zones.iter_mut() {
             z.bypassed = false;
             z.auto_bypass = false;
@@ -998,7 +1188,7 @@ impl Panel {
             match self.model {
                 Model::Pc1550 => self.mem_flash_until = Some(now + Duration::from_secs(120)),
                 Model::Pc1832 => {
-                    self.temp("Alarm Occurred", "While Armed  <>", 4000);
+                    self.temp_at("Alarm Occurred", "While Armed  <>", 4000, now);
                     self.pending_kp = Some(KpMode::Memory { level: 0, idx: 0 });
                 }
                 Model::Vista20p => {}
@@ -1060,7 +1250,7 @@ impl Panel {
                 self.log(EvKind::Info, format!("Zone {} ({}) shut down after {} alarms (swinger)", zone, label, limit));
             }
         }
-        if self.alarms.iter().any(|a| a.kind == kind && a.zone == zone && !a.silenced) {
+        if self.live_alarms(now).any(|a| a.kind == kind && a.zone == zone) {
             return;
         }
         let mut bell = Duration::from_secs(self.bell_minutes() * 60);
@@ -1082,6 +1272,23 @@ impl Panel {
             self.out.push(Out::Snapshot(kind.label().to_lowercase()));
         }
         self.log(EvKind::Alarm, text);
+        // Authentic wire event 0x4B (PC1832) & Contact ID 459 (VISTA-20P): Recent Closing
+        // when a burglary alarm trips within 2 minutes (120 s) of arming.
+        if kind == AlarmKind::Burglary && zone > 0 && !self.recent_close_logged {
+            if let Some(a) = self.armed {
+                if now.saturating_duration_since(a.since).as_secs() <= 120 {
+                    self.recent_close_logged = true;
+                    self.log_cid(
+                        EvKind::Alarm,
+                        "Recent closing alarm (within 2 min of arming)",
+                        459,
+                        'E',
+                        a.user as u16,
+                        true,
+                    );
+                }
+            }
+        }
         if self.model == Model::Vista20p && kind != AlarmKind::Duress {
             self.vista_last_voice_alarm = Some(now);
             self.vista_speak_alarm(kind, zone);
@@ -1138,6 +1345,9 @@ impl Panel {
             self.key_beep();
         } else if delayed {
             self.beeps(3);
+            if self.model == Model::Pc1832 {
+                self.temp_at("Activate", "Stay/Away Zones", 2500, now);
+            }
             self.log(EvKind::Arm, format!("Interior zones come back in {} seconds (night arming)", secs));
         } else {
             self.beeps(3);
@@ -1209,10 +1419,19 @@ impl Panel {
         if self.model == Model::Vista20p {
             let text: &str = match &self.vista_mode {
                 VistaKp::Command { quick: true, .. } => {
-                    "Quick prefix #: press * for voice status, 0+2 for voice volume, or 2/3/4/7 to quick arm (when *21 is enabled)."
+                    "Quick prefix #: press * for voice status, 0+1 record memo, 0+2 voice volume, 0+3 play memo, or 2/3/4/7 quick arm (*21)."
                 }
                 VistaKp::Command { quick: false, .. } => {
-                    "Code accepted: press 1 OFF, 2 AWAY, 3 STAY, 4 MAX, 5 TEST, 6 BYPASS, 7 INSTANT, 8 CODE, or 9 CHIME."
+                    "Code accepted: 1 OFF, 2 AWAY, 3 STAY, 4 MAX, 5 TEST, 6 BYPASS, 7 INSTANT, 8 CODE, 9 CHIME, # advanced (#60/#63/#64/#66/#7/#8), * partition, 0 global."
+                }
+                VistaKp::HashCmd { buf, .. } => {
+                    if buf == "6" {
+                        "Master command #6: press 0 Event Log (#60), 3 Time/Date (#63), 4 Schedules (#64), or 6 Macros (#66)."
+                    } else if buf == "0" {
+                        "Periodic test (#0): press 0 for 24h, 1 for 7 days, or 2 for 28 days."
+                    } else {
+                        "Advanced command #: press 60 Event Log, 63 Time/Date, 64 Schedules, 66 Macros, 7 Output On, or 8 Output Off."
+                    }
                 }
                 VistaKp::Bypass { buf, .. } => {
                     if buf.is_empty() {
@@ -1221,16 +1440,20 @@ impl Panel {
                         "Zone bypass: enter the second digit of the zone number."
                     }
                 }
-                VistaKp::TestWait => "Test mode: press 0 for Walk Test (Code + 1 ends it), or 1 for Dialer Test.",
-                VistaKp::UserCode { slot, buf, first } => {
+                VistaKp::TestWait { .. } => "Test mode: press 0 for Walk Test (Code + 1 ends it), or 1 for Dialer Test.",
+                VistaKp::UserCode { slot, buf, first, .. } => {
                     if slot.len() < 2 {
                         "User codes: enter a 2-digit user number (02 = master, 03-49 = users)."
                     } else if buf == "#" {
-                        "User codes: press 0 to delete this user code."
+                        "User attributes: 0 delete, 1 authority (0-4), 2 access group, 3 partition, 5 pager."
+                    } else if buf == "#1" {
+                        "Authority level: 0 Standard, 1 Arm-Only, 2 Guest (disarms only if used to arm), 3 Duress (CID 121), 4 Partition Master."
+                    } else if buf.starts_with('#') {
+                        "Enter attribute value digit(s) to save."
                     } else if !first.is_empty() {
                         "User codes: re-enter the new 4-digit master code to confirm."
                     } else {
-                        "User codes: enter the new 4-digit code, or press # 0 to delete this user."
+                        "User codes: enter the new 4-digit code, or press # for delete/attributes (#0, #1, #2, #3, #5)."
                     }
                 }
                 VistaKp::Program { field, review, .. } => match (field, *review) {
@@ -1240,15 +1463,55 @@ impl Panel {
                 },
                 VistaKp::Volume => "Voice volume: press 3 louder, 6 quieter, 4 toggle voice status/chime on or off, # when done.",
                 VistaKp::NightWait { .. } => "Armed STAY: press 3 (STAY) again within 5 seconds for NIGHT-STAY.",
+                VistaKp::TimeDate { can_edit, editing, .. } => {
+                    if *editing {
+                        "Set Time/Date: type HHMM, 1=PM/2=AM, YYMMDD (* advances/saves at last digit, # moves back)."
+                    } else if *can_edit {
+                        "Time/Date display: press * to edit clock (while disarmed), or any other key to exit."
+                    } else {
+                        "Time/Date display: press any key to exit (auto-clears after 30 s)."
+                    }
+                }
+                VistaKp::EventLog { .. } => "Event Log (#60): press * for older events, # for newer events, or any other key to exit.",
+                VistaKp::Schedule { .. } => "Scheduling (#64): enter schedule 01-16 (00=quit), event (00/01/04/05/06/07), time, days SMTWTFS, repeat 0-4.",
+                VistaKp::MacroPgm { slot, viewing, .. } => {
+                    if slot.is_none() {
+                        "Macro programming (#66): press 1-4 to select macro, or 0 to exit."
+                    } else if *viewing {
+                        "Macro display: press * to edit this macro, or # / 0 to exit."
+                    } else {
+                        "Macro edit: enter keystrokes (up to 16), press AWAY (D) for command separator 'F', press AWAY (D) again to save."
+                    }
+                }
+                VistaKp::MacroCode { .. } => "Macro key activated: enter your 4-digit user code within 30 s to run the macro.",
+                VistaKp::OutputCmd { activate, .. } => {
+                    if *activate {
+                        "Activate output (#7): enter 2-digit device number (01-18)."
+                    } else {
+                        "Deactivate output (#8): enter 2-digit device number (01-18)."
+                    }
+                }
+                VistaKp::GoToPart => "GoTo Partition: enter partition number 1-3 (0 returns to Partition 1).",
+                VistaKp::MultiPart { .. } => "Multi-Partition command: press 1 OFF, 2 AWAY, 3 STAY, 4 MAX, or 7 INSTANT.",
                 VistaKp::Normal => {
-                    if self.entry.is_some() {
+                    if self.vista_msg_recording.is_some() {
+                        "Recording 6160V voice memo: press 1 to stop and save."
+                    } else if self.entry.is_some() {
                         "Entry delay: enter your 4-digit code + 1 (OFF) to disarm."
                     } else if self.exit.map_or(false, |e| matches!(e.how, ArmHow::StayKey | ArmHow::NoEntry)) {
                         "Exit delay: arming Stay / Instant."
                     } else if self.exit.map_or(false, |e| e.how == ArmHow::MaxKey) {
-                        "Exit delay: arming Maximum (no entry delay). Leave through the doorway before time expires."
+                        if self.ee.entry_or(Model::Vista20p, "84", 0, 1) == 0 || self.exit.map_or(false, |e| e.delay_seen) {
+                            "Exit delay: arming Maximum (no entry delay)."
+                        } else {
+                            "Exit delay: leave through the doorway for Maximum, or stay inside for Auto-Stay Instant (*84)."
+                        }
                     } else if self.exit.is_some() {
-                        "Exit delay: leave through the doorway to arm Away, or stay inside for Auto-Stay."
+                        if self.ee.entry_or(Model::Vista20p, "84", 0, 1) == 0 || self.exit.map_or(false, |e| e.delay_seen) {
+                            "Exit delay: arming Away."
+                        } else {
+                            "Exit delay: leave through the doorway to arm Away, or stay inside for Auto-Stay (*84)."
+                        }
                     } else if self.vista_alarm_mem_zone.is_some() {
                         "Alarm memory displayed: enter [Code] + 1 (OFF) a second time to clear."
                     } else {
@@ -1317,6 +1580,8 @@ impl Panel {
                     "Entry delay: enter your code to disarm."
                 } else if self.exit.map_or(false, |e| e.how == ArmHow::StayKey || e.how == ArmHow::NoEntry) {
                     "Exit delay: arming in Stay mode."
+                } else if self.exit.map_or(false, |e| e.how == ArmHow::AwayKey || e.delay_seen) {
+                    "Exit delay: arming in Away mode."
                 } else if self.exit.is_some() {
                     "Exit delay: leave through the doorway to arm Away, or stay in the room and it arms in Stay mode."
                 } else {
@@ -1336,14 +1601,17 @@ impl Panel {
             self.beeps(3);
             self.log(EvKind::Info, "Quick exit, two minutes to leave");
             if self.model == Model::Pc1832 {
-                self.temp("Quick Exit in", "Progress", 2500);
+                self.temp_at("Quick Exit in", "Progress", 2500, now);
             }
         } else {
             self.error_tone();
+            if self.model == Model::Pc1832 {
+                self.temp_at("Function Not", "Available", 2000, now);
+            }
         }
     }
 
-    pub fn toggle_chime(&mut self) {
+    pub fn toggle_chime_at(&mut self, now: Instant) {
         self.chime = !self.chime;
         if self.chime {
             self.beeps(3);
@@ -1351,8 +1619,8 @@ impl Panel {
             self.long_beep();
         }
         if self.model == Model::Pc1832 {
-            let (a, b) = if self.chime { ("Door Chime", "Enabled") } else { ("Door Chime", "Disabled") };
-            self.temp(a, b, 2000);
+            let (a, b) = if self.chime { ("Door Chime", "Feature ON") } else { ("Door Chime", "Feature OFF") };
+            self.temp_at(a, b, 2000, now);
         }
         self.log(EvKind::Info, if self.chime { "Door chime on" } else { "Door chime off" });
         self.out.push(Out::Save);
@@ -1399,12 +1667,16 @@ impl Panel {
     // ----- codes -----
 
     pub fn is_duress(&self, slot: &str) -> bool {
-        self.model == Model::Pc1832 && (self.ee.attrs(slot) & 2) != 0
+        match self.model {
+            Model::Pc1832 => (self.ee.attrs(slot) & 2) != 0,
+            Model::Vista20p => (self.ee.attrs(slot) & 0x07) == 3,
+            Model::Pc1550 => false,
+        }
     }
 
-    /// A 4 digit code typed in normal mode: disarm, silence or arm.
+    /// A 4- or 6-digit code typed in normal mode: disarm, silence or arm.
     pub fn normal_code(&mut self, code: &str, now: Instant) {
-        let Some(slot) = self.ee.find_code(code) else {
+        let Some(slot) = self.match_code(code) else {
             self.bad_code(now);
             return;
         };
@@ -1477,20 +1749,27 @@ impl Panel {
             self.log(EvKind::Alarm, format!("Keypad lockout after {} wrong codes", count));
             self.report(ReportKind::Lockout, 461, 0, format!("{} wrong codes entered at the keypad", count), 0);
             self.out.push(Out::Snapshot("keypad-lockout".to_string()));
-        } else if self.bad_codes == 3 {
-            // RoomGuard's own touch, not the panel's: a photo of whoever is
-            // guessing, even with the keypad lockout off the way it ships.
-            self.out.push(Out::Snapshot("wrong-codes".to_string()));
+        } else {
+            if self.model == Model::Pc1832 {
+                // Authentic PK5500 wire status 0x8F ("Invalid Access Code")
+                self.temp_at("Invalid", "Access Code", 2000, now);
+            }
+            if self.bad_codes == 3 {
+                // RoomGuard's own touch, not the panel's: a photo of whoever is
+                // guessing, even with the keypad lockout off the way it ships.
+                self.out.push(Out::Snapshot("wrong-codes".to_string()));
+            }
         }
         self.dirty = true;
     }
 
     pub fn k_need_code(&mut self, purpose: CodeFor, mut buf: String, key: Key, now: Instant) -> KpMode {
+        let need = self.code_len();
         match key {
             Key::Digit(d) => {
                 self.key_beep();
                 buf.push(char::from(b'0' + d));
-                if buf.len() < 4 {
+                if buf.len() < need {
                     return KpMode::NeedCode { purpose, buf };
                 }
                 self.code_for(purpose, &buf, now)
@@ -1508,7 +1787,7 @@ impl Panel {
     }
 
     fn code_for(&mut self, purpose: CodeFor, code: &str, now: Instant) -> KpMode {
-        let slot = self.ee.find_code(code);
+        let slot = self.match_code(code);
         match purpose {
             CodeFor::Installer | CodeFor::Keypad => {
                 if slot.as_deref() == Some("inst") {
@@ -1627,17 +1906,18 @@ impl Panel {
                 self.key_beep();
                 p.sel.push(char::from(b'0' + d));
                 if p.reset_stage == 1 {
-                    if p.sel.len() < 4 {
+                    let need = self.code_len();
+                    if p.sel.len() < need {
                         return KpMode::Program(p);
                     }
                     let code = std::mem::take(&mut p.sel);
-                    if self.ee.code_matches("inst", &code) {
+                    if self.match_code(&code).as_deref() == Some("inst") {
                         if p.confirm_action == Some("989") {
                             p.reset_stage = 0;
                             p.confirm_action = None;
                             self.ee.set_code("40", "1234");
                             self.beeps(6);
-                            self.temp("Master Code", "Reset to 1234", 2500);
+                            self.temp_at("Master Code", "Reset to 1234", 2500, now);
                             self.log(EvKind::Program, "Master code defaulted to 1234 ([989])");
                             self.out.push(Out::Save);
                         } else {
@@ -1724,7 +2004,7 @@ impl Panel {
         }
     }
 
-    fn open_section(&mut self, mut p: Prog, key: String, _now: Instant) -> KpMode {
+    fn open_section(&mut self, mut p: Prog, key: String, now: Instant) -> KpMode {
         let Some(sp) = eeprom::spec(self.model, &key) else {
             self.error_tone();
             return KpMode::Program(p);
@@ -1743,29 +2023,29 @@ impl Panel {
                     }
                     "900" => {
                         self.beeps(3);
-                        self.temp("Panel Version", "0460 (v4.60)", 3500);
+                        self.temp_at("Panel Version", "0460 (v4.60)", 3500, now);
                         self.log(EvKind::Program, "Panel version displayed: 0460 (v4.60)");
                     }
                     "901" => {
                         self.walk_test = !self.walk_test;
                         if self.walk_test {
                             self.beeps(3);
-                            self.temp("Installer Walk", "Test Enabled", 2500);
+                            self.temp_at("Installer Walk", "Test Enabled", 2500, now);
                             self.log(EvKind::Program, "Installer walk test enabled ([901])");
                         } else {
                             self.long_beep();
-                            self.temp("Installer Walk", "Test Disabled", 2500);
+                            self.temp_at("Installer Walk", "Test Disabled", 2500, now);
                             self.log(EvKind::Program, "Installer walk test disabled ([901])");
                         }
                     }
                     "902" => {
                         self.beeps(3);
-                        self.temp("Module Superv.", "Reset Complete", 2500);
+                        self.temp_at("Module Superv.", "Reset Complete", 2500, now);
                         self.log(EvKind::Program, "Module supervision reset ([902])");
                     }
                     "903" => {
                         self.beeps(3);
-                        self.temp("Supervision", "01 PK5500 Keypad", 3500);
+                        self.temp_at("Supervision", "01 PK5500 Keypad", 3500, now);
                         self.log(EvKind::Program, "Supervision field viewed: Slot 01 PK5500");
                     }
                     "989" => {
@@ -1999,13 +2279,14 @@ impl Panel {
             },
             Kind::Code(slot) => match key {
                 Key::Digit(d) => {
+                    let need = self.code_len();
                     self.key_beep();
                     p.work.push(char::from(b'0' + d));
-                    if p.work.len() >= 4 {
+                    if p.work.len() >= need {
                         let code: String = p.work.iter().collect();
                         p.work.clear();
                         p.section = None;
-                        let taken = self.ee.find_code(&code).map_or(false, |s| s != slot);
+                        let taken = self.match_code(&code).map_or(false, |s| s != slot);
                         if taken {
                             self.error_tone();
                         } else {
@@ -2065,7 +2346,12 @@ impl Panel {
             return;
         }
         let c = self.cfg(z);
-        if !c.chime || self.zones[z - 1].bypassed {
+        let chime_allowed = if self.model == Model::Vista20p && self.ee.entry_or(Model::Vista20p, "26", 0, 0) != 0 {
+            self.ee.entry_or(Model::Vista20p, "chime_list", z.saturating_sub(1), 0) != 0
+        } else {
+            c.chime
+        };
+        if !chime_allowed || self.zones[z - 1].bypassed {
             return;
         }
         if !opened && self.camera_zone.get(z - 1).copied().unwrap_or(false) {
@@ -2201,7 +2487,7 @@ impl Panel {
         if c.kind.is_delay() || home_away_delay || interior_delay_stay {
             if a.no_entry {
                 self.trigger(AlarmKind::Burglary, z as u8, c.audible, false, now);
-            } else if self.entry.is_none() && !self.alarms.iter().any(|al| !al.silenced && al.kind == AlarmKind::Burglary) {
+            } else if self.entry.is_none() && !self.live_alarms(now).any(|al| al.kind == AlarmKind::Burglary) {
                 self.start_entry(z as u8, now, false);
             } else if self.entry.is_none() {
                 self.trigger(AlarmKind::Burglary, z as u8, c.audible, false, now);
@@ -2249,6 +2535,12 @@ impl Panel {
     // ----- keys -----
 
     fn needs_hold(&self, key: Key) -> bool {
+        if self.model == Model::Vista20p
+            && key == Key::Away
+            && matches!(self.vista_mode, VistaKp::MacroPgm { slot: Some(_), viewing: false, .. })
+        {
+            return false;
+        }
         if key.is_emergency() {
             return !(self.model == Model::Pc1550 && key == Key::Fire && self.is_programming());
         }
@@ -2265,6 +2557,7 @@ impl Panel {
             }
             return;
         }
+        let was_blanked = self.is_blanked_1832(now);
         self.last_key_at = now;
         if let Some(until) = self.lockout_until {
             if now < until {
@@ -2275,6 +2568,48 @@ impl Panel {
             } else {
                 self.lockout_until = None;
             }
+        }
+        // PC1832 [016] Option 3 & Option 4: Keypad Blanking wake handling (0x40 / 0x17).
+        // Emergency keys ALWAYS bypass blanking immediately.
+        if was_blanked && !key.is_emergency() {
+            self.key_beep();
+            if self.ee.toggle(Model::Pc1832, "016", 4) {
+                self.pc1832_blank_wake = true;
+                self.buf.clear();
+                if let Key::Digit(d) = key {
+                    self.buf.push(char::from(b'0' + d));
+                }
+            }
+            return;
+        }
+        if self.pc1832_blank_wake && !key.is_emergency() {
+            match key {
+                Key::Digit(d) => {
+                    self.key_beep();
+                    self.buf.push(char::from(b'0' + d));
+                    if self.buf.len() >= self.code_len() {
+                        let code = std::mem::take(&mut self.buf);
+                        if self.match_code(&code).map_or(false, |s| s != "inst") {
+                            self.bad_codes = 0;
+                            self.pc1832_blank_wake = false;
+                            self.beeps(2);
+                        } else {
+                            self.bad_code(now);
+                        }
+                    }
+                }
+                Key::Hash => {
+                    self.key_beep();
+                    self.buf.clear();
+                }
+                _ => {
+                    self.error_tone();
+                }
+            }
+            return;
+        }
+        if key.is_emergency() {
+            self.pc1832_blank_wake = false;
         }
         if self.needs_hold(key) {
             self.held = Some(HeldKey { key, since: now, fired: false });
@@ -2295,21 +2630,45 @@ impl Panel {
     }
 
     fn hold_complete(&mut self, key: Key, now: Instant) {
-        if key.is_emergency() {
-            self.emergency(key, now);
-            // An emergency key cancels whatever menu was open.
-            if !self.is_programming() {
-                self.kp = KpMode::Normal;
-                self.buf.clear();
-            }
-            return;
-        }
         if self.model == Model::Vista20p {
-            // Vista Function Key D (mapped to Key::Away): check field *57 entry 3
-            if key == Key::Away {
-                // *57 function codes. Single button arming needs no code.
-                let code = self.ee.entry_or(Model::Vista20p, "57", 3, 0);
+            // Vista Function Keys A (Fire), B (Panic), C (Aux), D (Away): check *57 entries 0..=3.
+            let fn_idx = match key {
+                Key::Fire => Some(0usize),
+                Key::Panic => Some(1usize),
+                Key::Aux => Some(2usize),
+                Key::Away => Some(3usize),
+                _ => None,
+            };
+            if let Some(idx) = fn_idx {
+                let code = self.ee.entry_or(Model::Vista20p, "57", idx, 0);
                 match code {
+                    0 => match idx {
+                        0 => {
+                            if !self.is_programming() {
+                                self.vista_mode = VistaKp::Normal;
+                                self.buf.clear();
+                            }
+                            self.emergency(Key::Fire, now);
+                        }
+                        1 => {
+                            if !self.is_programming() {
+                                self.vista_mode = VistaKp::Normal;
+                                self.buf.clear();
+                            }
+                            self.emergency(Key::Panic, now);
+                        }
+                        2 => {
+                            if !self.is_programming() {
+                                self.vista_mode = VistaKp::Normal;
+                                self.buf.clear();
+                            }
+                            self.emergency(Key::Aux, now);
+                        }
+                        _ => self.vista_page(),
+                    },
+                    1 => self.vista_page(),
+                    // *57 code 02: Display Time & Date (30 s, no user code needed)
+                    2 => self.vista_open_time_date(false, now),
                     3 => self.vista_arm_key(2, now),
                     4 => self.vista_arm_key(3, now),
                     5 => {
@@ -2328,12 +2687,26 @@ impl Panel {
                             self.vista_step_to_away();
                         }
                     }
+                    // *57 code 07: Output Device Command
+                    7 => self.vista_fn_output_toggle(now),
                     8 => self.vista_comm_test(),
-                    2 => self.vista_speak_status(),
+                    // *57 codes 09..=12: Macro Keys 1..=4
+                    9..=12 => self.vista_start_macro((code - 9) as usize, now),
                     _ => self.vista_page(),
                 }
                 return;
             }
+        }
+        if key.is_emergency() {
+            self.emergency(key, now);
+            // An emergency key cancels whatever menu was open.
+            if !self.is_programming() {
+                self.kp = KpMode::Normal;
+                self.buf.clear();
+            }
+            return;
+        }
+        if self.model == Model::Vista20p {
             return;
         }
         // A held 1 to 5 on the PowerSeries is function key 1 to 5.
@@ -2350,9 +2723,12 @@ impl Panel {
             }
             other => other,
         };
-        // Function keys don't work inside a [*] menu; the keypad says so.
+        // Function keys don't work inside a [*] menu; the keypad says so (wire 0x0E).
         if !matches!(self.kp, KpMode::Normal) {
             self.error_tone();
+            if self.model == Model::Pc1832 {
+                self.temp_at("Function Not", "Available", 2000, now);
+            }
             return;
         }
         let (fn_idx, default_code) = match key {
@@ -2379,7 +2755,7 @@ impl Panel {
                     self.error_tone();
                 }
             }
-            6 => self.toggle_chime(),
+            6 => self.toggle_chime_at(now),
             7 => self.system_test(now),
             8 => {
                 if self.armed.is_none() && self.exit.is_none() {
@@ -2518,7 +2894,8 @@ impl Panel {
     // ----- the clock tick -----
 
     pub fn tick(&mut self, now: Instant, wall_ms: i64) {
-        self.tick_vista(now);
+        self.vista_wall_ms = wall_ms;
+        self.tick_vista(now, wall_ms);
         if self.armed.map_or(false, |a| a.reactivate_at.map_or(false, |t| now >= t)) {
             self.finish_reactivate(now);
         }
@@ -2549,6 +2926,15 @@ impl Panel {
         }
         if self.temp_msg.as_ref().map_or(false, |m| now >= m.2) {
             self.temp_msg = None;
+            self.dirty = true;
+        }
+        if self.cmd_out_active.map_or(false, |(_, t)| now >= t) {
+            self.cmd_out_active = None;
+            self.dirty = true;
+        }
+        if self.pc1832_blank_wake && now.saturating_duration_since(self.last_key_at).as_secs() >= 30 {
+            self.pc1832_blank_wake = false;
+            self.buf.clear();
             self.dirty = true;
         }
         if !self.buf.is_empty() && now.saturating_duration_since(self.last_key_at).as_secs() >= 10 {
@@ -2743,9 +3129,12 @@ impl Panel {
                 Model::Pc1550 => self.ee.toggle(self.model, "34", 4),
                 Model::Pc1832 | Model::Vista20p => true,
             };
-            if urgency && left <= 10.0 {
+            // On PC1832, wire status 0x0D (Entry Delay After Alarm) pulses the entry tone
+            // immediately to warn the user that an alarm occurred while armed.
+            let after_alarm = self.model == Model::Pc1832 && self.memory_flag;
+            if after_alarm || (urgency && left <= 10.0) {
                 // Both PC1550 (v4.1 [34] light 4) and PC1832 emit the pulsing
-                // double-beep tone during the last 10 seconds: beep, beep, beeeep.
+                // double-beep tone during the last 10 seconds (or opening after alarm): beep, beep, beeeep.
                 return Pattern::ShortShortLong { short_ms: 94, gap_ms: 26, long_ms: 731 };
             }
             return Pattern::Steady;
