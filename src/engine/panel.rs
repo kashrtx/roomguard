@@ -659,6 +659,12 @@ impl Panel {
         self.zones.iter().any(|z| z.bypassed)
     }
 
+    /// True only when at least one zone was explicitly bypassed by the user
+    /// (excludes interior zones automatically made inactive by Stay mode).
+    pub fn manual_bypass_any(&self) -> bool {
+        self.zones.iter().any(|z| z.bypassed && !z.auto_bypass)
+    }
+
     pub fn live_alarms(&self, now: Instant) -> impl Iterator<Item = &AlarmRt> {
         self.alarms.iter().filter(move |a| !a.silenced && now < a.bell_until)
     }
@@ -934,7 +940,7 @@ impl Panel {
         let text = match (mode, no_entry) {
             (ArmMode::Stay, true) => "Armed instant, no entry delay",
             (ArmMode::Away, true) => "Armed maximum, no entry delay",
-            (ArmMode::Stay, false) => "Armed stay, interior zones bypassed",
+            (ArmMode::Stay, false) => "Armed stay (interior zones inactive)",
             (ArmMode::Away, false) => "Armed away",
         };
         self.log(EvKind::Arm, text);
@@ -963,7 +969,7 @@ impl Panel {
             if c.force_arm && !kind.is_delay() {
                 continue;
             }
-            if kind.is_delay() && self.entry.is_none() {
+            if (kind.is_delay() || (self.model == Model::Vista20p && kind.is_stay_away())) && self.entry.is_none() {
                 if exit_fault {
                     self.log(EvKind::Alarm, format!("Audible exit fault, {} left open", self.label(z)));
                 }
@@ -2034,6 +2040,7 @@ impl Panel {
         }
         let before = self.violated(z);
         let was_open = self.zones[z - 1].open;
+        let was_tamper = self.zones[z - 1].tamper;
         {
             let r = &mut self.zones[z - 1];
             r.open = open;
@@ -2045,7 +2052,7 @@ impl Panel {
         if open != was_open {
             self.chime_check(z, open);
         }
-        if after && !before {
+        if (after && !before) || (open && !was_open && !was_tamper) || (tamper && !was_tamper) {
             self.zone_tripped(z, now);
         }
         if !after && before {
@@ -2180,8 +2187,14 @@ impl Panel {
             }
             return;
         }
-        if zr.tamper || zr.fault {
+        if zr.tamper {
             self.trigger(AlarmKind::Tamper, z as u8, c.audible, false, now);
+            return;
+        }
+        // A supervisory zone fault (e.g. brief camera disconnect) reports as a
+        // trouble on the panel rather than firing an instant burglary alarm.
+        if zr.fault && !zr.open {
+            return;
         }
         let home_away_delay = self.model == Model::Pc1550 && c.kind == ZoneKind::StayAway && self.ee.toggle(self.model, "32", 3);
         let interior_delay_stay = c.kind == ZoneKind::InteriorDelay && a.mode == ArmMode::Stay;
@@ -2944,6 +2957,7 @@ impl Panel {
                     kind: self.cfg(z).kind,
                     open: r.open,
                     bypassed: r.bypassed,
+                    auto_bypass: r.auto_bypass,
                     alarm: r.alarm,
                     tamper: r.tamper,
                     fault: r.fault,
@@ -2997,6 +3011,8 @@ impl Panel {
                 "The camera's view is blocked"
             } else if self.inputs.cam_enabled && !self.inputs.cam_online {
                 "The camera stopped sending pictures"
+            } else if a.mode == ArmMode::Stay && self.zones.iter().any(|z| z.auto_bypass) {
+                "Perimeter armed, interior zones off"
             } else {
                 "Watching the room"
             };

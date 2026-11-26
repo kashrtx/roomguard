@@ -1011,7 +1011,7 @@ impl Panel {
                 (ArmMode::Stay, false) if self.vista_night => "ARMED NIGHT-STAY",
                 (ArmMode::Stay, false) => "ARMED ***STAY***",
             };
-            let byp = self.zones.iter().any(|z| z.bypassed);
+            let byp = self.manual_bypass_any();
             // After [*] restarts the exit delay, the door can be used again.
             let restart = a.quick_exit.map_or(false, |t| now < t);
             let l2 = if restart {
@@ -1050,7 +1050,7 @@ impl Panel {
         // Disarmed: check troubles or open zones
         let line1 = if self.chime {
             "DISARMED CHIME"
-        } else if self.zones.iter().any(|z| z.bypassed) {
+        } else if self.manual_bypass_any() {
             "DISARMED BYPASS"
         } else {
             "****DISARMED****"

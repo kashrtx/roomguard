@@ -91,7 +91,7 @@ fn apply(enabled: bool, exe: &Path) -> Result<(), String> {
         return Ok(());
     }
     let entry = format!(
-        "[Desktop Entry]\nType=Application\nName=RoomGuard\nComment=Camera based room alarm\nExec=\"{}\" --minimized\nTerminal=false\nX-GNOME-Autostart-enabled=true\n",
+        "[Desktop Entry]\nType=Application\nName=RoomGuard\nComment=Camera based room alarm\nExec=\"{}\" --minimized\nIcon=roomguard\nStartupWMClass=roomguard\nTerminal=false\nX-GNOME-Autostart-enabled=true\n",
         exe.display()
     );
     if let Some(dir) = path.parent() {

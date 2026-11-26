@@ -3,6 +3,33 @@
 Every release lists what changed. The release workflow copies the section for
 each version onto its GitHub release page.
 
+## [2.2.0] - 2026-11-26
+
+RoomGuard 2.2.0 adds intuitive multi-zone drawing directly on both the **Room map** and **Live** camera views, runs a fresh empty-room calibration on every launch with clear on-screen guidance, embeds native app icons on Windows, macOS, and Linux builds, and fixes false zone-bypass indicators and unexpected instant alarms.
+
+### Highlights & New Features
+
+- **Intuitive Multi-Zone Drawing (Map & Live Views):**
+  - Draw, redraw, or remove any active panel zone (`Z01`–`Z06` on PC1550; `Z01`–`Z08` on PC1832 and VistaGuard 20P) directly on either the **Room map** or **Live** camera view using the color-coded zone picker, one-click **Draw** / **Redraw** buttons in the **Zones** sidebar, or by assigning learned map portals to any zone.
+  - Each drawn zone gets a distinct color pill on the video/map, an interactive chip with one-click redraw and remove (`×`), and a per-zone **Contact / Motion** toggle so doors and windows can watch open/closed visual state while interior areas watch people and motion.
+  - Pressing `Escape` cancels an active drag-to-draw cleanly without sending `#` to the keypad.
+- **Fresh Calibration Every Launch:**
+  - RoomGuard no longer reuses stale empty-room baselines from previous sessions — every launch (and every webcam switch) begins a fresh calibration automatically once streaming while disarmed, locking today's room layout, new or moved objects, lighting, and closed contacts for every contact-enabled zone.
+  - Clear, prominent calibration banners and video overlays explain why calibration is needed and guide you through stepping out of view, with quick **Restart 5s**, **Skip for now**, and **Recalibrate** controls.
+- **Native App Icons on Every Platform:**
+  - **Windows:** Rebuilt `assets/icon/icon.ico` with standard 32-bit BGRA DIB frames (16–128 px) plus 256 px PNG, and replaced external `rc.exe`/`windres.exe` calls with a zero-dependency pure-Rust COFF `.rsrc` resource embedder in `build.rs` so the executable icon and `VS_VERSIONINFO` metadata embed reliably on every toolchain and path.
+  - **macOS:** Rebuilt `assets/icon/icon.icns` with all standard sizes (`icp4`–`ic14`), updated `Info.plist`, and fixed the release `.dmg` staging so `RoomGuard.app` (with volume icon and `/Applications` shortcut) mounts cleanly.
+  - **Linux:** Added desktop launcher & `256×256` hicolor icon installation, `StartupWMClass=roomguard` window matching, and `gio` custom-icon metadata support.
+
+### Bug Fixes
+
+- **Fixed false "Zone Bypassed" display in Stay / Auto-Stay mode:** Automatic Stay-mode interior bypasses are now distinguished from manual user bypasses — VistaGuard 20P displays `** ALL SECURE **` instead of falsely flashing `ZONE BYPASSED`, and the Zones sidebar clearly shows `Stay off` instead of `Bypassed` unless you explicitly bypassed a zone.
+- **Fixed unexpected instant alarms:**
+  - Fixed a lighting-change bug in the vision limb check that could treat the entire room as active motion when brightness shifted, and tightened limb checks to require confirmed (`Normal`+) detections while excluding people still inside the doorway or seated in an Ignore desk box from prematurely tripping Zone 2.
+  - Added Delay-first zone settling with an anti-race hold in the engine so walking through a doorway never lets an Interior/Follower zone beat the Delay zone by a fraction of a second and fire a false instant alarm.
+  - Separated brief camera `fault` drops (trouble only) from true `tamper` alarms and fixed VistaGuard 20P exit-error handling so an open interior zone at exit expiry starts Entry Delay instead of an instant zero-delay alarm.
+  - Shortened camera zone release hold from `2.5s` to `1.0s` so exiting cleanly clears zones before exit delay ends.
+
 ## [2.1.0] - 2026-11-25
 
 RoomGuard 2.1.0 introduces the **VistaGuard 20P** voice keypad, guided empty-room calibration with lighting-invariant closed-door detection, limb-aware person tracking with an **Ignore desk** workflow, studio-matched sirens and keypad acoustics, zero-delay keystroke audio, and line-by-line manual accuracy across all three panels.

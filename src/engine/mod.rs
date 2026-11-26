@@ -315,8 +315,8 @@ struct Engine {
     saved_events: u64,
     last_publish: Option<Instant>,
     seq: u64,
-    cam_motion: [bool; 2],
-    door_open: bool,
+    cam_motion: [bool; 8],
+    cam_contact_open: [bool; 8],
     cam_online: bool,
     cam_covered: bool,
     sim: [bool; 8],
@@ -362,8 +362,8 @@ impl Engine {
             saved_events: 0,
             last_publish: None,
             seq: 0,
-            cam_motion: [false; 2],
-            door_open: false,
+            cam_motion: [false; 8],
+            cam_contact_open: [false; 8],
             cam_online: true,
             cam_covered: false,
             sim: [false; 8],
@@ -416,8 +416,7 @@ impl Engine {
         self.panel.inputs.cam_online = self.cam_online;
         self.panel.inputs.cam_covered = self.cam_covered;
         self.panel.inputs.net_watch = self.cfg.operator.phone_alerts;
-        let cam = self.cfg.camera.enabled;
-        self.panel.camera_zone = [cam, cam && self.cfg.camera.doorway.is_some(), false, false, false, false, false, false];
+        self.panel.camera_zone = self.cfg.camera.camera_mask();
         self.panel.dirty = true;
     }
 
@@ -774,7 +773,7 @@ impl Engine {
     fn vision(&mut self, ev: VisionEvent, now: Instant) {
         match ev {
             VisionEvent::Motion { zone, open } => {
-                if (1..=2).contains(&zone) {
+                if (1..=8).contains(&zone) {
                     self.cam_motion[zone as usize - 1] = open;
                     self.sync_zones(now);
                 }
@@ -787,10 +786,23 @@ impl Engine {
                     self.sync_zones(now);
                 }
             }
-            VisionEvent::DoorOpen(open) => {
-                self.door_open = open;
-                self.panel.log(EvKind::Camera, if open { "Door opened (seen by the camera)" } else { "Door closed (seen by the camera)" });
-                self.sync_zones(now);
+            VisionEvent::DoorOpen { zone, open } => {
+                if (1..=8).contains(&zone) {
+                    let i = zone as usize - 1;
+                    if self.cam_contact_open[i] != open {
+                        self.cam_contact_open[i] = open;
+                        let lbl = self.panel.label(zone as usize);
+                        self.panel.log(
+                            EvKind::Camera,
+                            if open {
+                                format!("{} opened (seen by the camera)", lbl)
+                            } else {
+                                format!("{} closed (seen by the camera)", lbl)
+                            },
+                        );
+                        self.sync_zones(now);
+                    }
+                }
             }
             VisionEvent::Recognized { name } => {
                 let important = self.panel.entry.is_some() || self.panel.alarm_sounding(now);
@@ -820,18 +832,16 @@ impl Engine {
     /// tamper and fault; the PC1550 doesn't, so on it a covered or dead camera
     /// simply shows as the zone being open, the same as a cut wire.
     fn sync_zones(&mut self, now: Instant) {
-        let enabled = self.cfg.camera.enabled;
-        let has_door = self.cfg.camera.doorway.is_some();
+        let mask = self.cfg.camera.camera_mask();
         let n = self.panel.n().min(8);
         for i in 0..n {
-            let wired = i < 2 && enabled && (i == 0 || has_door);
-            self.zone_want[i] = if !wired {
+            self.zone_want[i] = if !mask[i] {
                 (self.sim[i], false, false)
             } else {
-                let motion = self.cam_motion[i] || (i == 0 && self.door_open);
+                let active = self.cam_motion[i] || self.cam_contact_open[i];
                 match self.panel.model {
-                    Model::Pc1832 | Model::Vista20p => (motion, self.cam_covered, !self.cam_online),
-                    Model::Pc1550 => (motion || self.cam_covered || !self.cam_online, false, false),
+                    Model::Pc1832 | Model::Vista20p => (active, self.cam_covered, !self.cam_online),
+                    Model::Pc1550 => (active || self.cam_covered || !self.cam_online, false, false),
                 }
             };
         }
@@ -842,29 +852,55 @@ impl Engine {
     /// has to stay open, or closed, for the programmed loop response time
     /// before the panel believes it (PC1550 500 ms from section [17], or 10
     /// ms for fast zones; PC1832 400 ms, or 36 ms for fast zones in [030]).
-    /// Tampers and faults go straight through, the camera already debounces
-    /// those over several seconds.
+    /// Delay zones settle ahead of Interior/Follower zones so entering through
+    /// a doorway never races into a false instant alarm on Room Motion.
     fn settle_zones(&mut self, now: Instant) {
         let n = self.panel.n().min(8);
-        for i in 0..n {
-            let z = i + 1;
-            let (open, tamper, fault) = self.zone_want[i];
-            let cur = self.panel.zones[i];
-            if cur.tamper != tamper || cur.fault != fault {
-                self.panel.set_zone(z, cur.open, tamper, fault, now);
-            }
-            if cur.open == open {
-                self.zone_pend[i] = None;
-                continue;
-            }
-            match self.zone_pend[i] {
-                Some((want, since)) if want == open => {
-                    if now.saturating_duration_since(since).as_millis() as u64 >= self.panel.loop_response_ms(z) {
-                        self.zone_pend[i] = None;
-                        self.panel.set_zone(z, open, tamper, fault, now);
+        for pass in 0..2 {
+            for i in 0..n {
+                let z = i + 1;
+                let kind = self.panel.cfg(z).kind;
+                let is_delay = kind.is_delay();
+                if (pass == 0 && !is_delay) || (pass == 1 && is_delay) {
+                    continue;
+                }
+                let (open, tamper, fault) = self.zone_want[i];
+                let cur = self.panel.zones[i];
+                if cur.tamper != tamper || cur.fault != fault {
+                    self.panel.set_zone(z, cur.open, tamper, fault, now);
+                }
+                if cur.open == open {
+                    self.zone_pend[i] = None;
+                    continue;
+                }
+                let is_follower = matches!(
+                    kind,
+                    ZoneKind::Interior | ZoneKind::StayAway | ZoneKind::InteriorDelay | ZoneKind::NightZone
+                );
+                if open && is_follower && self.panel.armed.is_some() && self.panel.entry.is_none() {
+                    let delay_opening = (0..n).any(|d| {
+                        d != i
+                            && self.panel.cfg(d + 1).kind.is_delay()
+                            && !self.panel.zones[d].bypassed
+                            && self.zone_want[d].0
+                            && !self.panel.zones[d].open
+                    });
+                    if delay_opening {
+                        if self.zone_pend[i].is_none() {
+                            self.zone_pend[i] = Some((open, now));
+                        }
+                        continue;
                     }
                 }
-                _ => self.zone_pend[i] = Some((open, now)),
+                match self.zone_pend[i] {
+                    Some((want, since)) if want == open => {
+                        if now.saturating_duration_since(since).as_millis() as u64 >= self.panel.loop_response_ms(z) {
+                            self.zone_pend[i] = None;
+                            self.panel.set_zone(z, open, tamper, fault, now);
+                        }
+                    }
+                    _ => self.zone_pend[i] = Some((open, now)),
+                }
             }
         }
     }
@@ -886,7 +922,8 @@ impl Engine {
             self.panel.inputs.cam_online = online;
             self.panel.log(EvKind::Camera, if online { "Camera back online" } else { "Camera stopped sending pictures" });
             if !online {
-                self.cam_motion = [false; 2];
+                self.cam_motion = [false; 8];
+                self.cam_contact_open = [false; 8];
             }
             self.sync_zones(now);
         }
@@ -934,8 +971,14 @@ impl Engine {
         self.panel.inputs.cam_online = self.cam_online;
         self.panel.inputs.cam_covered = self.cam_covered;
         self.panel.inputs.net_watch = self.cfg.operator.phone_alerts;
-        let cam = self.cfg.camera.enabled;
-        self.panel.camera_zone = [cam, cam && self.cfg.camera.doorway.is_some(), false, false, false, false, false, false];
+        let mask = self.cfg.camera.camera_mask();
+        for i in 0..8 {
+            if !mask[i] {
+                self.cam_motion[i] = false;
+                self.cam_contact_open[i] = false;
+            }
+        }
+        self.panel.camera_zone = mask;
         self.panel.dirty = true;
         if cam_changed || model_changed {
             self.sync_zones(now);

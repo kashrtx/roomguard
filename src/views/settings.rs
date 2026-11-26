@@ -146,20 +146,25 @@ impl SettingsView {
 
         section(ui, "Zone names");
         let model = cfg.model;
+        let cam_cfg = cfg.camera.clone();
         let labels = cfg.labels_mut(model);
         egui::Grid::new("settings-zones").num_columns(3).spacing([10.0, 6.0]).show(ui, |ui| {
             for (i, label) in labels.iter_mut().enumerate() {
-                ui.label(RichText::new(format!("Zone {}", i + 1)).color(theme::MUTED));
+                let z = i as u8 + 1;
+                ui.label(RichText::new(format!("Zone {}", z)).color(theme::MUTED));
                 if ui.add_sized([210.0, 24.0], egui::TextEdit::singleline(label).char_limit(24)).changed() {
                     *changed = true;
                 }
-                if i == 0 {
-                    ui.label(theme::muted("Doorway / whole view"));
-                } else if i == 1 {
-                    ui.label(theme::muted("Rest of room"));
+                let role = if z == 1 {
+                    if cam_cfg.doorway.is_some() { "Doorway (on map)" } else { "Whole camera view" }
+                } else if cam_cfg.zone_rect(z).is_some() {
+                    "Drawn on map"
+                } else if z == 2 && cam_cfg.uses_room_fallback() {
+                    "Rest of room"
                 } else {
-                    ui.label("");
-                }
+                    "Simulated (drawable on map)"
+                };
+                ui.label(theme::muted(role));
                 ui.end_row();
             }
         });

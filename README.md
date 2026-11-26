@@ -15,13 +15,12 @@ Every panel follows its real installation and programming manuals down to the se
 You don't need any alarm experience to use RoomGuard:
 
 1. **Launch RoomGuard** — the setup wizard walks you through picking a keypad, setting your 4-digit master code (default `1234`), choosing your webcam (or the built-in **Demo camera** if you don't have one), and optional phone alerts.
-2. **Mark your doorway** — under the **Camera** card, click **Mark the doorway** and drag a box around your door.
-3. **Ignore your desk/chair (recommended!)** — click **Ignore desk** (or **Ignore an area**) and draw a box over where you sit at your computer. That way sitting at your desk won't block you from arming, while reaching an arm into the doorway or walking into the room still triggers immediately.
-4. **Calibrate the empty room (important!)** — click **Calibrate empty room**, close your door, and step completely out of view during the 5-second countdown.
-   - RoomGuard waits until **zero people** are visible, then scans ~36 frames of your empty room.
-   - It learns your room's exact background, per-pixel noise floor (ignoring monitor flicker, bedding, or fans), and locks the exact closed-door image so your door never falsely shows **Open** when it's shut.
-   - Your calibration is **saved permanently** and reloads every time you start RoomGuard.
-   - **Tip:** If you ever move/bump the camera, rearrange furniture, change room lighting, or see false object/door detections, simply click **Recalibrate empty room**! It remaps the room in a few seconds and eliminates false alarms.
+2. **Draw your zones on the Live view or Room map** — mark your doorway (**Z01**), then use **Draw zone...** (or click **Draw** next to any zone in the **Zones** sidebar) to drag boxes for additional zones like windows, hallways, or extra doors directly on either the **Live** picture or **Room map**. Toggle **Contact** vs. **Motion** per zone right on its chip.
+3. **Ignore your desk/chair (recommended!)** — click **Ignore area** (or **Ignore desk**) and draw a box over where you sit at your computer. That way sitting at your desk won't block you from arming, while reaching an arm into the doorway or walking into the room still triggers immediately.
+4. **Fresh empty-room calibration every launch (automatic & guided!)** — every time RoomGuard starts, it runs a fresh empty-room calibration automatically (with a clear on-screen banner and 5-second countdown) so moved/new objects and today's lighting are learned accurately.
+   - Step completely out of view and close any watched doors/windows during the 5-second countdown.
+   - RoomGuard waits until **zero people** are visible, then scans ~36 frames of your empty room to learn today's exact background, per-pixel noise floor, and closed-contact images for every contact zone.
+   - **Tip:** If you move furniture, open blinds, or bump the camera later in the session, click **Recalibrate** anytime to remap the room in seconds.
 
 ---
 
@@ -29,9 +28,9 @@ You don't need any alarm experience to use RoomGuard:
 
 - **Three authentic panels.** Key sequences, LEDs, LCD displays, entry/exit delays with last-10-second urgency beeps, zone bypassing, troubles, alarm memory, user codes, and installer programming work just like the real hardware. See [the programming reference](docs/PROGRAMMING.md).
 - **Live Panel Settings (no manual needed).** Open **Settings -> Panel** to adjust exit/entry delays, quick arm, buzzer/voice volume, chime, and zone definitions with plain-English checkboxes and sliders — synced live both ways with keypad programming.
-- **Your webcam is the sensor.** Zone 1 is your **Doorway** (entry/exit delay + visual door contact). Zone 2 is **Room Motion** (interior motion detector — bypassed automatically in Stay mode). Entering the room without coming through the doorway triggers an instant alarm, just like a real interior PIR.
-- **Smart person & limb detection.** Powered by pure-Rust neural networks (RTMDet-Nano + RTMPose-Tiny 17-joint skeleton, Kinect-style). Static objects like posters, hanging clothes, furniture, and lighting shifts are ignored — while a real person (or an arm/leg reaching into the doorway or room) is caught even if their face isn't visible.
-- **Empty-room calibration & door contact.** Learns your empty room and closed door with lighting-invariant edge + intensity matching, so shadows on a closed door don't cause false trips, while opening the door trips Zone 1 even if nobody stands in the frame.
+- **Your webcam is a multi-zone sensor.** Zone 1 is your **Doorway** (entry/exit delay + visual door contact) and Zone 2 is **Room Motion** (interior motion detector — automatically inactive in Stay mode). You can also draw boxes for any additional panel zone (`Z01`–`Z08`) directly on the **Room map** or **Live** view, with per-zone **Contact** or **Motion** monitoring.
+- **Smart person & limb detection.** Powered by pure-Rust neural networks (RTMDet-Nano + RTMPose-Tiny 17-joint skeleton, Kinect-style). Static objects like posters, hanging clothes, furniture, and lighting shifts are ignored — while a real person (or an arm/leg reaching into the doorway or a drawn zone) is caught even if their face isn't visible.
+- **Fresh empty-room calibration every launch.** Automatically calibrates your empty room and closed contacts on startup with lighting-invariant edge + intensity matching, so new or moved objects and shadows never cause false alarms while opening a watched door or window trips its zone immediately.
 - **Offline face disarm.** Optionally enroll your face in **Settings -> Camera** so RoomGuard can automatically disarm during entry delay when it recognizes you. Everything stays 100% local on your computer.
 - **Authentic synthesized audio.** Every keypad buzzer, 6160V voice announcement, phone-line Contact ID tone, and all four sirens (**WAVE-2F Horn Siren**, **Master Blaster Motor Siren**, **RX-7C Indoor Piezo**, and **10 inch motor bell**) are synthesized live from physical models and measurements of the real hardware. Switching speakers or headphones moves audio seamlessly within ~1 second.
 - **Simulated monitoring center & phone alerts.** A built-in operator chats/calls on alarms (simulated — nobody is ever dispatched), and free push alerts with camera snapshots can be sent to your phone via [ntfy](https://ntfy.sh) with no account required.

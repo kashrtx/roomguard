@@ -339,6 +339,9 @@ pub struct ZoneView {
     pub kind: ZoneKind,
     pub open: bool,
     pub bypassed: bool,
+    /// True when the panel automatically deactivated this interior zone for Stay mode
+    /// (not manually bypassed by the user).
+    pub auto_bypass: bool,
     pub alarm: bool,
     pub tamper: bool,
     pub fault: bool,

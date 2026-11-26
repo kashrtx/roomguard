@@ -133,6 +133,10 @@ pub struct RoomGuardApp {
     shots: Option<Shots>,
     /// Everything was erased; nothing may be saved again before restarting.
     wiped: bool,
+    /// True once the automatic fresh empty-room calibration for this app launch has started.
+    startup_calib_started: bool,
+    /// Last configured camera device ID so switching webcams triggers a fresh calibration.
+    last_cam_device: u32,
 }
 
 fn icon_button(ui: &mut egui::Ui, icon: Icon, tip: &str) -> egui::Response {
@@ -189,6 +193,7 @@ impl RoomGuardApp {
         let lights = if cfg.ui.lights_on { 1.0 } else { 0.0 };
         let right_tab = cfg.ui.right_tab.min(1);
         let applied_autostart = autostart::is_enabled();
+        let last_cam_device = cfg.camera.device;
         RoomGuardApp {
             cfg,
             engine,
@@ -217,6 +222,8 @@ impl RoomGuardApp {
             start_minimized: minimized,
             shots: shots.map(|dir| Shots { dir, stage: 0, start: None, mark: 0.0, awaiting: None }),
             wiped: false,
+            startup_calib_started: false,
+            last_cam_device,
         }
     }
 
@@ -236,6 +243,10 @@ impl RoomGuardApp {
     }
 
     fn push_cfg(&mut self) {
+        if self.cfg.camera.device != self.last_cam_device {
+            self.last_cam_device = self.cfg.camera.device;
+            self.startup_calib_started = false;
+        }
         self.engine.send(EngineMsg::Config(Box::new(self.cfg.clone())));
         self.save_at = Some(Instant::now() + Duration::from_millis(700));
         if self.shots.is_none() && self.cfg.autostart != self.applied_autostart {
@@ -367,14 +378,16 @@ impl RoomGuardApp {
                         let cw = (content_w - 24.0).max(200.0);
                         ui.set_width(cw);
                         ui.set_max_width(cw);
-                        self.camera_view.ui(ui, &self.cam, &mut self.cfg.camera, changed, self.cfg.ui.show_motion, self.cfg.ui.show_tracks);
+                        self.camera_view.ui(ui, &self.cam, &mut self.cfg.camera, view, changed, self.cfg.ui.show_motion, self.cfg.ui.show_tracks);
                     });
                     ui.add_space(10.0);
                     theme::card().show(ui, |ui| {
                         let cw = (content_w - 24.0).max(200.0);
                         ui.set_width(cw);
                         ui.set_max_width(cw);
-                        views::sensors::ui(ui, view, &self.engine);
+                        if let Some(z) = views::sensors::ui(ui, view, &self.cfg.camera, &self.engine) {
+                            self.camera_view.start_draw_zone(z);
+                        }
                     });
                 });
             });
@@ -786,7 +799,33 @@ impl RoomGuardApp {
             self.wall(ui, &view, t, &mut changed);
         });
 
-        let modal = self.setup.is_some() || self.settings.open || self.close_dialog;
+        // Trigger a fresh empty-room calibration automatically once per app launch
+        // as soon as setup is done, the real webcam is streaming, and the panel is disarmed.
+        if !self.startup_calib_started
+            && self.setup.is_none()
+            && self.shots.is_none()
+            && !view.armed
+            && self.cfg.camera.enabled
+            && self.cfg.camera.device != vision::DEMO_DEVICE
+        {
+            let ready_for_calib = self
+                .cam
+                .shared
+                .lock()
+                .map(|s| matches!(s.status, vision::CamStatus::Running) && s.preview.is_some() && !s.room_calibrated && s.calib.is_none())
+                .unwrap_or(false);
+            if ready_for_calib {
+                self.startup_calib_started = true;
+                self.cam.send(vision::CamCmd::CalibrateRoom);
+            }
+        }
+
+        // Pressing Escape while drawing a zone cancels draw mode instead of pressing '#' on the keypad.
+        if self.camera_view.draw != views::camera::Draw::Off && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.camera_view.draw = views::camera::Draw::Off;
+        }
+
+        let modal = self.setup.is_some() || self.settings.open || self.close_dialog || self.camera_view.draw != views::camera::Draw::Off;
         if !modal && self.input.keyboard(ctx, &self.engine, &self.audio, view.model) {
             // Auto-open the keypad cover when the user types on their physical keyboard.
             match view.model {

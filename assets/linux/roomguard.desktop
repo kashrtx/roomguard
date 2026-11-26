@@ -4,5 +4,6 @@ Name=RoomGuard
 Comment=Camera based room alarm
 Exec=roomguard
 Icon=roomguard
+StartupWMClass=roomguard
 Terminal=false
 Categories=Utility;Security;

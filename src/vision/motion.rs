@@ -220,6 +220,32 @@ impl Motion {
         }
     }
 
+    /// Share of moving, non-ignored pixels inside a normalized view rectangle.
+    pub fn rect_frac(&self, rect: NRect) -> f32 {
+        if !self.ready || self.w == 0 || self.h == 0 || self.mask.len() < self.w * self.h {
+            return 0.0;
+        }
+        let x0 = ((rect.x.clamp(0.0, 1.0) * self.w as f32) as usize).min(self.w);
+        let y0 = ((rect.y.clamp(0.0, 1.0) * self.h as f32) as usize).min(self.h);
+        let x1 = (((rect.x + rect.w).clamp(0.0, 1.0) * self.w as f32).ceil() as usize).min(self.w);
+        let y1 = (((rect.y + rect.h).clamp(0.0, 1.0) * self.h as f32).ceil() as usize).min(self.h);
+        let (mut px, mut on) = (0usize, 0usize);
+        for y in y0..y1 {
+            let row = y * self.w;
+            for x in x0..x1 {
+                let i = row + x;
+                if self.ignore.get(i).copied().unwrap_or(0) != 0 {
+                    continue;
+                }
+                px += 1;
+                if self.mask[i] != 0 {
+                    on += 1;
+                }
+            }
+        }
+        on as f32 / px.max(1) as f32
+    }
+
     /// Share of moving pixels in each cell of a `gw` by `gh` grid.
     pub fn grid(&self, gw: usize, gh: usize) -> Vec<f32> {
         let mut g = vec![0f32; gw * gh];

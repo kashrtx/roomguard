@@ -40,12 +40,12 @@ pub const DEMO_DEVICE: u32 = 9999;
 
 #[derive(Clone, Debug)]
 pub enum VisionEvent {
-    /// Zone 1 is the doorway (or the whole view), zone 2 the rest of the room.
+    /// Camera-wired zone motion state (zones 1..=8).
     Motion { zone: u8, open: bool },
     Camera { online: bool, covered: bool },
     Recognized { name: String },
     Stranger,
-    DoorOpen(bool),
+    DoorOpen { zone: u8, open: bool },
     Snapshot { path: PathBuf, reason: String },
 }
 
@@ -110,6 +110,8 @@ pub struct Overlay {
     pub tracks: Vec<TrackView>,
     pub faces: Vec<FaceView>,
     pub doorway: Option<NRect>,
+    /// Extra camera-drawn zones (2..=8) projected into view coordinates: (zone, rect, contact_open).
+    pub zones: Vec<(u8, NRect, bool)>,
     pub ignore: Vec<NRect>,
     pub motion: Vec<f32>,
     pub mgw: usize,
@@ -119,7 +121,7 @@ pub struct Overlay {
     pub light_change: bool,
     pub focus: Option<NRect>,
     pub ptz_line: String,
-    pub zone_active: [bool; 2],
+    pub zone_active: [bool; 8],
     /// People are confirmed by body and skeleton detection, not raw motion.
     pub body_mode: bool,
     /// pose::POSE_LOADING, POSE_READY or POSE_FAILED.
@@ -180,6 +182,8 @@ pub struct CamShared {
     pub enroll: Option<EnrollView>,
     pub calib: Option<CalibView>,
     pub room_calibrated: bool,
+    /// Timestamp (ms) when calibration completed in the current session (0 if not yet calibrated).
+    pub calibrated_at_ms: i64,
     pub people: Vec<(String, usize)>,
     pub map: MapView,
     pub pano: Option<Arc<frame::Rgb>>,
@@ -276,7 +280,7 @@ struct Worker {
     calib: Option<CalibState>,
     map_dirty_at: Option<Instant>,
     map_version: u64,
-    door: map::DoorWatch,
+    doors: [map::DoorWatch; 8],
     cascade: Option<faces::Cascade>,
     db: faces::FaceDb,
     gallery: faces::Gallery,
@@ -284,9 +288,9 @@ struct Worker {
     ptz: ptz::Ptz,
     sweep: Option<ptz::Sweep>,
     armed: bool,
-    zone_open: [bool; 2],
-    zone_hits: [u32; 2],
-    zone_last: [Option<Instant>; 2],
+    zone_open: [bool; 8],
+    zone_hits: [u32; 8],
+    zone_last: [Option<Instant>; 8],
     sent_camera: Option<(bool, bool)>,
     covered: bool,
     cover_since: Option<Instant>,
@@ -345,7 +349,7 @@ impl Worker {
             calib: None,
             map_dirty_at: None,
             map_version: 1,
-            door: map::DoorWatch::new(),
+            doors: std::array::from_fn(|_| map::DoorWatch::new()),
             cascade,
             db,
             gallery,
@@ -353,9 +357,9 @@ impl Worker {
             ptz,
             sweep: None,
             armed: false,
-            zone_open: [false; 2],
-            zone_hits: [0; 2],
-            zone_last: [None; 2],
+            zone_open: [false; 8],
+            zone_hits: [0; 8],
+            zone_last: [None; 8],
             sent_camera: None,
             covered: false,
             cover_since: None,
@@ -505,7 +509,7 @@ impl Worker {
                 let c = *c;
                 let reopen = c.device != self.cfg.device || (c.enabled && !self.cfg.enabled);
                 let ptz_changed = c.ptz != self.cfg.ptz || c.lens != self.cfg.lens;
-                let door_changed = c.doorway != self.cfg.doorway;
+                let old_cfg = self.cfg.clone();
                 self.cfg = c;
                 if reopen {
                     self.close();
@@ -515,13 +519,30 @@ impl Worker {
                     self.ptz = ptz::Ptz::new(&self.cfg.ptz, self.cfg.lens.hfov());
                     self.load_ptz();
                 }
-                if door_changed {
-                    self.door.relearn();
-                    if let (Some(base), Some(dm)) = (&self.baseline, self.cfg.doorway) {
-                        let dv = self.ptz.xf().rect_map_to_view(dm);
-                        self.door.set_from_baseline(base, dv);
+                let xf = self.ptz.xf();
+                let new_mask = self.cfg.camera_mask();
+                for i in 0..8usize {
+                    let z = i as u8 + 1;
+                    let old_rect = old_cfg.zone_rect(z);
+                    let new_rect = self.cfg.zone_rect(z);
+                    let old_contact = old_cfg.zone_contact(z);
+                    let new_contact = self.cfg.zone_contact(z);
+                    if old_rect != new_rect || old_contact != new_contact {
+                        self.doors[i].relearn();
+                        if new_contact {
+                            if let (Some(base), Some(rm)) = (&self.baseline, new_rect) {
+                                let rv = xf.rect_map_to_view(rm);
+                                self.doors[i].set_from_baseline(base, rv);
+                            }
+                        }
+                        self.send_event(VisionEvent::DoorOpen { zone: z, open: false });
                     }
-                    self.send_event(VisionEvent::DoorOpen(false));
+                    if !new_mask[i] && self.zone_open[i] {
+                        self.zone_open[i] = false;
+                        self.zone_hits[i] = 0;
+                        self.zone_last[i] = None;
+                        self.send_event(VisionEvent::Motion { zone: z, open: false });
+                    }
                 }
             }
             CamCmd::Armed(a) => self.armed = a,
@@ -611,11 +632,26 @@ impl Worker {
                     sum: Vec::new(),
                     sum_sq: Vec::new(),
                 });
+                // Clear open camera zones during calibration so scanning never chimes
+                // or leaves zones stuck open.
+                for i in 0..8usize {
+                    let z = i as u8 + 1;
+                    self.zone_hits[i] = 0;
+                    self.zone_last[i] = None;
+                    if self.zone_open[i] {
+                        self.zone_open[i] = false;
+                        self.send_event(VisionEvent::Motion { zone: z, open: false });
+                    }
+                    if self.doors[i].open {
+                        self.doors[i].open = false;
+                        self.send_event(VisionEvent::DoorOpen { zone: z, open: false });
+                    }
+                }
                 if let Ok(mut s) = self.shared.lock() {
                     s.calib = Some(CalibView {
                         phase: CalibPhase::Countdown,
                         progress: 0.0,
-                        prompt: "Step out of view & close the door · 5s".to_string(),
+                        prompt: "Fresh calibration: step out of view & close doors/windows · 5s".to_string(),
                     });
                 }
                 self.ctx.request_repaint();
@@ -630,13 +666,17 @@ impl Worker {
             CamCmd::ResetMap => {
                 self.map.clear();
                 self.baseline = None;
-                self.door.relearn();
+                for d in self.doors.iter_mut() {
+                    d.relearn();
+                }
                 self.motion.reset();
                 if !self.cam_key.is_empty() {
                     let _ = std::fs::remove_file(Self::maps_dir().join(format!("{}-baseline.json", self.cam_key)));
                 }
                 if let Ok(mut s) = self.shared.lock() {
                     s.room_calibrated = false;
+                    s.calibrated_at_ms = 0;
+                    s.door_learned = false;
                 }
                 self.map_version += 1;
                 self.map_dirty_at = Some(Instant::now());
@@ -647,8 +687,10 @@ impl Worker {
                 self.map_dirty_at = Some(Instant::now());
             }
             CamCmd::RelearnDoor => {
-                self.door.relearn();
-                self.send_event(VisionEvent::DoorOpen(false));
+                for i in 0..8usize {
+                    self.doors[i].relearn();
+                    self.send_event(VisionEvent::DoorOpen { zone: i as u8 + 1, open: false });
+                }
             }
             CamCmd::SetHome => {
                 self.cfg.ptz.home_pan = self.ptz.pan;
@@ -806,22 +848,21 @@ impl Worker {
         self.map_version += 1;
         let pano_path = Self::maps_dir().join(format!("{}-pano.jpg", self.cam_key));
         let pano = std::fs::read(&pano_path).ok().and_then(|b| frame::decode_jpeg_file(&b));
-        let base_path = Self::maps_dir().join(format!("{}-baseline.json", self.cam_key));
-        let base = util::load_json::<map::RoomBaseline>(&base_path).filter(|b| b.valid());
-        let has_base = base.is_some();
-        if let Some(b) = &base {
-            self.motion.apply_baseline(&b.mean, &b.std, b.w, b.h);
-            if let Some(dm) = self.cfg.doorway {
-                let dv = self.ptz.xf().rect_map_to_view(dm);
-                self.door.set_from_baseline(b, dv);
-            }
+        // Always require a fresh empty-room calibration on every app launch or
+        // camera change instead of reusing a stale baseline from an older run,
+        // so moved/new objects and lighting shifts are detected accurately.
+        self.baseline = None;
+        self.motion.reset();
+        for d in self.doors.iter_mut() {
+            d.relearn();
         }
-        self.baseline = base;
+        util::log("fresh camera session: awaiting empty-room calibration so new objects and lighting are detected accurately");
         if let Ok(mut s) = self.shared.lock() {
             s.pano = pano.map(Arc::new);
             s.pano_seq += 1;
-            s.room_calibrated = has_base;
-            s.door_learned = self.door.learned;
+            s.room_calibrated = false;
+            s.calibrated_at_ms = 0;
+            s.door_learned = false;
         }
     }
 
@@ -1072,20 +1113,32 @@ impl Worker {
             }
         }
 
-        if let (Some(dv), Some(dm)) = (door_view, self.cfg.doorway) {
-            let inside = dv.x >= -0.02 && dv.y >= -0.02 && dv.x + dv.w <= 1.02 && dv.y + dv.h <= 1.02;
-            if self.cfg.door_contact && inside && !self.ptz.is_moving(now) {
+        if !calibrating && !self.ptz.is_moving(now) {
+            for i in 0..8usize {
+                let z = i as u8 + 1;
+                if !self.cfg.zone_contact(z) {
+                    continue;
+                }
+                let Some(zm) = self.cfg.zone_rect(z) else {
+                    continue;
+                };
+                let zv = xf.rect_map_to_view(zm);
+                let inside = zv.x >= -0.02 && zv.y >= -0.02 && zv.x + zv.w <= 1.02 && zv.y + zv.h <= 1.02;
+                if !inside {
+                    continue;
+                }
                 let someone = self.tracker.tracks.iter().any(|t| {
                     let (fx, fy) = t.foot();
-                    t.confirmed && t.unseen(now) < 0.6 && (dm.contains(fx, fy) || dm.contains(t.pos().0, t.pos().1))
+                    t.confirmed && t.unseen(now) < 0.6 && (zm.contains(fx, fy) || zm.contains(t.pos().0, t.pos().1))
                 }) || self.people.iter().any(|p| {
-                    p.kp.iter().any(|&(kx, ky, c)| c >= pose::KP_THR && dv.contains(kx, ky))
+                    p.kp.iter().any(|&(kx, ky, c)| c >= pose::KP_THR && zv.contains(kx, ky))
                 });
-                let moving = !m.valid || m.door_frac > 0.005 || someone;
+                let z_motion = if i == 0 { m.door_frac } else { self.motion.rect_frac(zv) };
+                let moving = !m.valid || z_motion > 0.005 || someone;
                 // Use the exact same box-downscaled buffer (`small`, MW x mh) that
                 // empty-room calibration stores in RoomBaseline so edges match 1:1.
-                if let Some(open) = self.door.update(&small, motion::MW, mh, dv, moving, now) {
-                    self.send_event(VisionEvent::DoorOpen(open));
+                if let Some(open) = self.doors[i].update(&small, motion::MW, mh, zv, moving, now) {
+                    self.send_event(VisionEvent::DoorOpen { zone: z, open });
                 }
             }
         }
@@ -1093,7 +1146,7 @@ impl Worker {
         if self.calib.is_some() {
             self.calib_step(&small, motion::MW, mh, &m, &xf, now);
         }
-        self.update_zones(&m, now, body_mode);
+        self.update_zones(&m, now, body_mode, det_thr);
         self.recognition(now);
         self.enroll_step(now);
         self.drive_ptz(&rgb, &small, mh, now);
@@ -1193,7 +1246,7 @@ impl Worker {
                 s.calib = Some(CalibView {
                     phase: CalibPhase::Countdown,
                     progress: 0.0,
-                    prompt: format!("Step out of view & close the door · {}s", left),
+                    prompt: format!("Fresh calibration: step out of view & close doors/windows · {}s", left),
                 });
             }
             return;
@@ -1210,7 +1263,7 @@ impl Worker {
                     phase: CalibPhase::WaitingClear,
                     progress: 0.0,
                     prompt: if person_seen {
-                        "Person detected — step completely out of view".to_string()
+                        "Person detected — step completely out of view so new objects calibrate accurately".to_string()
                     } else {
                         "Waiting for room to settle...".to_string()
                     },
@@ -1238,7 +1291,7 @@ impl Worker {
                 s.calib = Some(CalibView {
                     phase: CalibPhase::Capturing,
                     progress: prog,
-                    prompt: format!("Mapping empty room... {}%", (prog * 100.0).round() as u32),
+                    prompt: format!("Scanning empty room for new objects & contacts... {}%", (prog * 100.0).round() as u32),
                 });
             }
             return;
@@ -1253,52 +1306,77 @@ impl Worker {
             std.push(var.sqrt().round().clamp(0.0, 40.0) as u8);
         }
         let base = map::RoomBaseline { w: mw, h: mh, mean, std };
-        if !self.cam_key.is_empty() {
-            let path = Self::maps_dir().join(format!("{}-baseline.json", self.cam_key));
-            util::save_json(&path, &base);
-        }
         self.motion.apply_baseline(&base.mean, &base.std, base.w, base.h);
-        if let Some(dm) = self.cfg.doorway {
-            let dv = xf.rect_map_to_view(dm);
-            self.door.set_from_baseline(&base, dv);
+        for i in 0..8usize {
+            let z = i as u8 + 1;
+            self.doors[i].relearn();
+            if self.cfg.zone_contact(z) {
+                if let Some(rm) = self.cfg.zone_rect(z) {
+                    let rv = xf.rect_map_to_view(rm);
+                    self.doors[i].set_from_baseline(&base, rv);
+                }
+            }
+            self.send_event(VisionEvent::DoorOpen { zone: z, open: false });
+            if self.zone_open[i] {
+                self.zone_open[i] = false;
+                self.send_event(VisionEvent::Motion { zone: z, open: false });
+            }
+            self.zone_hits[i] = 0;
+            self.zone_last[i] = None;
         }
         self.baseline = Some(base);
         self.calib = None;
-        self.send_event(VisionEvent::DoorOpen(false));
-        if self.zone_open[0] {
-            self.zone_open[0] = false;
-            self.send_event(VisionEvent::Motion { zone: 1, open: false });
-        }
-        if self.zone_open[1] {
-            self.zone_open[1] = false;
-            self.send_event(VisionEvent::Motion { zone: 2, open: false });
-        }
-        util::log("empty room baseline calibrated (door and background locked)");
+        util::log("fresh empty-room calibration complete (all background & closed-contact baselines locked)");
         if let Ok(mut s) = self.shared.lock() {
             s.calib = None;
             s.room_calibrated = true;
-            s.door_learned = self.door.learned;
+            s.calibrated_at_ms = util::now_ms();
+            let any_contact = (0..8usize).any(|i| {
+                let z = i as u8 + 1;
+                self.cfg.zone_contact(z) && self.cfg.zone_rect(z).is_some()
+            });
+            s.door_learned = any_contact
+                && (0..8usize).all(|i| {
+                    let z = i as u8 + 1;
+                    !self.cfg.zone_contact(z) || self.cfg.zone_rect(z).is_none() || self.doors[i].learned
+                });
         }
         self.ctx.request_repaint();
     }
 
-    fn update_zones(&mut self, m: &motion::MotionOut, now: Instant, body_mode: bool) {
+    fn update_zones(&mut self, m: &motion::MotionOut, now: Instant, body_mode: bool, det_thr: f32) {
+        // Never trip camera zones while empty-room calibration is actively scanning.
+        if self.calib.is_some() {
+            return;
+        }
         let thr = [0.012f32, 0.008, 0.005, 0.0035, 0.002][(self.cfg.sensitivity.clamp(1, 5) - 1) as usize];
-        let door_rect = self.cfg.doorway;
-        let mut door_active = false;
-        let mut room_active = false;
+        let xf = self.ptz.xf();
+        let mut zone_rects: [Option<NRect>; 8] = [None; 8];
+        for i in 0..8usize {
+            zone_rects[i] = self.cfg.zone_rect(i as u8 + 1);
+        }
+        let door_rect = zone_rects[0];
+        let room_fallback = self.cfg.uses_room_fallback();
+        let whole_view_z1 = door_rect.is_none() && self.cfg.zones.is_empty();
+        let mut actives = [false; 8];
+
         // With body tracking, raw pixel motion never trips a zone on its own:
-        // only a confirmed human body (or the door watcher) does.
+        // only a confirmed human body (or a calibrated door/window contact) does.
         if m.valid && !body_mode {
-            if door_rect.is_some() {
-                door_active |= m.door_frac > thr * 1.5;
-                room_active |= m.room_frac > thr;
-            } else {
-                door_active |= m.total_frac > thr;
+            for i in 0..8usize {
+                if let Some(rm) = zone_rects[i] {
+                    let frac = if i == 0 { m.door_frac } else { self.motion.rect_frac(xf.rect_map_to_view(rm)) };
+                    actives[i] |= frac > thr * 1.5;
+                }
+            }
+            if room_fallback {
+                actives[1] |= m.room_frac > thr;
+            } else if whole_view_z1 {
+                actives[0] |= m.total_frac > thr;
             }
         }
+
         let max_unseen = if body_mode { 0.6 } else { 0.3 };
-        let xf = self.ptz.xf();
         for t in &self.tracker.tracks {
             if !t.confirmed || t.unseen(now) > max_unseen {
                 continue;
@@ -1306,29 +1384,46 @@ impl Worker {
             let (fx, fy) = t.foot();
             let (tx, ty) = t.pos();
             // If the person's center is inside an Ignore box (e.g. seated at your
-            // desk/chair), don't trip Room Motion just for sitting there; their
-            // limbs/joints outside the Ignore box are still checked below!
+            // desk/chair), don't trip Room Motion just for sitting there; limbs
+            // reaching into drawn zones (like Doorway/Window) are checked below.
             if self.cfg.ignore.iter().any(|ig| ig.contains(tx, ty)) {
                 continue;
             }
             let moving = !body_mode || t.moved_within(now, 1.2);
-            match door_rect {
-                Some(d) if d.contains(fx, fy) || d.contains(tx, ty) => door_active = true,
-                Some(_) => room_active |= moving,
-                None => door_active |= moving,
+            let mut hit_drawn = false;
+            for i in 0..8usize {
+                if let Some(r) = zone_rects[i] {
+                    if r.contains(fx, fy) || r.contains(tx, ty) {
+                        actives[i] = true;
+                        hit_drawn = true;
+                    }
+                }
+            }
+            if !hit_drawn {
+                if room_fallback {
+                    actives[1] |= moving;
+                } else if whole_view_z1 {
+                    actives[0] |= moving;
+                }
             }
         }
-        // Limb & partial-body intrusion check: any visible joint (head/arm/wrist/leg)
-        // outside an Ignore box that enters the Doorway or moves in the Room trips
-        // that zone, even if your torso is inside an Ignore desk/chair box.
+
+        // Limb & partial-body intrusion check: only consider confident body detections
+        // (Evidence::Normal or Strong, never weak noise hallucinations) and REAL motion
+        // (never treat a global lighting change as motion).
         if body_mode && !self.people.is_empty() {
             let motion_ok = m.valid && !m.light_change;
             for p in &self.people {
-                let torso_ignored = self.cfg.ignore.iter().any(|ig| {
-                    let (cx, cy) = xf.view_to_map(p.cx(), p.cy());
-                    ig.contains(cx, cy)
-                });
-                let has_motion = !motion_ok || mask_frac(&self.motion.mask, self.motion.w, self.motion.h, p) > 0.015;
+                if p.evidence(det_thr) < pose::Evidence::Normal {
+                    continue;
+                }
+                let (pcx, pcy) = xf.view_to_map(p.cx(), p.cy());
+                let torso_ignored = self.cfg.ignore.iter().any(|ig| ig.contains(pcx, pcy));
+                let has_motion = motion_ok && mask_frac(&self.motion.mask, self.motion.w, self.motion.h, p) > 0.02;
+
+                // Determine whether this person is currently inside or overlapping the doorway.
+                let mut in_doorway = door_rect.map_or(false, |d| d.contains(pcx, pcy));
+                let mut hit_any_drawn = false;
                 for &(kx, ky, conf) in &p.kp {
                     if conf < pose::KP_THR {
                         continue;
@@ -1337,33 +1432,61 @@ impl Worker {
                     if self.cfg.ignore.iter().any(|ig| ig.contains(mx, my)) {
                         continue;
                     }
-                    match door_rect {
-                        // Any joint inside the doorway box trips Room Door immediately.
-                        Some(d) if d.contains(mx, my) => door_active = true,
-                        // Outside the doorway & outside Ignore: if moving (and not just
-                        // your head peeking above a desk Ignore box while seated still),
-                        // trip Room Motion.
-                        Some(_) if has_motion && (!torso_ignored || (mx - xf.view_to_map(p.cx(), p.cy()).0).abs() > 0.14) => {
-                            room_active = true;
+                    for i in 0..8usize {
+                        if let Some(r) = zone_rects[i] {
+                            if r.contains(mx, my) {
+                                actives[i] = true;
+                                hit_any_drawn = true;
+                                if i == 0 {
+                                    in_doorway = true;
+                                }
+                            }
                         }
-                        None if has_motion => door_active = true,
-                        _ => {}
+                    }
+                }
+                // Only trip fallback Room Motion (Zone 2) when the person is NOT seated
+                // inside an Ignore desk box, NOT still standing in the doorway (preventing
+                // an arm/shoulder on the doorway edge from firing an instant alarm on Zone 2
+                // before Zone 1 starts entry delay), and actually moving.
+                if !torso_ignored && !in_doorway && !hit_any_drawn && has_motion {
+                    if room_fallback {
+                        actives[1] = true;
+                    } else if whole_view_z1 {
+                        actives[0] = true;
                     }
                 }
             }
         }
-        if self.door.open && self.cfg.door_contact {
-            door_active = true;
+
+        // Visual open/closed contact state for Zone 1 and any drawn contact zones.
+        for i in 0..8usize {
+            let z = i as u8 + 1;
+            if self.cfg.zone_contact(z) && self.doors[i].open {
+                actives[i] = true;
+            }
         }
-        let actives = [door_active, room_active];
-        for i in 0..2 {
+
+        let mask = self.cfg.camera_mask();
+        for i in 0..8usize {
+            if !mask[i] {
+                self.zone_hits[i] = 0;
+                self.zone_last[i] = None;
+                if self.zone_open[i] {
+                    self.zone_open[i] = false;
+                    self.send_event(VisionEvent::Motion { zone: i as u8 + 1, open: false });
+                }
+                continue;
+            }
             if actives[i] {
                 self.zone_hits[i] += 1;
                 self.zone_last[i] = Some(now);
             } else {
                 self.zone_hits[i] = 0;
             }
-            let hold = if i == 0 && self.door.open { 0.2 } else { 2.5 };
+            // 1.0s hold (0.2s when contact-open) clears promptly once someone leaves,
+            // preventing stale motion tails from causing false exit faults while still
+            // comfortably exceeding the panel's 350-500ms loop response time.
+            let hold = if self.doors[i].open { 0.2 } else { 1.0 };
             let want_open = if self.zone_open[i] {
                 self.zone_last[i].map_or(false, |t| now.saturating_duration_since(t).as_secs_f32() < hold)
             } else {
@@ -1685,8 +1808,17 @@ impl Worker {
             mgh: 24,
             faces: self.last_faces.clone(),
             doorway: self.cfg.doorway.map(|r| xf.rect_map_to_view(r)),
+            zones: self
+                .cfg
+                .zones
+                .iter()
+                .map(|z| {
+                    let open = self.doors.get(z.zone.saturating_sub(1) as usize).map_or(false, |d| d.open);
+                    (z.zone, xf.rect_map_to_view(z.rect), open)
+                })
+                .collect(),
             ignore: self.cfg.ignore.iter().map(|r| xf.rect_map_to_view(*r)).collect(),
-            door_open: self.door.open,
+            door_open: self.doors[0].open,
             covered: self.covered,
             light_change: m.light_change,
             focus: self.focus,
@@ -1752,7 +1884,15 @@ impl Worker {
             s.last_frame_ms = util::now_ms();
             s.xf = Some(xf.clone());
             s.ptz_status = self.ptz.status.clone();
-            s.door_learned = self.door.learned;
+            let any_contact = (0..8usize).any(|i| {
+                let z = i as u8 + 1;
+                self.cfg.zone_contact(z) && self.cfg.zone_rect(z).is_some()
+            });
+            s.door_learned = any_contact
+                && (0..8usize).all(|i| {
+                    let z = i as u8 + 1;
+                    !self.cfg.zone_contact(z) || self.cfg.zone_rect(z).is_none() || self.doors[i].learned
+                });
             if let Some(mv) = map_view {
                 if mv.version != s.map.version || self.cfg.learn_map {
                     s.map = mv;

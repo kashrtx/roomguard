@@ -9,6 +9,7 @@ mod app;
 mod audio;
 mod autostart;
 mod config;
+mod desktop;
 mod engine;
 mod keypads;
 mod lcd_font;
@@ -45,6 +46,8 @@ fn main() -> eframe::Result<()> {
     let restarted = args.iter().any(|a| a == "--restarted");
     if shots.is_some() {
         app::prepare_demo_data();
+    } else {
+        desktop::ensure_linux_icon();
     }
     util::log_init();
     // Only one copy at a time. Opening it again brings the open window to the
@@ -86,6 +89,7 @@ fn run(
 ) -> eframe::Result<()> {
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("RoomGuard")
+        .with_app_id("roomguard")
         .with_inner_size([1440.0, 900.0])
         .with_min_inner_size([1180.0, 740.0])
         .with_icon(app::window_icon());

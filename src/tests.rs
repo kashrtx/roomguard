@@ -1463,3 +1463,181 @@ fn final_audit_audio_sync_vista_maximum_and_manual_rules() {
         "valid date 11/25/26 must save with 3 confirmation beeps"
     );
 }
+
+// ----- RoomGuard 2.2 -----
+
+#[test]
+fn stay_mode_does_not_show_manual_bypass_on_vista_or_zone_view() {
+    let t0 = Instant::now();
+    // 1. Vista20p Stay arming auto-bypasses interior zones silently without displaying "ZONE BYPASSED".
+    let mut v = panel(Model::Vista20p);
+    keys(&mut v, "12343", t0);
+    v.tick(t0 + secs(65), 0);
+    assert!(matches!(v.armed, Some(a) if a.mode == ArmMode::Stay));
+    assert!(v.zones[1].bypassed && v.zones[1].auto_bypass, "zone 2 should be auto-bypassed in Stay");
+    assert!(!v.manual_bypass_any(), "auto-bypass must not count as a manual bypass");
+    let lcd = v.lcd_vista(t0 + secs(66), 0);
+    assert!(lcd.lines[1].contains("ALL SECURE"), "expected ALL SECURE on Stay, got {:?}", lcd.lines);
+    assert!(!lcd.lines[1].contains("BYPASS"), "Stay must not falsely show ZONE BYPASSED: {:?}", lcd.lines);
+    let zv = v.zone_views();
+    assert!(zv[1].bypassed && zv[1].auto_bypass);
+
+    // 2. Explicit user bypass ([Code] + 6 + 03) DOES count as manual bypass and displays DISARMED BYPASS / ZONE BYPASSED.
+    keys(&mut v, "12341", t0 + secs(70));
+    keys(&mut v, "1234603", t0 + secs(72));
+    assert!(v.zones[2].bypassed && !v.zones[2].auto_bypass);
+    assert!(v.manual_bypass_any());
+    let lcd_confirm = v.lcd_vista(t0 + secs(73), 0);
+    assert!(lcd_confirm.lines[0].contains("BYPAS 03"), "expected bypass confirmation, got {:?}", lcd_confirm.lines);
+    let lcd_dis = v.lcd_vista(t0 + secs(76), 0);
+    assert!(lcd_dis.lines[0].contains("BYPASS"), "manual bypass while disarmed must show DISARMED BYPASS: {:?}", lcd_dis.lines);
+    keys(&mut v, "12343", t0 + secs(77));
+    v.tick(t0 + secs(142), 0);
+    let lcd_arm = v.lcd_vista(t0 + secs(143), 0);
+    assert!(lcd_arm.lines[1].contains("BYPASS"), "manual bypass while armed Stay must show ZONE BYPASSED: {:?}", lcd_arm.lines);
+    let zv2 = v.zone_views();
+    assert!(zv2[2].bypassed && !zv2[2].auto_bypass);
+
+    // 3. PC1832 Auto-Stay also marks zone 2 as auto_bypass and not manual_bypass_any.
+    let mut p18 = panel(Model::Pc1832);
+    keys(&mut p18, "1234", t0);
+    p18.tick(t0 + secs(125), 0);
+    assert!(matches!(p18.armed, Some(a) if a.mode == ArmMode::Stay));
+    assert!(p18.zones[1].bypassed && p18.zones[1].auto_bypass);
+    assert!(!p18.manual_bypass_any());
+}
+
+#[test]
+fn vista_exit_error_and_camera_fault_do_not_fire_instant_burglary() {
+    let t0 = Instant::now();
+    // 1. Vista20p Away with interior Zone 2 still open at exit expiry starts Entry Delay (Exit Error),
+    //    not an instant zero-delay burglary alarm.
+    let mut v = panel(Model::Vista20p);
+    keys(&mut v, "12342", t0);
+    v.set_zone(1, true, false, false, t0 + secs(5));
+    v.set_zone(1, false, false, false, t0 + secs(8));
+    v.set_zone(2, true, false, false, t0 + secs(58));
+    v.tick(t0 + secs(65), 0);
+    assert!(matches!(v.armed, Some(a) if a.mode == ArmMode::Away));
+    assert!(v.entry.is_some(), "open Stay/Away zone at Vista exit expiry should start Entry Delay");
+    assert!(v.alarms.is_empty(), "Vista Exit Error must not fire an instant zero-delay alarm");
+
+    // 2. Pure camera fault (disconnect/frame drop) on an armed PC1832 does NOT trigger an instant siren.
+    let mut p = panel(Model::Pc1832);
+    armed_away(&mut p, t0);
+    p.set_zone(1, false, false, true, t0 + secs(20));
+    p.tick(t0 + secs(21), 0);
+    assert!(p.alarms.is_empty(), "camera fault without open/tamper must not trigger an instant alarm");
+    assert_eq!(p.bell_sent, BellPattern::Off);
+
+    // 3. Zone tamper while armed triggers a single Tamper alarm without duplicating into Burglary.
+    p.set_zone(1, false, true, false, t0 + secs(25));
+    p.tick(t0 + secs(26), 0);
+    assert_eq!(p.alarms.len(), 1, "tamper should raise exactly one alarm, got {:?}", p.alarms);
+    assert_eq!(p.alarms[0].kind, AlarmKind::Tamper);
+}
+
+#[test]
+fn camera_multi_zone_config_motion_and_contacts_work() {
+    use crate::config::{CameraCfg, NRect};
+    use crate::vision::motion::Motion;
+
+    let mut cfg = CameraCfg::default();
+    let r1 = NRect::new(0.05, 0.10, 0.25, 0.80);
+    let r3 = NRect::new(0.40, 0.15, 0.22, 0.45);
+    let r5 = NRect::new(0.72, 0.20, 0.22, 0.50);
+
+    cfg.set_zone_rect(1, r1, true);
+    cfg.set_zone_rect(3, r3, true);
+    cfg.set_zone_rect(5, r5, false);
+
+    assert!(cfg.uses_room_fallback(), "with Z1 drawn and Z2 not explicitly drawn, Z2 covers the room");
+    assert_eq!(cfg.camera_mask(), [true, true, true, false, true, false, false, false]);
+    assert!(cfg.zone_contact(1));
+    assert!(cfg.zone_contact(3));
+    assert!(!cfg.zone_contact(5));
+
+    // Drawing Z2 explicitly replaces whole-room fallback.
+    let r2 = NRect::new(0.32, 0.55, 0.30, 0.35);
+    cfg.set_zone_rect(2, r2, false);
+    assert!(!cfg.uses_room_fallback());
+    assert_eq!(cfg.zone_rect(2), Some(r2));
+
+    // Toggle contact and remove zone.
+    cfg.set_zone_contact(3, false);
+    assert!(!cfg.zone_contact(3));
+    cfg.remove_zone(3);
+    assert_eq!(cfg.zone_rect(3), None);
+    assert_eq!(cfg.camera_mask(), [true, true, false, false, true, false, false, false]);
+
+    // Round-trip & backward compatibility with older JSON lacking `zones`.
+    let json = serde_json::to_string(&cfg).expect("serializes");
+    let back: CameraCfg = serde_json::from_str(&json).expect("deserializes");
+    assert_eq!(cfg, back);
+    let legacy: CameraCfg = serde_json::from_str(r#"{"enabled":true,"doorway":{"x":0.1,"y":0.2,"w":0.2,"h":0.5}}"#).expect("legacy loads");
+    assert!(legacy.zones.is_empty());
+    assert!(legacy.uses_room_fallback());
+
+    // Motion::rect_frac isolates per-zone motion cleanly.
+    let (w, h) = (160usize, 120usize);
+    let mut mot = Motion::new();
+    let empty = vec![120u8; w * h];
+    mot.process(&empty, w, h, 3, Some(r1), &[]);
+    let mut moved = empty.clone();
+    // Draw a bright moving patch strictly inside r3 (x: 0.42..0.60, y: 0.20..0.55).
+    for y in 24..66 {
+        for x in 68..96 {
+            moved[y * w + x] = 225;
+        }
+    }
+    let out = mot.process(&moved, w, h, 3, Some(r1), &[]);
+    assert!(out.valid);
+    assert!(mot.rect_frac(r3) > 0.25, "expected motion inside Z3, got {}", mot.rect_frac(r3));
+    assert!(mot.rect_frac(r5) < 0.01, "Z5 should stay quiet, got {}", mot.rect_frac(r5));
+}
+
+#[test]
+fn icon_assets_have_valid_windows_dib_and_macos_chunks() {
+    // 1. Windows ICO: 7 frames, standard 32-bit DIB for 16..128 and PNG for 256.
+    let ico = include_bytes!("../assets/icon/icon.ico");
+    assert!(ico.len() > 64);
+    assert_eq!(u16::from_le_bytes([ico[0], ico[1]]), 0);
+    assert_eq!(u16::from_le_bytes([ico[2], ico[3]]), 1);
+    let count = u16::from_le_bytes([ico[4], ico[5]]) as usize;
+    assert_eq!(count, 7);
+    let mut saw_png_256 = false;
+    let mut dib_count = 0;
+    for i in 0..count {
+        let e = 6 + i * 16;
+        let w = ico[e];
+        let h = ico[e + 1];
+        let sz = u32::from_le_bytes([ico[e + 8], ico[e + 9], ico[e + 10], ico[e + 11]]) as usize;
+        let off = u32::from_le_bytes([ico[e + 12], ico[e + 13], ico[e + 14], ico[e + 15]]) as usize;
+        let frame = &ico[off..off + sz];
+        if w == 0 && h == 0 {
+            assert!(frame.starts_with(b"\x89PNG\r\n\x1a\n"), "256px ICO entry must be PNG");
+            saw_png_256 = true;
+        } else {
+            assert_eq!(u32::from_le_bytes([frame[0], frame[1], frame[2], frame[3]]), 40, "ICO {}px entry must be 40-byte BITMAPINFOHEADER DIB", w);
+            dib_count += 1;
+        }
+    }
+    assert!(saw_png_256 && dib_count == 6);
+
+    // 2. macOS ICNS: valid header and complete chunk set (16px through 1024px / Retina).
+    let icns = include_bytes!("../assets/icon/icon.icns");
+    assert_eq!(&icns[0..4], b"icns");
+    let total = u32::from_be_bytes([icns[4], icns[5], icns[6], icns[7]]) as usize;
+    assert_eq!(total, icns.len());
+    let mut chunks = Vec::new();
+    let mut pos = 8usize;
+    while pos + 8 <= icns.len() {
+        chunks.push([icns[pos], icns[pos + 1], icns[pos + 2], icns[pos + 3]]);
+        let clen = u32::from_be_bytes([icns[pos + 4], icns[pos + 5], icns[pos + 6], icns[pos + 7]]) as usize;
+        assert!(clen >= 8 && pos + clen <= icns.len());
+        pos += clen;
+    }
+    for want in [b"icp4", b"icp5", b"icp6", b"ic07", b"ic08", b"ic09", b"ic10", b"ic11", b"ic12", b"ic13", b"ic14"] {
+        assert!(chunks.contains(want), "missing macOS ICNS chunk {:?}", std::str::from_utf8(want));
+    }
+}

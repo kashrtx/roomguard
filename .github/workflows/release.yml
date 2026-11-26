@@ -62,16 +62,25 @@ jobs:
           cargo build --release --target aarch64-apple-darwin
           cargo build --release --target x86_64-apple-darwin
           VERSION=$(grep -m1 '^version' Cargo.toml | cut -d '"' -f 2)
-          APP=RoomGuard.app
+          STAGE=dmg-stage
+          APP="$STAGE/RoomGuard.app"
+          rm -rf "$STAGE"
           mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" dist
           lipo -create -output "$APP/Contents/MacOS/roomguard" \
             target/aarch64-apple-darwin/release/roomguard target/x86_64-apple-darwin/release/roomguard
+          chmod +x "$APP/Contents/MacOS/roomguard"
           sed "s/__VERSION__/$VERSION/g" assets/macos/Info.plist > "$APP/Contents/Info.plist"
           cp assets/icon/icon.icns "$APP/Contents/Resources/RoomGuard.icns"
+          touch "$APP"
           codesign --force --deep --sign - "$APP"
+          ln -s /Applications "$STAGE/Applications"
+          cp assets/icon/icon.icns "$STAGE/.VolumeIcon.icns"
+          if command -v SetFile >/dev/null 2>&1; then
+            SetFile -a C "$STAGE"
+          fi
           # Explicit DMG staging size avoids macOS 15 hdiutil auto-size ENOSPC on large universal binaries.
-          SIZE_MB=$(( $(du -sm "$APP" | cut -f1) + 128 ))
-          hdiutil create -volname RoomGuard -srcfolder "$APP" -size "${SIZE_MB}m" -fs HFS+ -ov -format UDZO "dist/${{ matrix.asset }}"
+          SIZE_MB=$(( $(du -sm "$STAGE" | cut -f1) + 128 ))
+          hdiutil create -volname RoomGuard -srcfolder "$STAGE" -size "${SIZE_MB}m" -fs HFS+ -ov -format UDZO "dist/${{ matrix.asset }}"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset }}

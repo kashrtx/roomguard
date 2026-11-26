@@ -120,6 +120,25 @@ impl Default for PtzCfg {
     }
 }
 
+/// A camera-monitored zone box drawn on the Room Map or Live camera view.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CameraZone {
+    /// Panel zone number (2..=8; zone 1 uses `CameraCfg::doorway`).
+    pub zone: u8,
+    /// Normalized rectangle in map space (0..1).
+    pub rect: NRect,
+    /// Also watch for visual open/closed changes (like a door/window contact)
+    /// using the calibrated empty-room baseline.
+    pub contact: bool,
+}
+
+impl Default for CameraZone {
+    fn default() -> Self {
+        CameraZone { zone: 3, rect: NRect::default(), contact: false }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CameraCfg {
@@ -131,6 +150,8 @@ pub struct CameraCfg {
     /// 1 (least sensitive) to 5 (most).
     pub sensitivity: u8,
     pub doorway: Option<NRect>,
+    /// Additional drawable camera zones (zones 2..=8) drawn on the Room Map or Live view.
+    pub zones: Vec<CameraZone>,
     pub ignore: Vec<NRect>,
     /// Treat the doorway like a door contact: a door left open trips it too.
     pub door_contact: bool,
@@ -154,6 +175,7 @@ impl Default for CameraCfg {
             lens: Lens::Normal,
             sensitivity: 3,
             doorway: None,
+            zones: Vec::new(),
             ignore: Vec::new(),
             door_contact: true,
             faces: true,
@@ -164,6 +186,76 @@ impl Default for CameraCfg {
             learn_map: true,
             ptz: PtzCfg::default(),
         }
+    }
+}
+
+impl CameraCfg {
+    pub fn zone_rect(&self, zone: u8) -> Option<NRect> {
+        if zone == 1 {
+            self.doorway
+        } else {
+            self.zones.iter().find(|z| z.zone == zone).map(|z| z.rect)
+        }
+    }
+
+    pub fn set_zone_rect(&mut self, zone: u8, rect: NRect, default_contact: bool) {
+        if zone == 1 {
+            self.doorway = Some(rect);
+        } else if (2..=8).contains(&zone) {
+            if let Some(existing) = self.zones.iter_mut().find(|z| z.zone == zone) {
+                existing.rect = rect;
+            } else {
+                self.zones.push(CameraZone { zone, rect, contact: default_contact });
+                self.zones.sort_by_key(|z| z.zone);
+            }
+        }
+    }
+
+    pub fn remove_zone(&mut self, zone: u8) {
+        if zone == 1 {
+            self.doorway = None;
+        } else {
+            self.zones.retain(|z| z.zone != zone);
+        }
+    }
+
+    pub fn zone_contact(&self, zone: u8) -> bool {
+        if zone == 1 {
+            self.door_contact
+        } else {
+            self.zones.iter().find(|z| z.zone == zone).map_or(false, |z| z.contact)
+        }
+    }
+
+    pub fn set_zone_contact(&mut self, zone: u8, on: bool) {
+        if zone == 1 {
+            self.door_contact = on;
+        } else if let Some(z) = self.zones.iter_mut().find(|z| z.zone == zone) {
+            z.contact = on;
+        }
+    }
+
+    /// True when Zone 2 automatically covers the rest of the room outside the doorway.
+    pub fn uses_room_fallback(&self) -> bool {
+        self.doorway.is_some() && !self.zones.iter().any(|z| z.zone == 2)
+    }
+
+    /// Which panel zones (1..=8) are currently wired to the camera.
+    pub fn camera_mask(&self) -> [bool; 8] {
+        let mut mask = [false; 8];
+        if !self.enabled {
+            return mask;
+        }
+        mask[0] = true;
+        if self.doorway.is_some() {
+            mask[1] = true;
+        }
+        for cz in &self.zones {
+            if (1..=8).contains(&cz.zone) {
+                mask[cz.zone as usize - 1] = true;
+            }
+        }
+        mask
     }
 }
 
@@ -367,6 +459,9 @@ impl AppConfig {
         }
         cfg.camera.sensitivity = cfg.camera.sensitivity.clamp(1, 5);
         cfg.camera.strictness = cfg.camera.strictness.clamp(1, 3);
+        cfg.camera.zones.retain(|z| (2..=8).contains(&z.zone) && z.rect.w > 0.01 && z.rect.h > 0.01);
+        cfg.camera.zones.sort_by_key(|z| z.zone);
+        cfg.camera.zones.dedup_by_key(|z| z.zone);
         cfg
     }
 
