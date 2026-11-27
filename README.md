@@ -125,6 +125,14 @@ For a dedicated external siren speaker, use a stable, ventilated spot away from 
 
 Any readable entity with a compatible state can be a zone source. Each zone has one source and the panel still sets the number of zones. Pairing, battery status, and device configuration stay in Home Assistant. Select a camera entity and choose **Load snapshot** for one on-demand JPEG preview. For camera motion, assign a motion entity exposed by Home Assistant. Previewing a camera starts no continuous stream or tracking worker.
 
+### Follow a physical alarm panel
+
+Connect the real panel to Home Assistant through a compatible bridge, then select its partition in **Settings → Home Assistant → Follow physical panel**. This works with the Classic LED, PowerSeries LCD, and VISTA voice layouts. Arm and disarm at the physical keypad. RoomGuard shows the states the bridge provides, including entry delay and alarm, and applies Stay or Away to its own zones. Night uses the VISTA Night-Stay zone list on the VISTA layout and Stay on the two DSC layouts. Vacation and custom bypass use RoomGuard’s Away rules.
+
+Phone alerts can include evidence from RoomGuard’s camera for a physical panel alarm. The panel link leaves the physical siren in charge of those alarms. RoomGuard still monitors its own zones and uses its local siren and quiet-alert settings for its own alarms. A lost connection shows a fault and keeps the last confirmed arming mode until the link returns.
+
+[Envisalink](https://www.home-assistant.io/integrations/envisalink/), the [DSC Keybus Interface](https://github.com/taligentx/dscKeybusInterface), and [ESPHome VISTA ECP](https://github.com/Dilbert66/esphome-vistaECP) are examples of bridges. RoomGuard needs the integration to publish an `alarm_control_panel` entity for the partition you want to follow.
+
 ## Experimental builds
 
 The experimental branch publishes prereleases via GitHub Actions. Download the asset marked **experimental** for your platform. Experimental builds use their own data directory and check only experimental prereleases under **Settings → Updates**. Stable builds check stable releases.

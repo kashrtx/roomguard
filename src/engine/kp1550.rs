@@ -547,7 +547,7 @@ impl Panel {
             _ => {}
         }
         let armed = self.armed.is_some();
-        let exiting = self.exit.is_some();
+        let exiting = self.is_on() && !armed;
         if armed || exiting {
             let no_entry = self.armed.map_or(false, |a| a.no_entry) || self.exit.map_or(false, |e| e.how == ArmHow::NoEntry);
             l[1] = if no_entry { Led::Flash } else { Led::On };

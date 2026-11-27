@@ -8,6 +8,8 @@
 
 use std::time::{Duration, Instant};
 
+use crate::home_assistant::AlarmState;
+
 use serde::{Deserialize, Serialize};
 
 use super::eeprom::{self, Eeprom, Kind, ZoneCfg};
@@ -30,6 +32,7 @@ pub mod tb {
     pub const CLOCK: u32 = 128;
     pub const FIRE_LOOP: u32 = 256;
     pub const HOME_SENSOR: u32 = 512;
+    pub const HOME_PANEL: u32 = 1024;
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -309,6 +312,9 @@ pub struct Panel {
     pub camera_zone: [bool; 8],
     pub quiet_intrusion: bool,
     pub home_sensor_unavailable: bool,
+    pub following_panel: bool,
+    pub physical_state: Option<AlarmState>,
+    pub physical_unavailable_since: Option<Instant>,
     pub exit: Option<ExitRt>,
     pub armed: Option<ArmedRt>,
     pub entry: Option<EntryRt>,
@@ -418,7 +424,7 @@ pub struct Panel {
 }
 
 impl Panel {
-    pub fn new(model: Model, save: PanelSave, labels: Vec<String>, owner: String, now: Instant) -> Panel {
+    pub fn new(model: Model, save: PanelSave, labels: Vec<String>, owner: String, following_panel: bool, now: Instant) -> Panel {
         let mut ee = save.ee;
         let master = match model {
             Model::Pc1550 => "1",
@@ -443,6 +449,9 @@ impl Panel {
             camera_zone: [true, true, false, false, false, false, false, false],
             quiet_intrusion: false,
             home_sensor_unavailable: false,
+            following_panel,
+            physical_state: None,
+            physical_unavailable_since: following_panel.then_some(now),
             exit: None,
             armed: None,
             entry: None,
@@ -533,7 +542,7 @@ impl Panel {
             vista_exit_alarm: false,
         };
         // Like a real panel after a power cut, come back armed if it was armed.
-        let restore_armed = model != Model::Vista20p || p.ee.entry_or(model, "39", 0, 1) != 0;
+        let restore_armed = following_panel || model != Model::Vista20p || p.ee.entry_or(model, "39", 0, 1) != 0;
         if let Some(a) = save.armed.filter(|_| restore_armed) {
             p.armed = Some(ArmedRt {
                 mode: a.mode,
@@ -751,7 +760,8 @@ impl Panel {
             delay_s,
             ts: util::now_ms(),
         };
-        self.out.push(if self.comms_enabled() { Out::Report(report) } else { Out::PhoneReport(report) });
+        let physical = matches!(kind, ReportKind::PhysicalEntry | ReportKind::PhysicalAlarm) || cid == 356;
+        self.out.push(if !physical && self.comms_enabled() { Out::Report(report) } else { Out::PhoneReport(report) });
         self.next_report
     }
 
@@ -986,8 +996,144 @@ impl Panel {
 
     // ----- arming -----
 
+    pub fn is_on(&self) -> bool {
+        self.armed.is_some() || self.exit.is_some()
+            || matches!(self.physical_state, Some(AlarmState::Arming | AlarmState::Triggered | AlarmState::Disarming))
+    }
+
+    pub fn set_following_panel(&mut self, following: bool, now: Instant) {
+        if self.following_panel != following {
+            if self.is_programming() {
+                self.exit_programming();
+            }
+            self.following_panel = following;
+            self.physical_state = None;
+            self.physical_unavailable_since = following.then_some(now);
+            self.auto_pre = None;
+            self.buf.clear();
+            self.held = None;
+            self.kp = KpMode::Normal;
+            self.vista_mode = VistaKp::Normal;
+            self.vista_code_disarm = None;
+            self.temp_msg = None;
+            self.dirty = true;
+        }
+    }
+
+    pub fn sync_physical_panel(&mut self, state: Option<AlarmState>, live: bool, now: Instant) {
+        use AlarmState::*;
+        if !self.following_panel {
+            return;
+        }
+        let Some(state) = state else {
+            if self.physical_unavailable_since.is_none() {
+                self.physical_unavailable_since = Some(now);
+                self.dirty = true;
+            }
+            return;
+        };
+        self.dirty |= self.physical_unavailable_since.take().is_some();
+        let previous = self.physical_state;
+        if previous == Some(state) {
+            return;
+        }
+        self.dirty = true;
+        let was_on = self.is_on();
+        self.physical_state = Some(state);
+        match state {
+            Disarmed => {
+                if self.armed.is_some() || self.exit.is_some() {
+                    self.disarm_internal(None, now);
+                    return;
+                }
+                if was_on {
+                    self.log(EvKind::Disarm, "Physical panel disarmed");
+                }
+            }
+            Stay | Night => self.arm_from_physical(ArmMode::Stay, state == Night, now),
+            Away | Vacation | CustomBypass => self.arm_from_physical(ArmMode::Away, false, now),
+            Pending => {
+                if self.armed.is_none() {
+                    self.arm_from_physical(ArmMode::Away, false, now);
+                }
+                if live {
+                    self.log(EvKind::Alarm, "Physical panel reported entry delay");
+                    self.report(ReportKind::PhysicalEntry, 0, 0, "Physical panel reported entry delay".into(), 0);
+                }
+            }
+            Triggered => {
+                if live {
+                    self.log(EvKind::Alarm, "Physical panel reported an alarm");
+                    self.report(ReportKind::PhysicalAlarm, 0, 0, "Physical panel reported an alarm".into(), 0);
+                }
+            }
+            Arming | Disarming => {}
+        }
+        if was_on != self.is_on() {
+            self.out.push(Out::Armed(self.is_on()));
+        }
+    }
+
+    fn arm_from_physical(&mut self, mode: ArmMode, night: bool, now: Instant) {
+        let night = night && self.model == Model::Vista20p;
+        if self.armed.is_some_and(|a| a.mode == mode && !a.no_entry) && self.vista_night == night {
+            return;
+        }
+        if self.armed.is_none() && self.alarms.is_empty() {
+            self.shift_memory();
+            self.mem_flash_until = None;
+            self.memory_flag = false;
+            self.recent_close_logged = false;
+            self.vista_alarm_mem_zone = None;
+            for zone in &mut self.zones {
+                zone.alarm = false;
+                zone.trips = 0;
+            }
+        }
+        let night_zones = if night { self.vista_zone_list(5) } else { 0 };
+        for z in 1..=self.n() {
+            let auto_bypass = mode == ArmMode::Stay && self.cfg(z).kind.is_stay_away()
+                && night_zones & (1u64 << (z - 1)) == 0;
+            let zone = &mut self.zones[z - 1];
+            if !zone.bypassed || zone.auto_bypass {
+                zone.bypassed = auto_bypass;
+                zone.auto_bypass = auto_bypass;
+            }
+        }
+        self.exit = None;
+        self.vista_night = night;
+        self.armed = Some(ArmedRt {
+            mode, no_entry: false, user: 0, since: now, quick_exit: None, shunt_until: None, reactivate_at: None,
+        });
+        let state = self.physical_state.map_or("Armed", AlarmState::label);
+        self.log(EvKind::Arm, format!("Following physical panel: {state}"));
+        self.out.push(Out::Save);
+    }
+
+    pub fn physical_phase(&self) -> Option<(StatusKind, &'static str)> {
+        use AlarmState::*;
+        match self.physical_state? {
+            Arming => Some((StatusKind::Exit, "Physical panel arming")),
+            Pending => Some((StatusKind::Entry, "Physical panel entry delay")),
+            Triggered => Some((StatusKind::Alarm, "Physical panel alarm")),
+            Disarming => Some((StatusKind::Armed, "Physical panel disarming")),
+            _ => None,
+        }
+    }
+
+    pub fn physical_lcd(&self) -> Option<(&'static str, &'static str)> {
+        use AlarmState::*;
+        match self.physical_state? {
+            Arming => Some(("EXIT DELAY", "PHYSICAL PANEL")),
+            Pending => Some(("ENTRY DELAY", "DISARM AT PANEL")),
+            Triggered => Some(("PANEL ALARM", "CHECK REAL PANEL")),
+            Disarming => Some(("DISARMING", "PHYSICAL PANEL")),
+            _ => None,
+        }
+    }
+
     pub fn arm(&mut self, how: ArmHow, user: u8, now: Instant) -> bool {
-        if self.armed.is_some() || self.exit.is_some() {
+        if self.following_panel || self.armed.is_some() || self.exit.is_some() {
             return false;
         }
         if !self.ready() {
@@ -1203,6 +1349,12 @@ impl Panel {
     }
 
     pub fn disarm(&mut self, user: u8, now: Instant) {
+        if !self.following_panel {
+            self.disarm_internal(Some(user), now);
+        }
+    }
+
+    fn disarm_internal(&mut self, user: Option<u8>, now: Instant) {
         let was_on = self.armed.is_some() || self.exit.is_some();
         let had_alarm = self.zones.iter().any(|z| z.alarm) || self.alarms.iter().any(|a| a.kind != AlarmKind::Duress);
         self.exit = None;
@@ -1228,21 +1380,24 @@ impl Panel {
                 Model::Vista20p => {}
             }
         }
-        let user_squawk = self.model == Model::Pc1832
-            && user > 0
-            && (self.ee.attrs(&format!("{:02}", user)) & (1 << 6)) != 0;
-        if was_on && (self.squawk_on() || user_squawk) {
-            self.squawk(2);
+        if let Some(user) = user {
+            let user_squawk = self.model == Model::Pc1832
+                && user > 0
+                && (self.ee.attrs(&format!("{:02}", user)) & (1 << 6)) != 0;
+            if was_on && (self.squawk_on() || user_squawk) {
+                self.squawk(2);
+            }
+            if had_alarm && self.model == Model::Pc1832 && self.ee.toggle(self.model, "381", 1) {
+                self.beeps(8);
+            } else if was_on && self.model != Model::Vista20p {
+                // Vista has its own confirmation and deferred status voice.
+                self.beeps(3);
+            }
+            self.log(EvKind::Disarm, format!("Disarmed by {}", self.who(user)));
+            self.report(ReportKind::Opening, 401, user as u16, format!("Opening by {}", self.who(user)), 0);
+        } else {
+            self.log(EvKind::Disarm, "Physical panel disarmed");
         }
-        if had_alarm && self.model == Model::Pc1832 && self.ee.toggle(self.model, "381", 1) {
-            self.beeps(8);
-        } else if was_on && self.model != Model::Vista20p {
-            // Vista confirmation tone + live status voice are handled cleanly by vista_off()
-            // so we never queue a redundant tone before the 1.1 s panel answer beep.
-            self.beeps(3);
-        }
-        self.log(EvKind::Disarm, format!("Disarmed by {}", self.who(user)));
-        self.report(ReportKind::Opening, 401, user as u16, format!("Opening by {}", self.who(user)), 0);
         self.out.push(Out::Disarmed { after_alarm: had_alarm });
         self.out.push(Out::Armed(false));
         self.out.push(Out::Save);
@@ -2569,6 +2724,15 @@ impl Panel {
 
     pub fn key(&mut self, key: Key, down: bool, now: Instant) {
         self.dirty = true;
+        if self.following_panel {
+            if down {
+                self.last_key_at = now;
+                if self.model == Model::Vista20p && key == Key::Star && !self.is_on() {
+                    self.press_vista(key, now);
+                }
+            }
+            return;
+        }
         if !down {
             if let Some(h) = self.held {
                 if h.key == key {
@@ -2885,7 +3049,7 @@ impl Panel {
 
     /// The camera recognized an enrolled person.
     pub fn face_recognized(&mut self, name: &str, now: Instant) -> bool {
-        if !self.face_disarm {
+        if self.following_panel || !self.face_disarm {
             return false;
         }
         let entering = self.entry.is_some() || (self.armed.is_some() && self.alarm_sounding(now));
@@ -3025,6 +3189,9 @@ impl Panel {
         if self.home_sensor_unavailable {
             t |= tb::HOME_SENSOR;
         }
+        if self.physical_unavailable_since.is_some_and(|since| now.saturating_duration_since(since) >= Duration::from_secs(8)) {
+            t |= tb::HOME_PANEL;
+        }
         if t == self.troubles {
             if t & tb::AC != 0 && !self.ac_reported {
                 let delay_min = self.ac_delay_mins();
@@ -3046,7 +3213,7 @@ impl Panel {
             }
             if gone & bit != 0 {
                 self.log(EvKind::Restore, format!("Trouble restored: {}", name));
-                if matches!(bit, tb::ZONE_FAULT | tb::ZONE_TAMPER | tb::BELL | tb::HOME_SENSOR) {
+                if matches!(bit, tb::ZONE_FAULT | tb::ZONE_TAMPER | tb::BELL | tb::HOME_SENSOR | tb::HOME_PANEL) {
                     self.report(ReportKind::Restore, trouble_cid(bit), 0, format!("{} cleared", name), 0);
                 }
             }
@@ -3283,6 +3450,9 @@ impl Panel {
     }
 
     fn auto_arm_tick(&mut self, now: Instant, wall_ms: i64) {
+        if self.following_panel {
+            return;
+        }
         if self.armed.is_some() || self.exit.is_some() {
             self.auto_pre = None;
             return;
@@ -3410,6 +3580,9 @@ impl Panel {
             let where_ = if a.zone == 0 { "Keypad".to_string() } else { format!("Zone {} {}", a.zone, self.label(a.zone as usize)) };
             return (StatusKind::Alarm, format!("{} alarm", a.kind.label()), where_);
         }
+        if let Some((status, title)) = self.physical_phase() {
+            return (status, title.into(), "Check the physical keypad".into());
+        }
         if let Some(e) = &self.entry {
             let left = (e.started + e.dur).saturating_duration_since(now).as_secs();
             return (StatusKind::Entry, "Entry delay".into(), format!("{} s to enter a code. Zone {} {}", left, e.zone, self.label(e.zone as usize)));
@@ -3419,10 +3592,12 @@ impl Panel {
             return (StatusKind::Exit, "Exit delay".into(), format!("{}:{:02} to leave", left / 60, left % 60));
         }
         if let Some(a) = &self.armed {
-            let title = match (a.mode, a.no_entry) {
-                (_, true) => "Armed, no entry delay",
-                (ArmMode::Stay, false) => "Armed stay",
-                (ArmMode::Away, false) => "Armed away",
+            let title = match (self.physical_state, a.mode, a.no_entry) {
+                (Some(state @ (AlarmState::Stay | AlarmState::Away | AlarmState::Night | AlarmState::Vacation | AlarmState::CustomBypass)), _, _) =>
+                    state.label(),
+                (_, _, true) => "Armed, no entry delay",
+                (_, ArmMode::Stay, false) => "Armed stay",
+                (_, ArmMode::Away, false) => "Armed away",
             };
             let detail = if self.memory_flag {
                 "An alarm happened while armed"
@@ -3473,6 +3648,7 @@ pub fn trouble_names(model: Model) -> Vec<(u32, &'static str)> {
             (tb::ZONE_FAULT, "Camera offline"),
             (tb::ZONE_TAMPER, "Camera view blocked"),
             (tb::HOME_SENSOR, "Home Assistant sensor unavailable"),
+            (tb::HOME_PANEL, "Physical panel link unavailable"),
         ],
         Model::Pc1832 | Model::Vista20p => vec![
             (tb::LOW_BATT, "Low battery"),
@@ -3483,6 +3659,7 @@ pub fn trouble_names(model: Model) -> Vec<(u32, &'static str)> {
             (tb::ZONE_FAULT, "Zone fault"),
             (tb::ZONE_TAMPER, "Zone tamper"),
             (tb::HOME_SENSOR, "Home Assistant sensor unavailable"),
+            (tb::HOME_PANEL, "Physical panel link unavailable"),
             (tb::CLOCK, "Loss of time"),
         ],
     }
@@ -3497,6 +3674,7 @@ fn trouble_cid(bit: u32) -> u16 {
         tb::TLM => 351,
         tb::FIRE_LOOP => 373,
         tb::ZONE_FAULT | tb::HOME_SENSOR => 380,
+        tb::HOME_PANEL => 356,
         tb::ZONE_TAMPER => 383,
         _ => 300,
     }

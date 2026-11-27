@@ -486,7 +486,7 @@ impl SettingsView {
                     if siren {
                         audio.send(AudioCmd::Preview { model: s.siren_model, warble: s.wave2_warble, ms: 3000 });
                     } else {
-                        audio.send(AudioCmd::KeyBeep);
+                        audio.test_keypad();
                     }
                 }
             });
@@ -500,6 +500,14 @@ impl SettingsView {
         }
         if s.master == 0.0 || s.siren == 0.0 {
             ui.label(RichText::new("The siren volume is muted in RoomGuard.").color(theme::AMBER));
+        }
+        if s.master == 0.0 || s.keypad == 0.0 {
+            ui.label(RichText::new("The keypad volume is muted in RoomGuard.").color(theme::AMBER));
+        } else if view.model == Model::Pc1832 && view.prog.buzzer == 0 {
+            ui.label(RichText::new("The LCD keypad’s buzzer is off in its user settings. Test keypad still plays a tone.").color(theme::AMBER));
+        }
+        if audio.same_output() || (s.siren_output.is_some() && s.siren_output == s.keypad_output) {
+            ui.label(RichText::new("Both selections are playing to the same device. Choose a specific speaker for Keypad & voice.").color(theme::AMBER));
         }
         ui.label(theme::muted("Place a dedicated speaker somewhere stable and ventilated, out of casual reach. Keep it clear of vents, fabrics, and exit paths. Test audibility from the rooms you want to cover."));
 

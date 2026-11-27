@@ -19,7 +19,7 @@ fn secs(n: u64) -> Duration {
 fn panel(model: Model) -> Panel {
     setup();
     let labels = crate::config::default_labels(model);
-    let mut p = Panel::new(model, PanelSave::fresh(model), labels, "Tester".to_string(), Instant::now());
+    let mut p = Panel::new(model, PanelSave::fresh(model), labels, "Tester".to_string(), false, Instant::now());
     p.out.clear();
     p
 }
@@ -33,6 +33,89 @@ fn keys(p: &mut Panel, ks: &str, t: Instant) {
         };
         p.key(k, true, t);
         p.key(k, false, t);
+    }
+}
+
+#[test]
+fn all_panels_follow_physical_arming_and_keep_guarding_when_the_link_drops() {
+    use crate::home_assistant::AlarmState::*;
+
+    for model in [Model::Pc1550, Model::Pc1832, Model::Vista20p] {
+        let t = Instant::now();
+        let mut p = panel(model);
+        p.set_following_panel(true, t);
+        p.sync_physical_panel(Some(Disarmed), false, t);
+        keys(&mut p, "12342", t);
+        assert!(!p.is_on(), "{model:?} accepted a virtual arming code");
+
+        p.sync_physical_panel(Some(Arming), true, t);
+        assert!(p.is_on());
+        assert_eq!(p.status(t).0, StatusKind::Exit);
+        p.tick(t + secs(300), 0);
+        assert!(p.armed.is_none() && p.exit.is_none(), "{model:?} invented an exit countdown");
+
+        p.sync_physical_panel(Some(Stay), true, t + secs(301));
+        assert_eq!(p.armed.unwrap().mode, ArmMode::Stay);
+        for zone in 1..=p.n() {
+            assert_eq!(p.zones[zone - 1].auto_bypass, p.cfg(zone).kind.is_stay_away());
+        }
+        p.sync_physical_panel(Some(Night), true, t + secs(302));
+        assert_eq!(p.armed.unwrap().mode, ArmMode::Stay);
+        assert_eq!(p.vista_night, model == Model::Vista20p);
+
+        p.sync_physical_panel(Some(Away), true, t + secs(303));
+        assert_eq!(p.armed.unwrap().mode, ArmMode::Away);
+        assert!(p.zones.iter().all(|z| !z.auto_bypass));
+        p.sync_physical_panel(None, true, t + secs(304));
+        p.tick(t + secs(314), 0);
+        assert_eq!(p.armed.unwrap().mode, ArmMode::Away);
+        assert!(p.physical_unavailable_since.is_some());
+        assert_ne!(p.troubles & crate::engine::panel::tb::HOME_PANEL, 0);
+        keys(&mut p, "12341", t + secs(315));
+        assert!(!p.face_recognized("Tester", t + secs(315)));
+        assert_eq!(p.armed.unwrap().mode, ArmMode::Away);
+
+        let mut saved = p.to_save(true);
+        if model == Model::Vista20p {
+            saved.ee.sections.insert("39".into(), "0".into());
+        }
+        let mut p = Panel::new(model, saved, crate::config::default_labels(model), "Tester".into(), true, t + secs(316));
+        assert_eq!(p.armed.unwrap().mode, ArmMode::Away);
+        p.sync_physical_panel(Some(Away), false, t + secs(317));
+        p.sync_physical_panel(Some(Disarmed), true, t + secs(318));
+        assert!(!p.is_on());
+        assert!(p.out.iter().any(|out| matches!(out, Out::Armed(false))));
+    }
+}
+
+#[test]
+fn physical_entry_and_alarm_follow_bridge_timing_and_alert_once() {
+    use crate::home_assistant::AlarmState::*;
+
+    for model in [Model::Pc1550, Model::Pc1832, Model::Vista20p] {
+        let t = Instant::now();
+        let mut p = panel(model);
+        p.set_following_panel(true, t);
+        p.sync_physical_panel(Some(Away), false, t);
+        p.sync_physical_panel(Some(Pending), true, t + secs(1));
+        assert_eq!(p.status(t + secs(1)).0, StatusKind::Entry);
+        assert!(p.entry.is_none());
+        p.tick(t + secs(300), 0);
+        assert!(p.alarms.is_empty());
+        p.sync_physical_panel(Some(Triggered), true, t + secs(301));
+        p.sync_physical_panel(None, false, t + secs(302));
+        p.sync_physical_panel(Some(Triggered), true, t + secs(303));
+        let at = t + secs(304);
+        assert_eq!(p.status(at).0, StatusKind::Alarm);
+        p.tick(at, 0);
+        assert_eq!(p.bell_sent, BellPattern::Off);
+        let reports = |kind| p.out.iter().filter(|out| matches!(out, Out::PhoneReport(report) if report.kind == kind)).count();
+        assert_eq!(reports(ReportKind::PhysicalEntry), 1);
+        assert_eq!(reports(ReportKind::PhysicalAlarm), 1);
+        p.sync_physical_panel(Some(Disarmed), true, at);
+        assert!(!p.is_on());
+        p.sync_physical_panel(Some(Triggered), true, at + secs(1));
+        assert!(p.armed.is_none(), "an alarm while disarmed is not evidence of arming");
     }
 }
 
@@ -261,7 +344,7 @@ fn panels_survive_a_save_and_reload() {
     armed_away(&mut p, t0);
     let json = serde_json::to_string(&p.to_save(false)).expect("saves");
     let back: PanelSave = serde_json::from_str(&json).expect("loads");
-    let p2 = Panel::new(Model::Pc1832, back, crate::config::default_labels(Model::Pc1832), "Tester".to_string(), Instant::now());
+    let p2 = Panel::new(Model::Pc1832, back, crate::config::default_labels(Model::Pc1832), "Tester".to_string(), false, Instant::now());
     assert!(p2.armed.is_some(), "comes back armed, like a panel after a power cut");
 }
 
@@ -2459,7 +2542,7 @@ fn vista_power_up_can_start_disarmed_and_biweekly_schedule_survives_restart() {
     let mut saved = p.to_save(true);
     assert!(saved.armed.is_some());
     saved.ee.sections.insert("39".into(), "0".into());
-    let mut p = Panel::new(model, saved, crate::config::default_labels(model), "Tester".into(), now);
+    let mut p = Panel::new(model, saved, crate::config::default_labels(model), "Tester".into(), false, now);
     assert!(p.armed.is_none());
 
     let monday = Local.with_ymd_and_hms(2026, 11, 30, 12, 0, 0).single().unwrap().timestamp_millis();
@@ -2476,7 +2559,7 @@ fn vista_power_up_can_start_disarmed_and_biweekly_schedule_survives_restart() {
     assert!(p.vista_outputs[1]);
     p.vista_outputs[1] = false;
     let json = serde_json::to_string(&p.to_save(true)).unwrap();
-    let mut p = Panel::new(model, serde_json::from_str(&json).unwrap(), crate::config::default_labels(model), "Tester".into(), now);
+    let mut p = Panel::new(model, serde_json::from_str(&json).unwrap(), crate::config::default_labels(model), "Tester".into(), false, now);
     p.tick(now + secs(1), monday + 1000);
     assert!(!p.vista_outputs[1], "restart during the scheduled minute must not replay the action");
     p.tick(now + secs(2), monday + 7 * 86_400_000);
@@ -2550,7 +2633,7 @@ fn vista_restores_night_stay_and_manual_bypasses() {
     keys(&mut p, "1234603#123433", now);
     assert!(p.vista_night);
     let saved = p.to_save(true);
-    let restored = Panel::new(model, saved, crate::config::default_labels(model), "Tester".into(), now);
+    let restored = Panel::new(model, saved, crate::config::default_labels(model), "Tester".into(), false, now);
     assert!(restored.vista_night);
     assert!(!restored.zones[1].bypassed, "a selected Night-Stay zone remains armed");
     assert!(restored.zones[2].bypassed && !restored.zones[2].auto_bypass, "manual bypass stays in effect");

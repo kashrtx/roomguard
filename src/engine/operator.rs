@@ -445,7 +445,7 @@ impl Operator {
                     );
                 }
             }
-            ReportKind::EntryStarted | ReportKind::Stranger => {}
+            ReportKind::EntryStarted | ReportKind::PhysicalEntry | ReportKind::PhysicalAlarm | ReportKind::Stranger => {}
             ReportKind::Shutdown | ReportKind::Cancel => {
                 self.say(ChatFrom::System, sig, None);
             }

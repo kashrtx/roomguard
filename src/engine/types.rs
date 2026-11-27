@@ -425,6 +425,8 @@ pub enum ReportKind {
     PowerUp,
     Lockout,
     EntryStarted,
+    PhysicalEntry,
+    PhysicalAlarm,
     Stranger,
 }
 

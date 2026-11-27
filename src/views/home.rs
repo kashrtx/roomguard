@@ -5,7 +5,7 @@ use eframe::egui::{self, RichText};
 use crate::config::AppConfig;
 use crate::engine::{EngineHandle, EngineMsg, View};
 use crate::engine::types::ZoneKind;
-use crate::home_assistant::{Binding, Rule};
+use crate::home_assistant::{AlarmState, Binding, Rule};
 use crate::theme;
 
 #[derive(Default)]
@@ -25,7 +25,7 @@ impl HomeUi {
         ui.label(theme::heading("Home Assistant"));
         ui.label(if !home.enabled { "Disconnected" } else if view.home.status.is_empty() { "Connecting…" } else { &view.home.status });
         if view.armed {
-            ui.label(theme::muted("Disarm before changing the connection or zone assignments."));
+            ui.label(theme::muted("Disarm before changing the connection, followed panel, or zone assignments."));
         }
 
         ui.collapsing("Connection", |ui| {
@@ -50,6 +50,36 @@ impl HomeUi {
                 });
             });
         });
+
+        ui.add_space(12.0);
+        ui.label(theme::heading("Follow physical panel"));
+        let partition = home.follow_panel.as_deref().and_then(|id| view.home.entities.get(id));
+        let label = partition.map(|entity| entity.name()).or(home.follow_panel.as_deref())
+            .unwrap_or("Use RoomGuard independently").to_owned();
+        ui.add_enabled_ui(!view.armed, |ui| {
+            egui::ComboBox::from_id_salt("ha-physical-panel").selected_text(label).width(375.0).show_ui(ui, |ui| {
+                *changed |= ui.selectable_value(&mut home.follow_panel, None, "Use RoomGuard independently").changed();
+                if view.home.online {
+                    for entity in view.home.entities.values().filter(|entity| entity.alarm_panel()) {
+                        *changed |= ui.selectable_value(
+                            &mut home.follow_panel, Some(entity.entity_id.clone()), format!("{} ({})", entity.name(), entity.entity_id),
+                        ).changed();
+                    }
+                }
+            });
+        });
+        ui.label(theme::muted("Arm and disarm from the real panel. The RoomGuard keypad shows that partition’s state and the room still uses its own zone rules."));
+        if view.following_panel {
+            if view.physical_unavailable {
+                ui.label(RichText::new("Physical panel unavailable. RoomGuard keeps its last known arming mode.").color(theme::AMBER));
+            } else if let Some(state) = partition.and_then(|entity| AlarmState::parse(&entity.state)) {
+                ui.label(theme::muted(state.label()));
+            }
+        } else if !view.home.online {
+            ui.label(theme::muted("Connect to Home Assistant to find your alarm partitions."));
+        } else if !view.home.entities.values().any(|entity| entity.alarm_panel()) {
+            ui.label(theme::muted("No alarm control panel entities found in Home Assistant."));
+        }
 
         ui.add_space(12.0);
         ui.label(theme::heading("Entities"));

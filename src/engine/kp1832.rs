@@ -811,8 +811,8 @@ impl Panel {
             let trb = if self.troubles != 0 { Led::Flash } else { Led::Off };
             return [Led::Off, Led::Off, trb, Led::Off];
         }
-        let ready = if self.armed.is_none() && self.exit.is_none() && self.ready() { Led::On } else { Led::Off };
-        let armed = if self.armed.is_some() || self.exit.is_some() {
+        let ready = if !self.is_on() && self.ready() { Led::On } else { Led::Off };
+        let armed = if self.is_on() {
             let no_entry = self.armed.map_or(false, |a| a.no_entry) || self.exit.map_or(false, |e| e.how == ArmHow::NoEntry);
             if no_entry {
                 Led::Flash
@@ -1023,6 +1023,9 @@ impl Panel {
             let l1 = if live.len() > 1 { arrows(top) } else { pad(top) };
             return LcdOut { lines: [l1, pad(&self.label(a.zone as usize))], cursor: None };
         }
+        if let Some((top, bottom)) = self.physical_lcd() {
+            return plain(top, bottom);
+        }
         if self.entry.is_some() {
             if self.memory_flag {
                 // Wire status 0x0D: Entry Delay After Alarm
@@ -1062,7 +1065,8 @@ impl Panel {
             if a.reactivate_at.map_or(false, |t| now < t) {
                 return plain("Exit Delay in", "Progress");
             }
-            let mut items: Vec<(String, String)> = vec![("Enter Code to".to_string(), "Disarm System".to_string())];
+            let prompt = if self.following_panel { ("Disarm at", "Physical Panel") } else { ("Enter Code to", "Disarm System") };
+            let mut items: Vec<(String, String)> = vec![(prompt.0.into(), prompt.1.into())];
             // Wire status 0x04 / 0x05 / 0x06 / 0x16
             let (arm_l1, arm_l2) = match (a.mode, a.no_entry) {
                 (ArmMode::Stay, true) => ("Armed Stay", "No Entry Delay"),

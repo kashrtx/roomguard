@@ -30,7 +30,7 @@ pub mod memo;
 pub mod synth;
 pub mod voice;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -93,7 +93,7 @@ pub enum AudioCmd {
     VoiceLevel(u8),
     Speak(Vec<String>),
     PlayMemo(memo::Clip),
-    PlayMicTest(memo::Clip),
+    PlayTest(memo::Clip),
     Sounder(Pattern),
     KeyBeep,
     Beeps { count: u8, on_ms: u16, off_ms: u16 },
@@ -112,6 +112,7 @@ pub enum AudioCmd {
     /// "tu-tu-tu" when it arms STAY, NIGHT-STAY or INSTANT.
     ToneSeq { delay_ms: u16, tones: Vec<(u16, u16, u16)> },
     Silence,
+    ClearSiren,
     /// The pointer is near the keypad: make sure the output is awake.
     Wake,
 }
@@ -169,6 +170,7 @@ struct OutputWorker {
     tx: Sender<WorkerCmd>,
     ok: Arc<AtomicBool>,
     status: Arc<Mutex<String>>,
+    device_id: Arc<Mutex<Option<String>>>,
 }
 
 #[derive(Clone)]
@@ -197,6 +199,26 @@ impl AudioHandle {
 
     pub fn devices(&self) -> Endpoints {
         self.devices.lock().map(|devices| devices.clone()).unwrap_or_default()
+    }
+
+    pub fn test_keypad(&self) {
+        const RATE: u32 = 8000;
+        let samples: Arc<[f32]> = (0..RATE).map(|sample| {
+            let t = sample as f32 / RATE as f32;
+            let (frequency, elapsed) = if t < 0.5 { (880.0, t) } else { (1180.0, t - 0.5) };
+            let envelope = (elapsed / 0.01).min(1.0) * ((0.35 - elapsed) / 0.02).clamp(0.0, 1.0);
+            (t * frequency * std::f32::consts::TAU).sin() * envelope * 0.4
+        }).collect();
+        self.send(AudioCmd::PlayTest(memo::Clip { samples, rate: RATE }));
+    }
+
+    pub fn same_output(&self) -> bool {
+        if !self.split.load(Ordering::Relaxed) || !self.keypad_ok() || !self.is_ok() {
+            return false;
+        }
+        let keypad = self.keypad.device_id.lock().ok().and_then(|id| id.clone());
+        let siren = self.siren.device_id.lock().ok().and_then(|id| id.clone());
+        keypad.is_some() && keypad == siren
     }
 
     pub fn output_status(&self, siren: bool) -> String {
@@ -234,11 +256,13 @@ fn start_output(name: &'static str, devices: Option<Arc<Mutex<Endpoints>>>) -> O
     let running = ok.clone();
     let status = Arc::new(Mutex::new(String::new()));
     let status_rx = status.clone();
-    let spawned = std::thread::Builder::new().name(name.into()).spawn(move || run(rx, running, status_rx, devices));
+    let device_id = Arc::new(Mutex::new(None));
+    let active_id = device_id.clone();
+    let spawned = std::thread::Builder::new().name(name.into()).spawn(move || run(rx, running, status_rx, active_id, devices));
     if let Err(e) = spawned {
         util::log(&format!("could not start {}: {}", name, e));
     }
-    OutputWorker { tx, ok, status }
+    OutputWorker { tx, ok, status, device_id }
 }
 
 /// The lasting state, replayed into each new output stream.
@@ -279,7 +303,7 @@ impl State {
 
     /// Sounds that matter if they're missed while the output reconnects.
     fn worth_replaying(c: &AudioCmd) -> bool {
-        matches!(c, AudioCmd::KeyBeep | AudioCmd::Beeps { .. } | AudioCmd::Chime(_) | AudioCmd::Tone { .. } | AudioCmd::ToneSeq { .. } | AudioCmd::Speak(_) | AudioCmd::Preview { .. } | AudioCmd::PlayMemo(_) | AudioCmd::PlayMicTest(_))
+        matches!(c, AudioCmd::KeyBeep | AudioCmd::Beeps { .. } | AudioCmd::Chime(_) | AudioCmd::Tone { .. } | AudioCmd::ToneSeq { .. } | AudioCmd::Speak(_) | AudioCmd::Preview { .. } | AudioCmd::PlayMemo(_) | AudioCmd::PlayTest(_))
     }
 
     fn replay(&self) -> Vec<AudioCmd> {
@@ -290,7 +314,7 @@ impl State {
     }
 }
 
-fn run(rx: Receiver<WorkerCmd>, ok: Arc<AtomicBool>, status: Arc<Mutex<String>>, devices: Option<Arc<Mutex<Endpoints>>>) {
+fn run(rx: Receiver<WorkerCmd>, ok: Arc<AtomicBool>, status: Arc<Mutex<String>>, device_id: Arc<Mutex<Option<String>>>, devices: Option<Arc<Mutex<Endpoints>>>) {
     util::set_thread_priority(util::prio::PANEL);
 
     // Endpoint enumeration can block on WASAPI. Keep it off the command path.
@@ -337,16 +361,20 @@ fn run(rx: Receiver<WorkerCmd>, ok: Arc<AtomicBool>, status: Arc<Mutex<String>>,
             }
             continue;
         };
-        let current = current.clone();
+        let mut current = current.clone();
         switch_flag.store(false, Ordering::Relaxed);
         let failed = Arc::new(AtomicBool::new(false));
+        let callbacks = Arc::new(AtomicU64::new(0));
         let (tx, input) = mpsc::channel();
         // Prime the callback before opening the device, including an alarm
         // already sounding when its speaker comes back.
         for cmd in state.replay().into_iter().filter(|cmd| current.route.accepts(cmd)) {
             let _ = tx.send(cmd);
         }
-        let built = build_stream(input, failed.clone(), ok.clone(), current.device.as_deref());
+        let built = build_stream(input, failed.clone(), ok.clone(), callbacks.clone(), current.device.as_deref());
+        if let Ok(mut id) = device_id.lock() {
+            *id = built.as_ref().ok().and_then(|(_, id, _)| id.clone());
+        }
         if let Ok(mut status) = status.lock() {
             *status = match &built {
                 Ok((_, _, label)) => label.clone(),
@@ -379,10 +407,16 @@ fn run(rx: Receiver<WorkerCmd>, ok: Arc<AtomicBool>, status: Arc<Mutex<String>>,
         }
 
         let deadline = Instant::now() + backoff;
-        let started = Instant::now();
+        let mut last_callback = Instant::now();
+        let mut seen_callbacks = 0;
         let retry = loop {
             let alive = stream.is_ok() && !failed.load(Ordering::Relaxed);
-            if alive && !ok.load(Ordering::Relaxed) && started.elapsed() > Duration::from_secs(3) {
+            let count = callbacks.load(Ordering::Relaxed);
+            if count != seen_callbacks {
+                last_callback = Instant::now();
+                seen_callbacks = count;
+            }
+            if alive && last_callback.elapsed() > Duration::from_secs(3) {
                 if let Ok(mut status) = status.lock() {
                     *status = "Selected device opened but did not request audio".into();
                 }
@@ -399,6 +433,19 @@ fn run(rx: Receiver<WorkerCmd>, ok: Arc<AtomicBool>, status: Arc<Mutex<String>>,
             match rx.recv_timeout(wait) {
                 Ok(WorkerCmd::Output(next)) => {
                     if next != output {
+                        if let Some(next) = next.as_ref().filter(|next| alive && next.device == current.device) {
+                            // Changing the siren route leaves the keypad stream
+                            // and any keypad audio already playing intact.
+                            if next.route == Route::Keypad {
+                                let _ = tx.send(AudioCmd::ClearSiren);
+                            }
+                            for cmd in state.replay().into_iter().filter(|cmd| next.route.accepts(cmd) && !current.route.accepts(cmd)) {
+                                let _ = tx.send(cmd);
+                            }
+                            current.route = next.route;
+                            output = Some(next.clone());
+                            continue;
+                        }
                         output = next;
                         backoff = Duration::from_millis(100);
                         pending.clear();
@@ -496,7 +543,7 @@ fn default_output_id() -> Option<String> {
 
 fn output_stream<T: SizedSample + FromSample<f32>>(
     device: &cpal::Device, config: &cpal::StreamConfig, rx: Receiver<AudioCmd>,
-    failed: Arc<AtomicBool>, ready: Arc<AtomicBool>,
+    failed: Arc<AtomicBool>, ready: Arc<AtomicBool>, callbacks: Arc<AtomicU64>,
 ) -> Result<cpal::Stream, cpal::BuildStreamError> {
     let channels = usize::from(config.channels.max(1));
     let mut synth = synth::Synth::new(config.sample_rate as f32);
@@ -521,6 +568,7 @@ fn output_stream<T: SizedSample + FromSample<f32>>(
                 data.fill(T::EQUILIBRIUM);
                 failed.store(true, Ordering::Relaxed);
             } else {
+                callbacks.fetch_add(1, Ordering::Relaxed);
                 ready.store(true, Ordering::Relaxed);
             }
         },
@@ -533,7 +581,7 @@ fn output_stream<T: SizedSample + FromSample<f32>>(
 }
 
 fn build_stream(
-    rx: Receiver<AudioCmd>, failed: Arc<AtomicBool>, ready: Arc<AtomicBool>, selected: Option<&str>,
+    rx: Receiver<AudioCmd>, failed: Arc<AtomicBool>, ready: Arc<AtomicBool>, callbacks: Arc<AtomicU64>, selected: Option<&str>,
 ) -> Result<(cpal::Stream, Option<String>, String), String> {
     let device = choose_device(false, selected)?;
     let id = device.id().ok().map(|id| id.to_string());
@@ -542,7 +590,7 @@ fn build_stream(
     let format = supported.sample_format();
     let config = supported.config();
     macro_rules! open {
-        ($ty:ty) => { output_stream::<$ty>(&device, &config, rx, failed, ready) };
+        ($ty:ty) => { output_stream::<$ty>(&device, &config, rx, failed, ready, callbacks) };
     }
     let stream = pcm!(format, open).map_err(|e| format!("{label}: {e}"))?;
     stream.play().map_err(|e| format!("{label}: {e}"))?;

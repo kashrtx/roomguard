@@ -108,6 +108,8 @@ pub struct View {
     pub chat: Arc<Vec<ChatMsg>>,
     pub call: Option<CallView>,
     pub armed: bool,
+    pub following_panel: bool,
+    pub physical_unavailable: bool,
     pub programming: bool,
     pub notify_status: String,
     pub mic_test_status: String,
@@ -231,6 +233,8 @@ impl Default for View {
             chat: Arc::new(Vec::new()),
             call: None,
             armed: false,
+            following_panel: false,
+            physical_unavailable: false,
             programming: false,
             notify_status: String::new(),
             mic_test_status: String::new(),
@@ -326,7 +330,7 @@ fn voice_for(model: Model) -> KeypadVoice {
 
 fn load_panel(model: Model, cfg: &AppConfig, now: Instant) -> Panel {
     let save = util::load_json::<PanelSave>(&panel_path(model)).unwrap_or_else(|| PanelSave::fresh(model));
-    Panel::new(model, save, cfg.labels(model).clone(), cfg.display_name(), now)
+    Panel::new(model, save, cfg.labels(model).clone(), cfg.display_name(), cfg.home_assistant.followed_panel().is_some(), now)
 }
 
 struct Engine {
@@ -435,7 +439,7 @@ impl Engine {
         e.saved_events = e.panel.events_seq;
         e.push_settings();
         e.hub.configure(&e.cfg.home_assistant, e.hub_epoch);
-        let armed = e.panel.armed.is_some();
+        let armed = e.panel.is_on();
         e.cam.send(CamCmd::Armed(armed));
         e.sync_zones(now);
         e
@@ -556,6 +560,7 @@ impl Engine {
             self.saved_events = self.panel.events_seq;
             self.zone_pend = [None; MAX_PANEL_ZONES];
             self.push_settings();
+            self.sync_physical_panel(false, now);
             self.sync_zones(now);
             util::log("reloaded the panel from its last save");
         }
@@ -586,7 +591,7 @@ impl Engine {
                         self.mic_test_running = false;
                         match result {
                             Ok(clip) => {
-                                self.audio.send(AudioCmd::PlayMicTest(clip));
+                                self.audio.send(AudioCmd::PlayTest(clip));
                                 self.mic_test_status = if self.cfg.sound.master == 0.0 || self.cfg.sound.keypad == 0.0 {
                                     "Microphone captured audio. Turn up Keypad and Everything to hear playback."
                                 } else if self.audio.keypad_ok() {
@@ -692,7 +697,7 @@ impl Engine {
     }
 
     fn apply_panel_edit(&mut self, edit: PanelEdit, now: Instant) {
-        let busy = self.panel.armed.is_some() || self.panel.exit.is_some();
+        let busy = self.panel.is_on();
         let m = self.panel.model;
         match edit {
             PanelEdit::SetKeypadLevels { brightness, contrast, buzzer } => {
@@ -947,6 +952,7 @@ impl Engine {
                 self.home.status = status;
                 self.home.preview = None;
                 self.home_pulses.clear();
+                self.sync_physical_panel(false, now);
             }
             ha::Update::Snapshot(entities) => {
                 self.home.entities = Arc::new(entities);
@@ -954,6 +960,8 @@ impl Engine {
                 self.home.status = "Connected".into();
                 self.home_pulses.clear();
                 self.sync_home_baseline(now);
+                // A changed state on reconnect is new to this running session.
+                self.sync_physical_panel(self.panel.physical_state.is_some(), now);
                 self.panel.dirty = true;
                 return;
             }
@@ -976,15 +984,28 @@ impl Engine {
                         self.home_pulses.insert(id.clone(), now + Duration::from_millis(ms + 1500));
                     }
                 }
+                let follow_changed = self.cfg.home_assistant.followed_panel() == Some(id.as_str());
                 let entities = Arc::make_mut(&mut self.home.entities);
                 match entity {
                     Some(entity) => { entities.insert(id, entity); }
                     None => { entities.remove(&id); }
                 }
+                if follow_changed {
+                    self.sync_physical_panel(true, now);
+                }
             }
         }
         self.sync_zones(now);
         self.panel.dirty = true;
+    }
+
+    fn sync_physical_panel(&mut self, live: bool, now: Instant) {
+        let id = self.cfg.home_assistant.followed_panel();
+        self.panel.set_following_panel(id.is_some(), now);
+        let state = id.filter(|_| self.home.online)
+            .and_then(|id| self.home.entities.get(id))
+            .and_then(|entity| ha::AlarmState::parse(&entity.state));
+        self.panel.sync_physical_panel(state, live, now);
     }
 
     fn home_active(&self, binding: &ha::Binding) -> Option<bool> {
@@ -1127,7 +1148,7 @@ impl Engine {
     }
 
     fn apply_config(&mut self, mut new: AppConfig, now: Instant) {
-        let busy = self.panel.armed.is_some() || self.panel.exit.is_some();
+        let busy = self.panel.is_on();
         if new.model != self.panel.model && busy {
             new.model = self.panel.model;
         }
@@ -1138,6 +1159,7 @@ impl Engine {
             || new.home_assistant.url != self.cfg.home_assistant.url
             || new.home_assistant.token != self.cfg.home_assistant.token;
         let bindings_changed = new.home_assistant.bindings != self.cfg.home_assistant.bindings;
+        let followed_panel_changed = new.home_assistant.followed_panel() != self.cfg.home_assistant.followed_panel();
         let model_changed = new.model != self.panel.model;
         let cam_changed = new.camera != self.cfg.camera;
         let sound_changed = new.sound != self.cfg.sound;
@@ -1223,6 +1245,12 @@ impl Engine {
         } else if cam_changed {
             self.sync_zones(now);
         }
+        if followed_panel_changed || hub_changed || model_changed {
+            if followed_panel_changed {
+                self.panel.set_following_panel(false, now);
+            }
+            self.sync_physical_panel(false, now);
+        }
     }
 
     fn dial_info(&self, r: &Report) -> DialInfo {
@@ -1252,7 +1280,7 @@ impl Engine {
 
     fn phone_report(&mut self, report: &Report, now: Instant) {
         let gifs_enabled = self.cfg.operator.motion_gifs_enabled();
-        if gifs_enabled && report.kind == ReportKind::EntryStarted {
+        if gifs_enabled && matches!(report.kind, ReportKind::EntryStarted | ReportKind::PhysicalEntry) {
             self.entry_evidence = Some((report.zone_or_user, now));
             self.cam.send(CamCmd::MarkEntryForClip(now));
         }
@@ -1262,11 +1290,12 @@ impl Engine {
         if snapshot && self.cfg.operator.send_photos && self.cfg.camera.enabled && self.cam_online && !self.cam_covered {
             self.alert_sequence += 1;
             let reason = format!("phone-alert-{}", self.alert_sequence);
+            let intrusion = matches!(report.kind, ReportKind::PhysicalAlarm | ReportKind::Alarm(AlarmKind::Burglary));
             let motion_gif = gifs_enabled
-                && matches!(report.kind, ReportKind::EntryStarted | ReportKind::Stranger | ReportKind::Alarm(AlarmKind::Burglary));
+                && (intrusion || matches!(report.kind, ReportKind::EntryStarted | ReportKind::PhysicalEntry | ReportKind::Stranger));
             let deadline = now + Duration::from_millis(if motion_gif { 3000 } else { 1200 });
             if motion_gif {
-                let event_at = if report.kind == ReportKind::Alarm(AlarmKind::Burglary) {
+                let event_at = if intrusion {
                     self.entry_evidence.take()
                         .filter(|(zone, at)| *zone == report.zone_or_user && now.saturating_duration_since(*at) < Duration::from_secs(300))
                         .map_or(now, |(_, at)| at)
@@ -1354,7 +1383,7 @@ impl Engine {
             self.push_volumes();
         }
         self.route(now);
-        let want_awake = self.cfg.keep_awake && (self.panel.armed.is_some() || self.panel.exit.is_some());
+        let want_awake = self.cfg.keep_awake && self.panel.is_on();
         self.awake.set(want_awake);
         let ops = self.op.tick(now, &self.cfg.operator, self.cfg.sound.line_audio);
         self.handle_op(ops);
@@ -1382,7 +1411,7 @@ impl Engine {
         for (_, job, _) in self.pending_photos.drain(..) {
             self.notify.send(job);
         }
-        let armed = self.panel.armed.is_some() || self.panel.exit.is_some();
+        let armed = self.panel.is_on();
         if armed {
             self.panel.log(EvKind::Info, "RoomGuard was closed while armed.");
             let cfg = NtfyCfg::from(&self.cfg.operator);
@@ -1430,6 +1459,11 @@ impl Engine {
         }
         let p = &self.panel;
         let (status, title, detail) = p.status(now);
+        let detail = if p.physical_unavailable_since.is_some() {
+            "Physical panel unavailable · Showing last known state".into()
+        } else {
+            detail
+        };
         let (lcd, lcd_cursor) = match p.model {
             Model::Pc1832 => {
                 let l = p.lcd_1832(now, wall);
@@ -1479,7 +1513,9 @@ impl Engine {
             events: self.events_cache.1.clone(),
             chat: self.chat_cache.1.clone(),
             call: self.op.call_view(),
-            armed: p.armed.is_some() || p.exit.is_some(),
+            armed: p.is_on(),
+            following_panel: p.following_panel,
+            physical_unavailable: p.physical_unavailable_since.is_some(),
             programming: p.is_programming(),
             notify_status: self.notify_status.clone(),
             mic_test_status: self.mic_test_status.clone(),
@@ -1488,7 +1524,7 @@ impl Engine {
             sim: self.sim,
             home: self.home.clone(),
             home_zones: std::array::from_fn(|index| self.cfg.home_assistant.binding(p.model, (index + 1) as u8).is_some()),
-            hint: p.hint(),
+            hint: if p.following_panel { "Arm or disarm at the physical keypad".into() } else { p.hint() },
             prog: self.prog_cache.1.clone(),
         };
         if let Ok(mut v) = self.view.lock() {

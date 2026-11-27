@@ -2148,7 +2148,8 @@ impl Panel {
         let week = day - i32::from(weekday);
         let mut to_fire = Vec::new();
         for schedule in &mut self.vista_schedules {
-            if u32::from(schedule.hour) != clock.hour
+            if (self.following_panel && (4..=6).contains(&schedule.event))
+                || u32::from(schedule.hour) != clock.hour
                 || u32::from(schedule.minute) != clock.minute
                 || schedule.days & (1 << weekday) == 0
                 || schedule.start_day.is_some_and(|start| day < start)
@@ -2420,6 +2421,9 @@ impl Panel {
             return plain(&l1, &l2);
         }
 
+        if let Some((top, bottom)) = self.physical_lcd() {
+            return plain(top, bottom);
+        }
         // Entry delay (alternates EXIT ALARM when triggered by an exit-error fault)
         if let Some(e) = &self.entry {
             if e.exit_fault && (now.saturating_duration_since(e.started).as_millis() / 2000) % 2 == 1 {
@@ -2769,12 +2773,12 @@ impl Panel {
 
     /// 6160V status LEDs: [READY (green), ARMED (red), MESSAGE (red), AC/MIC].
     pub fn leds_vista(&self) -> [Led; 4] {
-        let ready = if self.armed.is_none() && self.exit.is_none() && self.ready() {
+        let ready = if !self.is_on() && self.ready() {
             Led::On
         } else {
             Led::Off
         };
-        let armed = if self.armed.is_some() || self.exit.is_some() {
+        let armed = if self.is_on() {
             Led::On
         } else if self.vista_alarm_mem_zone.is_some() {
             Led::Flash

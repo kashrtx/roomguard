@@ -22,6 +22,7 @@ pub struct Config {
     pub url: String,
     pub token: String,
     pub bindings: Vec<Binding>,
+    pub follow_panel: Option<String>,
 }
 
 impl std::fmt::Debug for Config {
@@ -32,8 +33,59 @@ impl std::fmt::Debug for Config {
 }
 
 impl Config {
+    pub fn followed_panel(&self) -> Option<&str> {
+        self.follow_panel.as_deref().filter(|id| self.enabled && id.starts_with("alarm_control_panel."))
+    }
+
     pub fn binding(&self, model: Model, zone: u8) -> Option<&Binding> {
         self.bindings.iter().find(|binding| binding.model == model && binding.zone == zone)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AlarmState {
+    Disarmed,
+    Arming,
+    Stay,
+    Away,
+    Night,
+    Vacation,
+    CustomBypass,
+    Pending,
+    Triggered,
+    Disarming,
+}
+
+impl AlarmState {
+    pub fn parse(state: &str) -> Option<Self> {
+        Some(match state {
+            "disarmed" => Self::Disarmed,
+            "arming" => Self::Arming,
+            "armed_home" => Self::Stay,
+            "armed_away" => Self::Away,
+            "armed_night" => Self::Night,
+            "armed_vacation" => Self::Vacation,
+            "armed_custom_bypass" => Self::CustomBypass,
+            "pending" => Self::Pending,
+            "triggered" => Self::Triggered,
+            "disarming" => Self::Disarming,
+            _ => return None,
+        })
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Disarmed => "Disarmed",
+            Self::Arming => "Exit delay",
+            Self::Stay => "Armed stay",
+            Self::Away => "Armed away",
+            Self::Night => "Armed night",
+            Self::Vacation => "Armed vacation",
+            Self::CustomBypass => "Armed with custom bypass",
+            Self::Pending => "Entry delay",
+            Self::Triggered => "Alarm triggered",
+            Self::Disarming => "Disarming",
+        }
     }
 }
 
@@ -117,6 +169,10 @@ impl Entity {
 
     pub fn camera(&self) -> bool {
         self.entity_id.starts_with("camera.")
+    }
+
+    pub fn alarm_panel(&self) -> bool {
+        self.entity_id.starts_with("alarm_control_panel.")
     }
 
     pub fn binary(&self) -> bool {
@@ -453,12 +509,14 @@ mod tests {
             let state = |value: &str, minute: &str| json!({
                 "entity_id":"binary_sensor.door","state":value,"last_updated":format!("2026-11-27T10:{minute}:00+00:00")
             });
+            let alarm = |value: &str| json!({"entity_id":"alarm_control_panel.house","state":value});
             let event = |new: Value| json!({"type":"event","id":1,"event":{
-                "event_type":"state_changed","data":{"entity_id":"binary_sensor.door","new_state":new}
+                "event_type":"state_changed","data":{"entity_id":new["entity_id"],"new_state":new}
             }});
             send(&mut socket, event(state("on", "11")));
-            send(&mut socket, json!({"id":2,"type":"result","success":true,"result":[state("off", "10")]}));
+            send(&mut socket, json!({"id":2,"type":"result","success":true,"result":[state("off", "10"),alarm("disarmed")]}));
             send(&mut socket, event(state("off", "12")));
+            send(&mut socket, event(alarm("armed_home")));
             socket.close(None).unwrap();
         });
         let (settings, config) = mpsc::channel();
@@ -468,7 +526,10 @@ mod tests {
             assert!(session(&cfg, &config, &engine).is_err());
         });
         match events.recv_timeout(Duration::from_secs(8)).unwrap() {
-            EngineMsg::HomeAssistant { epoch: 4, update: Update::Snapshot(states) } => assert_eq!(states["binary_sensor.door"].state, "on"),
+            EngineMsg::HomeAssistant { epoch: 4, update: Update::Snapshot(states) } => {
+                assert_eq!(states["binary_sensor.door"].state, "on");
+                assert_eq!(AlarmState::parse(&states["alarm_control_panel.house"].state), Some(AlarmState::Disarmed));
+            }
             _ => panic!("expected connection snapshot"),
         }
         match events.recv_timeout(Duration::from_secs(8)).unwrap() {
@@ -477,6 +538,13 @@ mod tests {
                 assert_eq!(entity.state, "off");
             }
             _ => panic!("expected live state change"),
+        }
+        match events.recv_timeout(Duration::from_secs(8)).unwrap() {
+            EngineMsg::HomeAssistant { epoch: 4, update: Update::State { id, entity: Some(entity) } } => {
+                assert_eq!(id, "alarm_control_panel.house");
+                assert_eq!(AlarmState::parse(&entity.state), Some(AlarmState::Stay));
+            }
+            _ => panic!("expected physical panel update"),
         }
         client.join().unwrap();
         server.join().unwrap();

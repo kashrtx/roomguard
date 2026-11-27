@@ -48,6 +48,12 @@ pub fn for_report(report: &Report, cfg: &OperatorCfg) -> Option<(NotifyJob, bool
         ReportKind::EntryStarted if cfg.heads_up_on_entry => (
             format!("{location} opened"), format!("Entry countdown started at {at}."), 3, "door", true,
         ),
+        ReportKind::PhysicalEntry if cfg.heads_up_on_entry => (
+            "Physical panel entry delay".into(), format!("The panel reported an entry delay at {at}."), 3, "door", true,
+        ),
+        ReportKind::PhysicalAlarm => (
+            "Physical panel alarm".into(), format!("The panel reported an alarm at {at}."), 5, "rotating_light", true,
+        ),
         ReportKind::Stranger if cfg.unknown_person_alerts => (
             "Person detected while armed".into(), format!("RoomGuard saw someone it could not identify at {at}."), 4, "bust_in_silhouette", true,
         ),

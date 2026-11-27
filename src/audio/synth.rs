@@ -826,7 +826,7 @@ impl Synth {
                 self.voice_player.stop();
                 self.memo = Some((clip, 0.0, false));
             }
-            AudioCmd::PlayMicTest(clip) => {
+            AudioCmd::PlayTest(clip) => {
                 self.voice_player.stop();
                 self.memo = Some((clip, 0.0, true));
             }
@@ -974,6 +974,12 @@ impl Synth {
                 self.preview = Some((Siren::new(self.sr, model, warble), ms(self.sr, dur)));
             }
             AudioCmd::Wake => self.wake_left = ms(self.sr, 2500),
+            AudioCmd::ClearSiren => {
+                self.bell = BellPattern::Off;
+                self.squawks.clear();
+                self.preview = None;
+                self.siren = Siren::new(self.sr, self.siren.model, self.siren.warble);
+            }
             AudioCmd::Silence => {
                 self.sounder.set(Pattern::Off);
                 self.key_duck_left = 0;

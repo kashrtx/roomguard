@@ -306,6 +306,9 @@ impl RoomGuardApp {
                                 let (r, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
                                 ui.painter().circle_filled(r.center(), 4.5, col);
                                 ui.label(RichText::new(&view.status_title).font(theme::semi(14.0)).color(col));
+                                if view.following_panel && !view.physical_unavailable {
+                                    ui.label(theme::muted("Linked panel"));
+                                }
                                 if view.armed && self.cfg.operator.quiet_intrusion {
                                     ui.label(theme::muted("Quiet intrusion"));
                                 }
@@ -316,7 +319,8 @@ impl RoomGuardApp {
                         });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if layout_locked {
-                            ui.label(RichText::new("Layout locked · Disarm to unlock").color(theme::AMBER));
+                            let message = if view.following_panel { "Layout locked · Disarm at panel" } else { "Layout locked · Disarm to unlock" };
+                            ui.label(RichText::new(message).color(theme::AMBER));
                             return;
                         }
                         if self.cfg.ui.keypad_only {
