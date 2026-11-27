@@ -178,7 +178,7 @@ impl Panel {
         }
     }
 
-    fn star_function(&mut self, d: u8, now: Instant) -> KpMode {
+    pub(crate) fn star_function(&mut self, d: u8, now: Instant) -> KpMode {
         let disarmed = self.armed.is_none() && self.exit.is_none();
         match d {
             1 => {
@@ -374,7 +374,7 @@ impl Panel {
         if t & tb::FTC != 0 {
             v.push((4, "Fail to Comm"));
         }
-        if t & tb::ZONE_FAULT != 0 {
+        if t & (tb::ZONE_FAULT | tb::HOME_SENSOR) != 0 {
             v.push((5, "Zone Fault"));
         }
         if t & tb::ZONE_TAMPER != 0 {
@@ -433,7 +433,7 @@ impl Panel {
                 self.key_beep();
                 KpMode::Troubles { idx: 0, sub: 1, mem: false }
             }
-            Key::Digit(5) if sub == 0 && self.troubles & tb::ZONE_FAULT != 0 => {
+            Key::Digit(5) if sub == 0 && self.troubles & (tb::ZONE_FAULT | tb::HOME_SENSOR) != 0 => {
                 self.key_beep();
                 KpMode::Troubles { idx: 0, sub: 5, mem: false }
             }
@@ -786,7 +786,7 @@ impl Panel {
         }
     }
 
-    fn command_output(&mut self, n: u8, now: Instant) -> KpMode {
+    pub(crate) fn command_output(&mut self, n: u8, now: Instant) -> KpMode {
         let dur = self.ee.entry_or(Model::Pc1832, "170", 0, 5).clamp(1, 30) as u64;
         self.cmd_out_active = Some((n, now + Duration::from_secs(dur)));
         if n == 2 {

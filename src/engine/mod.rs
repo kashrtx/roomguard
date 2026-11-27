@@ -28,6 +28,7 @@ use crate::vision::{CamCmd, CameraHandle, VisionEvent};
 use operator::{DialInfo, OpOut, Operator};
 use panel::{Out, Panel, PanelSave};
 use types::*;
+use crate::home_assistant as ha;
 
 pub enum OpInput {
     Answer,
@@ -60,6 +61,7 @@ pub enum EngineMsg {
     Config(Box<AppConfig>),
     Op(OpInput),
     NotifyResult { ok: bool, test: bool, err: String },
+    MemoResult { id: Instant, result: crate::audio::memo::Result },
     NetStatus(bool),
     SetMasterCode(String),
     EditPanel(PanelEdit),
@@ -67,7 +69,19 @@ pub enum EngineMsg {
     VerifyCode { code: String, reply: std::sync::mpsc::Sender<bool> },
     TestNotify,
     ClearEvents,
+    HomeAssistant { epoch: u64, update: ha::Update },
+    HomePreview(String),
     Shutdown,
+}
+
+const MAX_PANEL_ZONES: usize = Model::Vista20p.zone_count();
+
+#[derive(Clone, Default)]
+pub struct HomeView {
+    pub status: String,
+    pub online: bool,
+    pub entities: Arc<ha::Entities>,
+    pub preview: Option<(String, Result<Arc<crate::vision::frame::Rgb>, String>)>,
 }
 
 #[derive(Clone)]
@@ -95,7 +109,10 @@ pub struct View {
     pub armed: bool,
     pub programming: bool,
     pub notify_status: String,
-    pub sim: [bool; 8],
+    pub notify_test_status: String,
+    pub sim: [bool; MAX_PANEL_ZONES],
+    pub home: HomeView,
+    pub home_zones: [bool; MAX_PANEL_ZONES],
     /// Plain help about what the keypad is waiting for.
     pub hint: String,
     /// The panel's programming, for the installer view in Settings.
@@ -213,7 +230,10 @@ impl Default for View {
             armed: false,
             programming: false,
             notify_status: String::new(),
-            sim: [false; 8],
+            notify_test_status: String::new(),
+            sim: [false; MAX_PANEL_ZONES],
+            home: HomeView::default(),
+            home_zones: [false; MAX_PANEL_ZONES],
             hint: String::new(),
             prog: Arc::new(ProgView::default()),
         }
@@ -261,10 +281,15 @@ pub fn start(
     let view = Arc::new(Mutex::new(Arc::new(View::default())));
     let v2 = view.clone();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let memo_events = tx.clone();
+    let memo = crate::audio::memo::start(move |id, result| {
+        let _ = memo_events.send(EngineMsg::MemoResult { id, result });
+    });
+    let hub = ha::start(tx.clone());
     let spawned = std::thread::Builder::new().name("engine".into()).spawn(move || {
         // The panel's clock and beeps come first, ahead of camera work.
         util::set_thread_priority(util::prio::PANEL);
-        let mut e = Engine::new(cfg, audio, cam, notify, ctx, v2);
+        let mut e = Engine::new(cfg, audio, cam, notify, ctx, v2, memo, hub);
         e.run(rx);
         let _ = done_tx.send(());
     });
@@ -304,6 +329,7 @@ struct Engine {
     panel: Panel,
     op: Operator,
     audio: AudioHandle,
+    memo: Sender<crate::audio::memo::Command>,
     cam: CameraHandle,
     notify: NotifyHandle,
     ctx: egui::Context,
@@ -320,28 +346,35 @@ struct Engine {
     cam_contact_open: [bool; 8],
     cam_online: bool,
     cam_covered: bool,
-    sim: [bool; 8],
+    sim: [bool; MAX_PANEL_ZONES],
     events_cache: (u64, Arc<Vec<EventRow>>),
     chat_cache: (u64, Arc<Vec<ChatMsg>>),
     notify_status: String,
-    last_photo: Option<PathBuf>,
+    notify_test_status: String,
+    pending_photos: Vec<(String, NotifyJob, Instant)>,
+    alert_sequence: u64,
+    entry_evidence: Option<(u16, Instant)>,
     last_face_log: Option<Instant>,
     last_stranger: Option<Instant>,
     last_buzzer: u8,
     awake: crate::power::KeepAwake,
     /// What each zone's sensor says right now (open, tamper, fault).
-    zone_want: [(bool, bool, bool); 8],
+    zone_want: [(bool, bool, bool); MAX_PANEL_ZONES],
     /// A change waiting out the zone's loop response time.
-    zone_pend: [Option<(bool, Instant)>; 8],
+    zone_pend: [Option<(bool, Instant)>; MAX_PANEL_ZONES],
     prog_cache: (u64, Arc<ProgView>),
     /// Since when the sound output has been missing.
     audio_bad_since: Option<Instant>,
     /// Internal errors recovered from in a row.
     faults: u32,
+    hub: ha::Handle,
+    home: HomeView,
+    hub_epoch: u64,
+    home_pulses: std::collections::BTreeMap<String, Instant>,
 }
 
 impl Engine {
-    fn new(cfg: AppConfig, audio: AudioHandle, cam: CameraHandle, notify: NotifyHandle, ctx: egui::Context, view: Arc<Mutex<Arc<View>>>) -> Engine {
+    fn new(cfg: AppConfig, audio: AudioHandle, cam: CameraHandle, notify: NotifyHandle, ctx: egui::Context, view: Arc<Mutex<Arc<View>>>, memo: Sender<crate::audio::memo::Command>, hub: ha::Handle) -> Engine {
         let now = Instant::now();
         let panel = load_panel(cfg.model, &cfg, now);
         let op = Operator::load(cfg.display_name());
@@ -351,6 +384,7 @@ impl Engine {
             panel,
             op,
             audio,
+            memo,
             cam,
             notify,
             ctx,
@@ -367,23 +401,31 @@ impl Engine {
             cam_contact_open: [false; 8],
             cam_online: true,
             cam_covered: false,
-            sim: [false; 8],
+            sim: [false; MAX_PANEL_ZONES],
             events_cache: (0, Arc::new(Vec::new())),
             chat_cache: (0, Arc::new(Vec::new())),
             notify_status: String::new(),
-            last_photo: None,
+            notify_test_status: String::new(),
+            pending_photos: Vec::new(),
+            alert_sequence: 0,
+            entry_evidence: None,
             last_face_log: None,
             last_stranger: None,
             last_buzzer,
             awake: crate::power::KeepAwake::new(),
-            zone_want: [(false, false, false); 8],
-            zone_pend: [None; 8],
+            zone_want: [(false, false, false); MAX_PANEL_ZONES],
+            zone_pend: [None; MAX_PANEL_ZONES],
             prog_cache: (0, Arc::new(ProgView::default())),
             audio_bad_since: None,
             faults: 0,
+            hub,
+            home: HomeView::default(),
+            hub_epoch: 0,
+            home_pulses: Default::default(),
         };
         e.saved_events = e.panel.events_seq;
         e.push_settings();
+        e.hub.configure(&e.cfg.home_assistant, e.hub_epoch);
         let armed = e.panel.armed.is_some();
         e.cam.send(CamCmd::Armed(armed));
         e.sync_zones(now);
@@ -403,11 +445,13 @@ impl Engine {
     }
 
     fn push_settings(&mut self) {
+        self.audio.configure(self.cfg.sound.keypad_output.clone(), self.cfg.sound.siren_output.clone());
         self.push_volumes();
         self.audio.send(AudioCmd::Siren { model: self.cfg.sound.siren_model, warble: self.cfg.sound.wave2_warble });
         self.audio.send(AudioCmd::Voice(voice_for(self.panel.model)));
         self.cam.send(CamCmd::Config(Box::new(self.cfg.camera.clone())));
         self.notify.config(&self.cfg.operator);
+        self.cam.send(CamCmd::AlertClipsEnabled(self.cfg.operator.motion_gifs_enabled()));
         let name = self.cfg.display_name();
         self.panel.labels = self.cfg.labels(self.panel.model).clone();
         self.panel.owner = name.clone();
@@ -417,6 +461,7 @@ impl Engine {
         self.panel.inputs.cam_online = self.cam_online;
         self.panel.inputs.cam_covered = self.cam_covered;
         self.panel.inputs.net_watch = self.cfg.operator.phone_alerts;
+        self.panel.quiet_intrusion = self.cfg.operator.quiet_intrusion;
         self.panel.camera_zone = self.cfg.camera.camera_mask();
         self.panel.dirty = true;
     }
@@ -499,7 +544,7 @@ impl Engine {
             self.panel = load_panel(self.cfg.model, &self.cfg, now);
             self.last_buzzer = self.panel.buzzer;
             self.saved_events = self.panel.events_seq;
-            self.zone_pend = [None; 8];
+            self.zone_pend = [None; MAX_PANEL_ZONES];
             self.push_settings();
             self.sync_zones(now);
             util::log("reloaded the panel from its last save");
@@ -516,12 +561,13 @@ impl Engine {
             }
             EngineMsg::SimZone { zone, open } => {
                 let z = zone as usize;
-                if (1..=8).contains(&z) {
+                if (1..=self.panel.n()).contains(&z) {
                     self.sim[z - 1] = open;
                     self.sync_zones(now);
                 }
             }
             EngineMsg::Vision(ev) => self.vision(ev, now),
+            EngineMsg::MemoResult { id, result } => self.panel.vista_memo_result(id, result, now),
             EngineMsg::Config(c) => self.apply_config(*c, now),
             EngineMsg::Op(inp) => {
                 let outs = self.op.input(inp, now, &self.cfg.operator);
@@ -529,14 +575,19 @@ impl Engine {
                 self.save_due = Some(now + Duration::from_secs(1));
             }
             EngineMsg::NotifyResult { ok, test, err } => {
-                if ok {
-                    self.panel.inputs.ftc = false;
-                    self.notify_status = if test { "Test sent. Check your phone." } else { "Last alert delivered" }.to_string();
+                if test {
+                    self.notify_test_status = if ok {
+                        "Test accepted. Check your phone.".into()
+                    } else {
+                        format!("Test failed: {}", err)
+                    };
                 } else {
-                    self.notify_status = format!("Couldn't send: {}", err);
-                    if !test {
-                        self.panel.inputs.ftc = true;
-                    }
+                    self.panel.inputs.ftc = !ok;
+                    self.notify_status = if ok {
+                        "Last alert accepted by ntfy".into()
+                    } else {
+                        format!("Phone alert failed: {}", err)
+                    };
                 }
                 self.panel.dirty = true;
             }
@@ -567,14 +618,28 @@ impl Engine {
             EngineMsg::TestNotify => {
                 self.notify.send(NotifyJob {
                     title: "RoomGuard test".to_string(),
-                    message: format!("Phone alerts are working, {}. This is what an alarm alert will look like.", self.cfg.display_name()),
+                    message: format!("This is a test from RoomGuard, {}. If you can read it on your phone, pairing worked.", self.cfg.display_name()),
                     priority: 3,
                     tags: "white_check_mark".to_string(),
-                    photo: self.last_photo.clone(),
+                    photo: None,
                     test: true,
                 });
-                self.notify_status = "Sending a test...".to_string();
+                self.notify_test_status = "Sending a test…".to_string();
                 self.panel.dirty = true;
+            }
+            EngineMsg::HomeAssistant { epoch, update } => {
+                if epoch == self.hub_epoch && self.cfg.home_assistant.enabled {
+                    self.home_update(update, now);
+                }
+            }
+            EngineMsg::HomePreview(id) => {
+                if self.home.online && self.home.entities.get(&id).is_some_and(ha::Entity::camera) {
+                    self.home.preview = Some((id.clone(), Err("Loading snapshot…".into())));
+                    if !self.hub.preview(&self.cfg.home_assistant, self.hub_epoch, id.clone()) {
+                        self.home.preview = Some((id, Err("Camera preview is busy. Try again shortly.".into())));
+                    }
+                    self.panel.dirty = true;
+                }
             }
             EngineMsg::ClearEvents => {
                 self.panel.events.clear();
@@ -686,20 +751,8 @@ impl Engine {
                     }
                     _ => return,
                 };
-                if m == Model::Pc1832 && key == "001" {
-                    let prev = self.panel.ee.raw(m, "001");
-                    for z in 1..=8usize {
-                        let i = (z - 1) * 2;
-                        let old_c = prev.get(i..i + 2).unwrap_or("00");
-                        let new_c = final_val.get(i..i + 2).unwrap_or("00");
-                        if old_c != new_c {
-                            let code = new_c.parse::<u32>().unwrap_or(0);
-                            self.panel.ee.sections.insert(
-                                format!("{:03}", 100 + z),
-                                eeprom::Eeprom::default_zone_attrs(code).to_string(),
-                            );
-                        }
-                    }
+                if m == Model::Pc1832 {
+                    self.panel.ee.default_changed_pc1832_zone_attrs(&key, &final_val);
                 }
                 self.panel.ee.sections.insert(key.clone(), final_val);
                 self.panel.log(EvKind::Program, format!("Section [{}] updated (Settings)", key));
@@ -824,11 +877,95 @@ impl Engine {
                     self.panel.report(ReportKind::Stranger, 0, 0, "Unknown person".to_string(), 0);
                 }
             }
-            VisionEvent::Snapshot { path, reason: _ } => {
-                self.op.photo(path.clone(), now);
-                self.last_photo = Some(path);
+            VisionEvent::Snapshot { path, reason } => {
+                if reason.starts_with("phone-alert-") {
+                    if let Some(index) = self.pending_photos.iter().position(|(id, _, _)| id == &reason) {
+                        let (_, mut job, deadline) = self.pending_photos.swap_remove(index);
+                        if now <= deadline && self.cfg.operator.send_photos {
+                            job.photo = Some(path);
+                        }
+                        self.notify.send(job);
+                    }
+                } else {
+                    self.op.photo(path, now);
+                }
             }
         }
+    }
+
+    fn home_update(&mut self, update: ha::Update, now: Instant) {
+        match update {
+            ha::Update::Preview { id, result } => {
+                if self.home.online && self.home.preview.as_ref().is_some_and(|(selected, _)| selected == &id) {
+                    self.home.preview = Some((id, result));
+                    self.panel.dirty = true;
+                }
+                return;
+            }
+            ha::Update::Status(status) => {
+                self.home.online = false;
+                self.home.status = status;
+                self.home.preview = None;
+                self.home_pulses.clear();
+            }
+            ha::Update::Snapshot(entities) => {
+                self.home.entities = Arc::new(entities);
+                self.home.online = true;
+                self.home.status = "Connected".into();
+                self.home_pulses.clear();
+                self.sync_home_baseline(now);
+                self.panel.dirty = true;
+                return;
+            }
+            ha::Update::State { id, entity } => {
+                if !self.home.online {
+                    return;
+                }
+                let changed = self.home.entities.get(&id).zip(entity.as_ref()).is_some_and(|(old, new)| {
+                    old.state != new.state
+                        && (ha::Rule::Changes.active(&old.state, "").is_some()
+                            || (id.starts_with("event.") && old.state == "unknown"))
+                        && ha::Rule::Changes.active(&new.state, "").is_some()
+                });
+                if changed {
+                    let response = self.cfg.home_assistant.bindings.iter()
+                        .filter(|binding| binding.model == self.panel.model && binding.entity == id && binding.rule == ha::Rule::Changes)
+                        .map(|binding| self.panel.loop_response_ms(usize::from(binding.zone)))
+                        .max();
+                    if let Some(ms) = response {
+                        self.home_pulses.insert(id.clone(), now + Duration::from_millis(ms + 1500));
+                    }
+                }
+                let entities = Arc::make_mut(&mut self.home.entities);
+                match entity {
+                    Some(entity) => { entities.insert(id, entity); }
+                    None => { entities.remove(&id); }
+                }
+            }
+        }
+        self.sync_zones(now);
+        self.panel.dirty = true;
+    }
+
+    fn home_active(&self, binding: &ha::Binding) -> Option<bool> {
+        if !self.home.online {
+            return None;
+        }
+        let state = &self.home.entities.get(&binding.entity)?.state;
+        let result = binding.rule.active(state, &binding.operand)?;
+        Some(result || (binding.rule == ha::Rule::Changes && self.home_pulses.contains_key(&binding.entity)))
+    }
+
+    fn sync_home_baseline(&mut self, now: Instant) {
+        for i in 0..self.panel.n() {
+            if let Some(binding) = self.cfg.home_assistant.binding(self.panel.model, (i + 1) as u8) {
+                if let Some(open) = self.home_active(binding) {
+                    self.panel.zones[i].open = open;
+                }
+                self.zone_pend[i] = None;
+            }
+        }
+        self.sync_zones(now);
     }
 
     /// Camera conditions become zone states. The PowerSeries knows zone
@@ -836,9 +973,23 @@ impl Engine {
     /// simply shows as the zone being open, the same as a cut wire.
     fn sync_zones(&mut self, now: Instant) {
         let mask = self.cfg.camera.camera_mask();
-        let n = self.panel.n().min(8);
+        let n = self.panel.n();
+        self.panel.camera_zone = mask;
+        self.panel.home_sensor_unavailable = false;
         for i in 0..n {
-            self.zone_want[i] = if !mask[i] {
+            self.zone_want[i] = if let Some(binding) = self.cfg.home_assistant.binding(self.panel.model, (i + 1) as u8) {
+                let active = self.home_active(binding);
+                let available = active.is_some();
+                let zone = &mut self.panel.zones[i];
+                // Transport failure is a supervision fault, never a motion edge.
+                zone.fault = !available;
+                zone.tamper = false;
+                if let Some(camera) = self.panel.camera_zone.get_mut(i) {
+                    *camera = false;
+                }
+                self.panel.home_sensor_unavailable |= !available;
+                (active.unwrap_or(zone.open), false, !available)
+            } else if !mask.get(i).copied().unwrap_or(false) {
                 (self.sim[i], false, false)
             } else {
                 let active = self.cam_motion[i] || self.cam_contact_open[i];
@@ -858,17 +1009,20 @@ impl Engine {
     /// Delay zones settle ahead of Interior/Follower zones so entering through
     /// a doorway never races into a false instant alarm on Room Motion.
     fn settle_zones(&mut self, now: Instant) {
-        let n = self.panel.n().min(8);
+        let n = self.panel.n();
         for pass in 0..2 {
             for i in 0..n {
                 let z = i + 1;
+                let (open, tamper, fault) = self.zone_want[i];
+                let cur = self.panel.zones[i];
+                if (cur.open, cur.tamper, cur.fault) == (open, tamper, fault) && self.zone_pend[i].is_none() {
+                    continue;
+                }
                 let kind = self.panel.cfg(z).kind;
                 let is_delay = kind.is_delay();
                 if (pass == 0 && !is_delay) || (pass == 1 && is_delay) {
                     continue;
                 }
-                let (open, tamper, fault) = self.zone_want[i];
-                let cur = self.panel.zones[i];
                 if cur.tamper != tamper || cur.fault != fault {
                     self.panel.set_zone(z, cur.open, tamper, fault, now);
                 }
@@ -937,15 +1091,27 @@ impl Engine {
         if new.model != self.panel.model && busy {
             new.model = self.panel.model;
         }
+        if busy {
+            new.home_assistant = self.cfg.home_assistant.clone();
+        }
+        let hub_changed = new.home_assistant.enabled != self.cfg.home_assistant.enabled
+            || new.home_assistant.url != self.cfg.home_assistant.url
+            || new.home_assistant.token != self.cfg.home_assistant.token;
+        let bindings_changed = new.home_assistant.bindings != self.cfg.home_assistant.bindings;
         let model_changed = new.model != self.panel.model;
         let cam_changed = new.camera != self.cfg.camera;
         let sound_changed = new.sound != self.cfg.sound;
+        let outputs_changed = new.sound.keypad_output != self.cfg.sound.keypad_output || new.sound.siren_output != self.cfg.sound.siren_output;
         let op_changed = new.operator != self.cfg.operator;
+        let old_phone = NtfyCfg::from(&self.cfg.operator);
+        let new_phone = NtfyCfg::from(&new.operator);
+        let destination_changed = (old_phone.enabled && !new_phone.enabled) || old_phone.topic_url() != new_phone.topic_url() || old_phone.token != new_phone.token;
         self.cfg = new;
         if model_changed {
             self.save(true);
             self.audio.send(AudioCmd::Silence);
-            self.zone_pend = [None; 8];
+            let _ = self.memo.send(crate::audio::memo::Command::Cancel);
+            self.zone_pend = [None; MAX_PANEL_ZONES];
             self.panel = load_panel(self.cfg.model, &self.cfg, now);
             self.last_buzzer = self.panel.buzzer;
             self.last_power = None;
@@ -954,16 +1120,30 @@ impl Engine {
             self.panel.log(EvKind::Info, text);
         }
         if cam_changed {
+            self.entry_evidence = None;
             self.grace_until = now + Duration::from_secs(10);
             self.cam.send(CamCmd::Config(Box::new(self.cfg.camera.clone())));
+        }
+        if outputs_changed {
+            self.audio.configure(self.cfg.sound.keypad_output.clone(), self.cfg.sound.siren_output.clone());
         }
         if sound_changed || model_changed {
             self.push_volumes();
             self.audio.send(AudioCmd::Siren { model: self.cfg.sound.siren_model, warble: self.cfg.sound.wave2_warble });
             self.audio.send(AudioCmd::Voice(voice_for(self.panel.model)));
         }
+        if destination_changed {
+            self.pending_photos.clear();
+            self.entry_evidence = None;
+            self.notify_status.clear();
+            self.notify_test_status.clear();
+        }
         if op_changed {
             self.notify.config(&self.cfg.operator);
+            self.cam.send(CamCmd::AlertClipsEnabled(self.cfg.operator.motion_gifs_enabled()));
+            if self.cfg.operator.quiet_intrusion {
+                self.audio.send(AudioCmd::Ring(false));
+            }
         }
         let name = self.cfg.display_name();
         self.panel.labels = self.cfg.labels(self.panel.model).clone();
@@ -974,6 +1154,7 @@ impl Engine {
         self.panel.inputs.cam_online = self.cam_online;
         self.panel.inputs.cam_covered = self.cam_covered;
         self.panel.inputs.net_watch = self.cfg.operator.phone_alerts;
+        self.panel.quiet_intrusion = self.cfg.operator.quiet_intrusion;
         let mask = self.cfg.camera.camera_mask();
         for i in 0..8 {
             if !mask[i] {
@@ -981,9 +1162,20 @@ impl Engine {
                 self.cam_contact_open[i] = false;
             }
         }
-        self.panel.camera_zone = mask;
+        self.panel.camera_zone = std::array::from_fn(|i| {
+            mask[i] && self.cfg.home_assistant.binding(self.panel.model, (i + 1) as u8).is_none()
+        });
         self.panel.dirty = true;
-        if cam_changed || model_changed {
+        if hub_changed {
+            self.hub_epoch += 1;
+            self.home = HomeView::default();
+            self.home_pulses.clear();
+            self.hub.configure(&self.cfg.home_assistant, self.hub_epoch);
+        }
+        if hub_changed || bindings_changed || model_changed {
+            self.home_pulses.clear();
+            self.sync_home_baseline(now);
+        } else if cam_changed {
             self.sync_zones(now);
         }
     }
@@ -1007,9 +1199,42 @@ impl Engine {
     fn handle_op(&mut self, outs: Vec<OpOut>) {
         for o in outs {
             match o {
-                OpOut::Notify(job) => self.notify.send(job),
+                OpOut::Audio(AudioCmd::Ring(true) | AudioCmd::Line(_)) if self.cfg.operator.quiet_intrusion => {}
                 OpOut::Audio(c) => self.audio.send(c),
             }
+        }
+    }
+
+    fn phone_report(&mut self, report: &Report, now: Instant) {
+        let gifs_enabled = self.cfg.operator.motion_gifs_enabled();
+        if gifs_enabled && report.kind == ReportKind::EntryStarted {
+            self.entry_evidence = Some((report.zone_or_user, now));
+            self.cam.send(CamCmd::MarkEntryForClip(now));
+        }
+        let Some((job, snapshot)) = notify::for_report(report, &self.cfg.operator) else {
+            return;
+        };
+        if snapshot && self.cfg.operator.send_photos && self.cfg.camera.enabled && self.cam_online && !self.cam_covered {
+            self.alert_sequence += 1;
+            let reason = format!("phone-alert-{}", self.alert_sequence);
+            let motion_gif = gifs_enabled
+                && matches!(report.kind, ReportKind::EntryStarted | ReportKind::Stranger | ReportKind::Alarm(AlarmKind::Burglary));
+            let deadline = now + Duration::from_millis(if motion_gif { 3000 } else { 1200 });
+            if motion_gif {
+                let event_at = if report.kind == ReportKind::Alarm(AlarmKind::Burglary) {
+                    self.entry_evidence.take()
+                        .filter(|(zone, at)| *zone == report.zone_or_user && now.saturating_duration_since(*at) < Duration::from_secs(300))
+                        .map_or(now, |(_, at)| at)
+                } else {
+                    now
+                };
+                self.cam.send(CamCmd::AlertClip { reason: reason.clone(), event_at, deadline });
+            } else {
+                self.cam.send(CamCmd::AlertSnapshot { reason: reason.clone(), deadline });
+            }
+            self.pending_photos.push((reason, job, deadline));
+        } else {
+            self.notify.send(job);
         }
     }
 
@@ -1018,7 +1243,12 @@ impl Engine {
         for o in outs {
             match o {
                 Out::Audio(c) => self.audio.send(c),
+                Out::Memo(cmd) => {
+                    let _ = self.memo.send(cmd);
+                }
+                Out::PhoneReport(r) => self.phone_report(&r, now),
                 Out::Report(r) => {
+                    self.phone_report(&r, now);
                     let dial = self.dial_info(&r);
                     let res = self.op.report(r, now, dial, &self.cfg.operator);
                     self.handle_op(res);
@@ -1027,6 +1257,7 @@ impl Engine {
                 Out::Save => self.save_due = Some(now + Duration::from_millis(400)),
                 Out::LearnFace => self.cam.send(CamCmd::LearnOwner),
                 Out::Disarmed { after_alarm } => {
+                    self.entry_evidence = None;
                     let res = self.op.disarmed(after_alarm, now, &self.cfg.operator);
                     self.handle_op(res);
                 }
@@ -1038,6 +1269,19 @@ impl Engine {
     fn tick(&mut self) {
         let now = Instant::now();
         let wall = util::now_ms();
+        let pulses = self.home_pulses.len();
+        self.home_pulses.retain(|_, until| now < *until);
+        if self.home_pulses.len() != pulses {
+            self.sync_zones(now);
+        }
+        self.pending_photos.retain(|(_, job, deadline)| {
+            if now < *deadline {
+                true
+            } else {
+                self.notify.send(job.clone());
+                false
+            }
+        });
         // Reading the cached battery state is instant, so it can be checked often.
         if self.last_power.map_or(true, |t| now.saturating_duration_since(t).as_millis() >= 1000) {
             self.last_power = Some(now);
@@ -1090,15 +1334,18 @@ impl Engine {
     }
 
     fn shutdown(&mut self) {
+        for (_, job, _) in self.pending_photos.drain(..) {
+            self.notify.send(job);
+        }
         let armed = self.panel.armed.is_some() || self.panel.exit.is_some();
         if armed {
-            self.panel.log(EvKind::Info, "RoomGuard was closed while armed. It will come back armed when it opens again.");
+            self.panel.log(EvKind::Info, "RoomGuard was closed while armed.");
             let cfg = NtfyCfg::from(&self.cfg.operator);
             if cfg.enabled {
                 let job = NotifyJob {
                     title: "RoomGuard closed while armed".to_string(),
                     message: format!(
-                        "The app was closed at {} while the system was armed. It will re-arm by itself when it opens again.",
+                        "The app was closed at {} while the system was armed.",
                         util::fmt_clock(util::now_ms())
                     ),
                     priority: 4,
@@ -1174,7 +1421,12 @@ impl Engine {
             status,
             status_title: title,
             status_detail: detail,
-            zones: p.zone_views(),
+            zones: p.zone_views().into_iter().map(|mut zone| {
+                if self.cfg.home_assistant.binding(p.model, zone.num).is_some() && zone.fault {
+                    zone.note = "Home Assistant sensor unavailable".into();
+                }
+                zone
+            }).collect(),
             bell: p.bell_sent != BellPattern::Off,
             siren: self.cfg.sound.siren_model,
             hold: p.hold_progress(now),
@@ -1185,7 +1437,10 @@ impl Engine {
             armed: p.armed.is_some() || p.exit.is_some(),
             programming: p.is_programming(),
             notify_status: self.notify_status.clone(),
+            notify_test_status: self.notify_test_status.clone(),
             sim: self.sim,
+            home: self.home.clone(),
+            home_zones: std::array::from_fn(|index| self.cfg.home_assistant.binding(p.model, (index + 1) as u8).is_some()),
             hint: p.hint(),
             prog: self.prog_cache.1.clone(),
         };

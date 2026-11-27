@@ -14,6 +14,7 @@ mod engine;
 mod keypads;
 mod lcd_font;
 mod notify;
+mod home_assistant;
 mod paint;
 mod png;
 mod power;
@@ -88,8 +89,8 @@ fn run(
     started: Arc<AtomicBool>,
 ) -> eframe::Result<()> {
     let mut viewport = egui::ViewportBuilder::default()
-        .with_title("RoomGuard")
-        .with_app_id("roomguard")
+        .with_title(util::app_name())
+        .with_app_id(if update::experimental_build().is_some() { "roomguard-experimental" } else { "roomguard" })
         .with_inner_size([1440.0, 900.0])
         .with_min_inner_size([1180.0, 740.0])
         .with_icon(app::window_icon());

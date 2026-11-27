@@ -266,6 +266,10 @@ pub struct SoundCfg {
     pub siren: f32,
     pub keypad: f32,
     pub siren_model: SirenModel,
+    /// None follows the operating system's default output.
+    pub keypad_output: Option<String>,
+    /// None uses the same output as the keypad.
+    pub siren_output: Option<String>,
     /// Wire the WAVE-2F to its warble terminal instead of the steady one.
     pub wave2_warble: bool,
     /// Play the communicator's phone line tones while it reports.
@@ -279,6 +283,8 @@ impl Default for SoundCfg {
             siren: 0.45,
             keypad: 0.7,
             siren_model: SirenModel::Wave2F,
+            keypad_output: None,
+            siren_output: None,
             wave2_warble: true,
             line_audio: false,
         }
@@ -299,6 +305,9 @@ pub struct OperatorCfg {
     pub ntfy_topic: String,
     pub ntfy_token: String,
     pub send_photos: bool,
+    pub send_motion_gifs: bool,
+    pub quiet_intrusion: bool,
+    pub unknown_person_alerts: bool,
     pub heads_up_on_entry: bool,
     pub open_close_reports: bool,
     pub trouble_reports: bool,
@@ -307,7 +316,7 @@ pub struct OperatorCfg {
 impl Default for OperatorCfg {
     fn default() -> Self {
         OperatorCfg {
-            enabled: true,
+            enabled: false,
             operator_name: "Dana".to_string(),
             passcode_salt: String::new(),
             passcode_hash: String::new(),
@@ -315,7 +324,10 @@ impl Default for OperatorCfg {
             ntfy_server: "https://ntfy.sh".to_string(),
             ntfy_topic: format!("roomguard-{}", util::random_token(14)),
             ntfy_token: String::new(),
-            send_photos: true,
+            send_photos: false,
+            send_motion_gifs: false,
+            quiet_intrusion: false,
+            unknown_person_alerts: true,
             heads_up_on_entry: false,
             open_close_reports: false,
             trouble_reports: true,
@@ -324,6 +336,10 @@ impl Default for OperatorCfg {
 }
 
 impl OperatorCfg {
+    pub fn motion_gifs_enabled(&self) -> bool {
+        self.phone_alerts && self.send_photos && self.send_motion_gifs
+    }
+
     pub fn set_passcode(&mut self, word: &str) {
         self.passcode_salt = util::random_token(12);
         self.passcode_hash = util::hash_secret(&self.passcode_salt, &word.trim().to_lowercase());
@@ -378,6 +394,7 @@ pub struct AppConfig {
     pub camera: CameraCfg,
     pub sound: SoundCfg,
     pub operator: OperatorCfg,
+    pub home_assistant: crate::home_assistant::Config,
     pub ui: UiCfg,
     pub labels_1550: Vec<String>,
     pub labels_1832: Vec<String>,
@@ -401,6 +418,7 @@ impl Default for AppConfig {
             camera: CameraCfg::default(),
             sound: SoundCfg::default(),
             operator: OperatorCfg::default(),
+            home_assistant: crate::home_assistant::Config::default(),
             ui: UiCfg::default(),
             labels_1550: default_labels(Model::Pc1550),
             labels_1832: default_labels(Model::Pc1832),
@@ -438,7 +456,9 @@ pub fn default_labels(model: Model) -> Vec<String> {
             "Basement",
         ],
     };
-    names.iter().map(|s| s.to_string()).collect()
+    names.iter().map(|s| s.to_string())
+        .chain((names.len() + 1..=model.zone_count()).map(|zone| format!("Zone {:02}", zone)))
+        .collect()
 }
 
 impl AppConfig {

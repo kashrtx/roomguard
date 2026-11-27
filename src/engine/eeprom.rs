@@ -1,4 +1,4 @@
-//! The panel's EEPROM: every programming section with its real number,
+//! The panel's EEPROM: supported programming sections with their numbers,
 //! layout and default, for both panels. Data is stored as the same hex digits
 //! you'd key in at the keypad. Access codes are stored salted and hashed.
 
@@ -85,7 +85,8 @@ pub const PC1832: &[Spec] = &[
     Spec { key: "000.3", name: "Func Key 3", kind: d(1, 2), default: "06" },
     Spec { key: "000.4", name: "Func Key 4", kind: d(1, 2), default: "14" },
     Spec { key: "000.5", name: "Func Key 5", kind: d(1, 2), default: "16" },
-    Spec { key: "001", name: "Zone Defs", kind: d(16, 2), default: "01050301050802040000000000000000" },
+    Spec { key: "001", name: "Zn Defs 01-16", kind: d(16, 2), default: "01050301050802040000000000000000" },
+    Spec { key: "002", name: "Zn Defs 17-32", kind: d(16, 2), default: "00000000000000000000000000000000" },
     Spec { key: "005", name: "Sys Times", kind: Kind::Sub, default: "" },
     Spec { key: "005.01", name: "Part 1 Times", kind: d(3, 3), default: "030045120" },
     Spec { key: "005.02", name: "Part 2 Times", kind: d(3, 3), default: "030045120" },
@@ -117,6 +118,30 @@ pub const PC1832: &[Spec] = &[
     Spec { key: "106", name: "Zone 6 Attr", kind: Kind::Toggle(8), default: "1" },
     Spec { key: "107", name: "Zone 7 Attr", kind: Kind::Toggle(8), default: "12346" },
     Spec { key: "108", name: "Zone 8 Attr", kind: Kind::Toggle(8), default: "1246" },
+    Spec { key: "109", name: "Zone 9 Attr", kind: Kind::Toggle(8), default: "" },
+    Spec { key: "110", name: "Zone 10 Attr", kind: Kind::Toggle(8), default: "" },
+    Spec { key: "111", name: "Zone 11 Attr", kind: Kind::Toggle(8), default: "" },
+    Spec { key: "112", name: "Zone 12 Attr", kind: Kind::Toggle(8), default: "" },
+    Spec { key: "113", name: "Zone 13 Attr", kind: Kind::Toggle(8), default: "" },
+    Spec { key: "114", name: "Zone 14 Attr", kind: Kind::Toggle(8), default: "" },
+    Spec { key: "115", name: "Zone 15 Attr", kind: Kind::Toggle(8), default: "" },
+    Spec { key: "116", name: "Zone 16 Attr", kind: Kind::Toggle(8), default: "" },
+    Spec { key: "117", name: "Zone 17 Attr", kind: Kind::Toggle(8), default: "" },
+    Spec { key: "118", name: "Zone 18 Attr", kind: Kind::Toggle(8), default: "" },
+    Spec { key: "119", name: "Zone 19 Attr", kind: Kind::Toggle(8), default: "" },
+    Spec { key: "120", name: "Zone 20 Attr", kind: Kind::Toggle(8), default: "" },
+    Spec { key: "121", name: "Zone 21 Attr", kind: Kind::Toggle(8), default: "" },
+    Spec { key: "122", name: "Zone 22 Attr", kind: Kind::Toggle(8), default: "" },
+    Spec { key: "123", name: "Zone 23 Attr", kind: Kind::Toggle(8), default: "" },
+    Spec { key: "124", name: "Zone 24 Attr", kind: Kind::Toggle(8), default: "" },
+    Spec { key: "125", name: "Zone 25 Attr", kind: Kind::Toggle(8), default: "" },
+    Spec { key: "126", name: "Zone 26 Attr", kind: Kind::Toggle(8), default: "" },
+    Spec { key: "127", name: "Zone 27 Attr", kind: Kind::Toggle(8), default: "" },
+    Spec { key: "128", name: "Zone 28 Attr", kind: Kind::Toggle(8), default: "" },
+    Spec { key: "129", name: "Zone 29 Attr", kind: Kind::Toggle(8), default: "" },
+    Spec { key: "130", name: "Zone 30 Attr", kind: Kind::Toggle(8), default: "" },
+    Spec { key: "131", name: "Zone 31 Attr", kind: Kind::Toggle(8), default: "" },
+    Spec { key: "132", name: "Zone 32 Attr", kind: Kind::Toggle(8), default: "" },
     Spec { key: "170", name: "PGM Timer", kind: d(1, 3), default: "005" },
     Spec { key: "176", name: "Cross Zn Tmr", kind: d(1, 3), default: "060" },
     Spec { key: "199", name: "AutoArm PrAl", kind: d(1, 3), default: "004" },
@@ -153,6 +178,30 @@ pub const PC1832: &[Spec] = &[
     Spec { key: "kp206", name: "Zn 6 Chime", kind: Kind::Toggle(8), default: "1" },
     Spec { key: "kp207", name: "Zn 7 Chime", kind: Kind::Toggle(8), default: "2" },
     Spec { key: "kp208", name: "Zn 8 Chime", kind: Kind::Toggle(8), default: "1" },
+    Spec { key: "kp209", name: "Zn 9 Chime", kind: Kind::Toggle(8), default: "1" },
+    Spec { key: "kp210", name: "Zn 10 Chime", kind: Kind::Toggle(8), default: "1" },
+    Spec { key: "kp211", name: "Zn 11 Chime", kind: Kind::Toggle(8), default: "1" },
+    Spec { key: "kp212", name: "Zn 12 Chime", kind: Kind::Toggle(8), default: "1" },
+    Spec { key: "kp213", name: "Zn 13 Chime", kind: Kind::Toggle(8), default: "1" },
+    Spec { key: "kp214", name: "Zn 14 Chime", kind: Kind::Toggle(8), default: "1" },
+    Spec { key: "kp215", name: "Zn 15 Chime", kind: Kind::Toggle(8), default: "1" },
+    Spec { key: "kp216", name: "Zn 16 Chime", kind: Kind::Toggle(8), default: "1" },
+    Spec { key: "kp217", name: "Zn 17 Chime", kind: Kind::Toggle(8), default: "1" },
+    Spec { key: "kp218", name: "Zn 18 Chime", kind: Kind::Toggle(8), default: "1" },
+    Spec { key: "kp219", name: "Zn 19 Chime", kind: Kind::Toggle(8), default: "1" },
+    Spec { key: "kp220", name: "Zn 20 Chime", kind: Kind::Toggle(8), default: "1" },
+    Spec { key: "kp221", name: "Zn 21 Chime", kind: Kind::Toggle(8), default: "1" },
+    Spec { key: "kp222", name: "Zn 22 Chime", kind: Kind::Toggle(8), default: "1" },
+    Spec { key: "kp223", name: "Zn 23 Chime", kind: Kind::Toggle(8), default: "1" },
+    Spec { key: "kp224", name: "Zn 24 Chime", kind: Kind::Toggle(8), default: "1" },
+    Spec { key: "kp225", name: "Zn 25 Chime", kind: Kind::Toggle(8), default: "1" },
+    Spec { key: "kp226", name: "Zn 26 Chime", kind: Kind::Toggle(8), default: "1" },
+    Spec { key: "kp227", name: "Zn 27 Chime", kind: Kind::Toggle(8), default: "1" },
+    Spec { key: "kp228", name: "Zn 28 Chime", kind: Kind::Toggle(8), default: "1" },
+    Spec { key: "kp229", name: "Zn 29 Chime", kind: Kind::Toggle(8), default: "1" },
+    Spec { key: "kp230", name: "Zn 30 Chime", kind: Kind::Toggle(8), default: "1" },
+    Spec { key: "kp231", name: "Zn 31 Chime", kind: Kind::Toggle(8), default: "1" },
+    Spec { key: "kp232", name: "Zn 32 Chime", kind: Kind::Toggle(8), default: "1" },
 ];
 
 /// VistaGuard 20P (VISTA-20P compatible) programming fields.
@@ -174,7 +223,7 @@ pub const VISTA20P: &[Spec] = &[
     Spec { key: "42", name: "Secondary Phone Number", kind: Kind::Phone(20), default: "" },
     Spec { key: "43", name: "Partition 1 Account Code", kind: d(1, 4), default: "1234" },
     Spec { key: "50", name: "Burglary Dialer Delay", kind: d(1, 1), default: "2" },
-    Spec { key: "56", name: "Zone Types (01-08)", kind: d(8, 2), default: "0104030104090210" },
+    Spec { key: "56", name: "Zone Types (01-48)", kind: d(48, 2), default: concat!("0104030104090210", "00000000000000000000000000000000000000000000000000000000000000000000000000000000") },
     Spec { key: "57", name: "Function Keys A-D", kind: d(4, 2), default: "00000003" },
     Spec { key: "59", name: "Exit Error Report Code", kind: d(1, 1), default: "0" },
     Spec { key: "81", name: "Night-Stay Zones (List 05)", kind: d(8, 1), default: "00000000" },
@@ -186,7 +235,7 @@ pub const VISTA20P: &[Spec] = &[
     Spec { key: "197", name: "Exit Time Display Interval", kind: d(1, 1), default: "0" },
     Spec { key: "198", name: "Display Partition Number", kind: d(1, 1), default: "0" },
     Spec { key: "chime_list", name: "Chime By Zone (List 03)", kind: d(8, 1), default: "10110010" },
-    Spec { key: "resp", name: "Zone Response Times (0-3)", kind: d(8, 1), default: "11111111" },
+    Spec { key: "resp", name: "Zone Response Times (0-3)", kind: d(48, 1), default: "111111111111111111111111111111111111111111111111" },
     Spec { key: "97", name: "Reset Factory Defaults", kind: Kind::Action, default: "" },
     Spec { key: "98", name: "Exit Programming (Lockout)", kind: Kind::Action, default: "" },
     Spec { key: "99", name: "Exit Programming", kind: Kind::Action, default: "" },
@@ -198,6 +247,10 @@ pub fn table(model: Model) -> &'static [Spec] {
         Model::Pc1832 => PC1832,
         Model::Vista20p => VISTA20P,
     }
+}
+
+pub fn pc1832_zone_section(zone: usize) -> (&'static str, usize) {
+    if zone <= 16 { ("001", zone.saturating_sub(1)) } else { ("002", zone - 17) }
 }
 
 pub fn spec(model: Model, key: &str) -> Option<&'static Spec> {
@@ -354,6 +407,12 @@ impl Eeprom {
 
     pub fn raw(&self, model: Model, key: &str) -> String {
         if let Some(v) = self.sections.get(key) {
+            if model == Model::Vista20p && matches!(key, "56" | "resp") {
+                let default = spec(model, key).map_or("", |spec| spec.default);
+                if let Some(padding) = default.get(v.len()..) {
+                    return format!("{}{}", v, padding);
+                }
+            }
             return v.clone();
         }
         spec(model, key).map(|s| s.default.to_string()).unwrap_or_default()
@@ -484,8 +543,9 @@ impl Eeprom {
                 }
             }
             Model::Pc1832 => {
-                let raw = self.raw(model, "001");
-                let i = zone.saturating_sub(1) * 2;
+                let (section, index) = pc1832_zone_section(zone);
+                let raw = self.raw(model, section);
+                let i = index * 2;
                 let code: u32 = raw.get(i..i + 2).and_then(|s| s.parse().ok()).unwrap_or(0);
                 let kind = match code {
                     1 => ZoneKind::Delay1,
@@ -563,7 +623,26 @@ impl Eeprom {
         }
     }
 
-    /// Default PC1832 zone attributes (Section [101]-[108]) for a given zone
+    pub fn default_changed_pc1832_zone_attrs(&mut self, section: &str, definitions: &str) {
+        let first = match section {
+            "001" => 1,
+            "002" => 17,
+            _ => return,
+        };
+        let previous = self.raw(Model::Pc1832, section);
+        for index in 0..16 {
+            let start = index * 2;
+            let old = previous.get(start..start + 2).unwrap_or("00");
+            let new = definitions.get(start..start + 2).unwrap_or("00");
+            if old != new {
+                let code = new.parse().unwrap_or(0);
+                let attributes = if code == 0 { "" } else { Self::default_zone_attrs(code) };
+                self.sections.insert(format!("{:03}", 100 + first + index), attributes.to_string());
+            }
+        }
+    }
+
+    /// Default PC1832 zone attributes (Sections [101]–[132]) for a given zone
     /// definition code, applied automatically when Section [001] changes.
     /// Straight from the v4.6 manual's attribute table: 1 audible, 2 steady,
     /// 3 chime, 4 bypass, 5 force arm, 6 swinger shutdown, 7 transmission

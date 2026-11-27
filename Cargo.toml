@@ -26,6 +26,8 @@ qrcode = { version = "0.14", default-features = false }
 starship-battery = "0.10"
 self-replace = "1"
 tract-onnx = "0.21"
+gif = "0.13.3"
+tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"

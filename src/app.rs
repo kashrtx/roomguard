@@ -305,6 +305,9 @@ impl RoomGuardApp {
                                 let (r, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
                                 ui.painter().circle_filled(r.center(), 4.5, col);
                                 ui.label(RichText::new(&view.status_title).font(theme::semi(14.0)).color(col));
+                                if view.armed && self.cfg.operator.quiet_intrusion {
+                                    ui.label(theme::muted("Quiet intrusion"));
+                                }
                                 if !view.status_detail.is_empty() {
                                     ui.add(egui::Label::new(RichText::new(&view.status_detail).color(theme::MUTED).size(13.0)).truncate());
                                 }
@@ -571,12 +574,10 @@ impl RoomGuardApp {
                 ui.set_width(440.0);
                 ui.label(RichText::new("RoomGuard is armed").font(theme::semi(19.0)));
                 ui.add_space(4.0);
-                let why = if needs_code {
-                    "Type your code to close it. While it's closed nothing watches the room, so you'll get a phone alert, and it comes back armed the next time it opens."
-                } else {
-                    "While it's closed nothing watches the room, so you'll get a phone alert, and it comes back armed the next time it opens."
-                };
-                ui.label(why);
+                if needs_code {
+                    ui.label("Enter your code to close RoomGuard.");
+                }
+                ui.label("Monitoring stops when RoomGuard closes.");
                 ui.add_space(8.0);
                 let mut submit = false;
                 if needs_code {

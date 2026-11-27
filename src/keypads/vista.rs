@@ -93,7 +93,7 @@ pub fn draw(
         );
     }
 
-    // 5. Lower-left recessed status plate: ARMED (red), READY (green), MSG (amber)
+    // 5. Lower-left recessed status plate: ARMED (red), READY (green), MSG (red)
     let plate = xf.r(BX + 14.0, BY + 114.0, 80.0, 118.0);
     paint::grad_rrect(
         &p,
@@ -108,7 +108,7 @@ pub fn draw(
     let led_msg = view.lcd_leds[2];
     draw_oval_led(&p, &xf, BX + 24.0, BY + 144.0, "ARMED", led_armed, Color32::from_rgb(0xFF, 0x3B, 0x2F), l, t, view.all_on);
     draw_oval_led(&p, &xf, BX + 24.0, BY + 178.0, "READY", led_ready, Color32::from_rgb(0x30, 0xE8, 0x52), l, t, view.all_on);
-    draw_oval_led(&p, &xf, BX + 24.0, BY + 210.0, "MSG", led_msg, Color32::from_rgb(0xFF, 0xB8, 0x28), l, t, view.all_on);
+    draw_oval_led(&p, &xf, BX + 24.0, BY + 210.0, "MSG", led_msg, Color32::from_rgb(0xFF, 0x3B, 0x2F), l, t, view.all_on);
 
     // 6. Sculpted upper-right visor with slight upward-sloping top arch
     let visor_pts = vec![

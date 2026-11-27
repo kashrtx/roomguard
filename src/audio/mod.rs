@@ -4,6 +4,7 @@
 //! rebuild the output stream if the device changes or disappears, which also
 //! tells the panel when the "bell circuit" is broken.
 
+pub mod memo;
 pub mod synth;
 pub mod voice;
 
@@ -66,6 +67,7 @@ pub enum AudioCmd {
     BuzzerLevel(u8),
     VoiceLevel(u8),
     Speak(Vec<String>),
+    PlayMemo(memo::Clip),
     Sounder(Pattern),
     KeyBeep,
     Beeps { count: u8, on_ms: u16, off_ms: u16 },
@@ -88,31 +90,101 @@ pub enum AudioCmd {
     Wake,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Route {
+    Keypad,
+    Siren,
+    Both,
+}
+
+impl Route {
+    fn accepts(self, cmd: &AudioCmd) -> bool {
+        match cmd {
+            AudioCmd::Volumes { .. } | AudioCmd::Silence => true,
+            AudioCmd::Bell(_) | AudioCmd::Squawk(_) | AudioCmd::Siren { .. } | AudioCmd::Preview { .. } => self != Self::Keypad,
+            _ => self != Self::Siren,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Output {
+    route: Route,
+    device: Option<String>,
+}
+
+enum WorkerCmd {
+    Audio(AudioCmd),
+    Output(Option<Output>),
+}
+
 #[derive(Clone)]
-pub struct AudioHandle {
-    tx: Sender<AudioCmd>,
+struct OutputWorker {
+    tx: Sender<WorkerCmd>,
     ok: Arc<AtomicBool>,
 }
 
+#[derive(Clone)]
+pub struct AudioHandle {
+    keypad: OutputWorker,
+    siren: OutputWorker,
+    devices: Arc<Mutex<Vec<String>>>,
+    split: Arc<AtomicBool>,
+}
+
 impl AudioHandle {
-    pub fn send(&self, c: AudioCmd) {
-        let _ = self.tx.send(c);
+    pub fn send(&self, cmd: AudioCmd) {
+        // Keep the siren worker's persistent state current even while it is idle.
+        let _ = self.siren.tx.send(WorkerCmd::Audio(cmd.clone()));
+        let _ = self.keypad.tx.send(WorkerCmd::Audio(cmd));
     }
-    /// False when there's no working output device (the "bell circuit").
+
+    pub fn configure(&self, keypad: Option<String>, siren: Option<String>) {
+        let separate = siren.is_some() && siren != keypad;
+        self.split.store(separate, Ordering::Relaxed);
+        let keypad_output = Output { route: if separate { Route::Keypad } else { Route::Both }, device: keypad };
+        let siren_output = separate.then_some(Output { route: Route::Siren, device: siren });
+        let _ = self.keypad.tx.send(WorkerCmd::Output(Some(keypad_output)));
+        let _ = self.siren.tx.send(WorkerCmd::Output(siren_output));
+    }
+
+    pub fn devices(&self) -> Vec<String> {
+        self.devices.lock().map(|devices| devices.clone()).unwrap_or_default()
+    }
+
+    pub fn keypad_ok(&self) -> bool {
+        self.keypad.ok.load(Ordering::Relaxed)
+    }
+
+    /// The panel's bell circuit follows the selected siren output.
     pub fn is_ok(&self) -> bool {
-        self.ok.load(Ordering::Relaxed)
+        if self.split.load(Ordering::Relaxed) {
+            self.siren.ok.load(Ordering::Relaxed)
+        } else {
+            self.keypad_ok()
+        }
     }
 }
 
 pub fn start() -> AudioHandle {
-    let (tx, rx) = mpsc::channel::<AudioCmd>();
-    let ok = Arc::new(AtomicBool::new(false));
-    let ok2 = ok.clone();
-    let spawned = std::thread::Builder::new().name("audio".into()).spawn(move || run(rx, ok2));
-    if let Err(e) = spawned {
-        util::log(&format!("could not start the audio thread: {}", e));
+    let devices = Arc::new(Mutex::new(Vec::new()));
+    AudioHandle {
+        keypad: start_output("audio-keypad", Some(devices.clone())),
+        siren: start_output("audio-siren", None),
+        devices,
+        split: Arc::new(AtomicBool::new(false)),
     }
-    AudioHandle { tx, ok }
+}
+
+fn start_output(name: &'static str, devices: Option<Arc<Mutex<Vec<String>>>>) -> OutputWorker {
+    let (tx, rx) = mpsc::channel();
+    let ok = Arc::new(AtomicBool::new(false));
+    let running = ok.clone();
+    let spawned = std::thread::Builder::new().name(name.into()).spawn(move || run(rx, running, devices));
+    if let Err(e) = spawned {
+        util::log(&format!("could not start {}: {}", name, e));
+    }
+    OutputWorker { tx, ok }
 }
 
 /// The lasting state, replayed into each new output stream.
@@ -164,137 +236,148 @@ impl State {
     }
 }
 
-fn run(rx: Receiver<AudioCmd>, ok: Arc<AtomicBool>) {
-    // Keep the command forwarder responsive so keypress beeps reach the
-    // real-time callback immediately without contending with background work.
+fn run(rx: Receiver<WorkerCmd>, ok: Arc<AtomicBool>, devices: Option<Arc<Mutex<Vec<String>>>>) {
     util::set_thread_priority(util::prio::PANEL);
 
-    // Watch for OS default-device changes (e.g. speakers -> headphones) on a
-    // separate low-priority thread. On Windows WASAPI, querying the default
-    // MMDevice endpoint can block 40-150 ms; isolating it here guarantees
-    // device polling NEVER stalls a KeyBeep on the hot forwarding path.
-    let active_device: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    // Endpoint enumeration can block on WASAPI. Keep it off the command path.
+    let active_default = Arc::new(Mutex::new(None::<String>));
     let switch_flag = Arc::new(AtomicBool::new(false));
     let stop_watch = Arc::new(AtomicBool::new(false));
-    {
-        let active2 = active_device.clone();
-        let switch2 = switch_flag.clone();
-        let stop2 = stop_watch.clone();
+    if let Some(devices) = devices {
+        let active = active_default.clone();
+        let switched = switch_flag.clone();
+        let stop = stop_watch.clone();
         let _ = std::thread::Builder::new().name("audio-watch".into()).spawn(move || {
             util::set_thread_priority(util::prio::BACKGROUND);
-            while !stop2.load(Ordering::Relaxed) {
-                std::thread::sleep(Duration::from_millis(1200));
-                if stop2.load(Ordering::Relaxed) {
-                    break;
+            while !stop.load(Ordering::Relaxed) {
+                let names = output_names();
+                if let Ok(mut list) = devices.lock() {
+                    *list = names;
                 }
-                let cur = active2.lock().ok().and_then(|g| g.clone());
-                if let Some(using) = cur {
-                    if let Some(now_default) = default_output_name() {
-                        if using != now_default {
-                            util::log(&format!("sound output switched to {}", now_default));
-                            switch2.store(true, Ordering::Release);
-                        }
+                let current = active.lock().ok().and_then(|name| name.clone());
+                if let Some(current) = current {
+                    if default_output_name().is_some_and(|name| name != current) {
+                        switched.store(true, Ordering::Release);
                     }
                 }
+                std::thread::sleep(Duration::from_millis(1200));
             }
         });
     }
 
+    let mut output: Option<Output> = None;
     let mut state = State::default();
     let mut logged = false;
-    // Short burst commands asked for while the output was rebuilding (Windows
-    // resets it when a device changes or wakes up). Replayed if still fresh.
-    let mut pending: Vec<(AudioCmd, Instant)> = Vec::new();
+    let mut pending = Vec::new();
     let mut backoff = Duration::from_millis(100);
     loop {
+        let Some(current) = &output else {
+            match rx.recv() {
+                Ok(WorkerCmd::Output(next)) => output = next,
+                Ok(WorkerCmd::Audio(cmd)) => state.remember(&cmd),
+                Err(_) => break,
+            }
+            continue;
+        };
+        let current = current.clone();
         switch_flag.store(false, Ordering::Relaxed);
         let failed = Arc::new(AtomicBool::new(false));
-        let (itx, irx) = mpsc::channel::<AudioCmd>();
-        let built = build_stream(irx, failed.clone());
-        // Which output this stream plays into, to notice a switch.
-        let using = built.as_ref().ok().and_then(|(_, name)| name.clone());
-        if let Ok(mut g) = active_device.lock() {
-            *g = using.clone();
+        let (tx, input) = mpsc::channel();
+        // Prime the callback before opening the device, including an alarm
+        // already sounding when its speaker comes back.
+        for cmd in state.replay().into_iter().filter(|cmd| current.route.accepts(cmd)) {
+            let _ = tx.send(cmd);
         }
-        let stream = built.map(|(s, _)| s);
+        let built = build_stream(input, failed.clone(), current.device.as_deref());
+        if let Ok(mut name) = active_default.lock() {
+            *name = if current.device.is_none() { built.as_ref().ok().and_then(|(_, name)| name.clone()) } else { None };
+        }
+        let stream = built.map(|(stream, _)| stream);
         match &stream {
             Ok(_) => {
                 ok.store(true, Ordering::Relaxed);
                 if logged {
-                    util::log("audio output is back");
+                    util::log(&format!("{:?} audio output is back", current.route));
                 }
                 logged = false;
                 backoff = Duration::from_millis(100);
-                for c in state.replay() {
-                    let _ = itx.send(c);
-                }
-                for (c, at) in pending.drain(..) {
-                    if at.elapsed() < Duration::from_millis(700) {
-                        let _ = itx.send(c);
+                for (cmd, at) in pending.drain(..) {
+                    if Instant::elapsed(&at) < Duration::from_millis(700) && current.route.accepts(&cmd) {
+                        let _ = tx.send(cmd);
                     }
                 }
             }
             Err(e) => {
-                ok.store(false, Ordering::Relaxed);
                 if !logged {
-                    util::log(&format!("audio output unavailable: {}", e));
+                    util::log(&format!("{:?} audio output unavailable: {}", current.route, e));
                     logged = true;
                 }
             }
         }
-        let mut switched = false;
-        loop {
-            match rx.recv_timeout(Duration::from_millis(150)) {
-                Ok(cmd) => {
-                    state.remember(&cmd);
-                    let alive = stream.is_ok() && !failed.load(Ordering::Relaxed);
-                    if alive {
-                        let _ = itx.send(cmd);
-                    } else if State::worth_replaying(&cmd) {
-                        if pending.len() >= 4 {
-                            pending.remove(0);
-                        }
-                        pending.push((cmd, Instant::now()));
+
+        let deadline = Instant::now() + backoff;
+        let retry = loop {
+            let alive = stream.is_ok() && !failed.load(Ordering::Relaxed);
+            if switch_flag.swap(false, Ordering::Acquire) || (stream.is_ok() && !alive) {
+                break true;
+            }
+            let wait = if alive { Duration::from_millis(150) } else { deadline.saturating_duration_since(Instant::now()) };
+            if wait.is_zero() {
+                backoff = (backoff * 2).min(Duration::from_millis(1500));
+                break true;
+            }
+            match rx.recv_timeout(wait) {
+                Ok(WorkerCmd::Output(next)) => {
+                    if next != output {
+                        output = next;
+                        backoff = Duration::from_millis(100);
+                        pending.clear();
+                        break true;
                     }
-                    // Drain any commands queued back-to-back in the same turn
-                    // (e.g. KeyBeep + Tone + Speak) without looping timeout.
-                    while let Ok(more) = rx.try_recv() {
-                        state.remember(&more);
+                }
+                Ok(WorkerCmd::Audio(cmd)) => {
+                    state.remember(&cmd);
+                    if matches!(cmd, AudioCmd::Silence) {
+                        pending.clear();
+                    }
+                    if current.route.accepts(&cmd) {
                         if alive {
-                            let _ = itx.send(more);
-                        } else if State::worth_replaying(&more) {
+                            let _ = tx.send(cmd);
+                        } else if State::worth_replaying(&cmd) {
                             if pending.len() >= 4 {
                                 pending.remove(0);
                             }
-                            pending.push((more, Instant::now()));
+                            pending.push((cmd, Instant::now()));
                         }
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => {
-                    stop_watch.store(true, Ordering::Relaxed);
-                    return;
-                }
+                Err(RecvTimeoutError::Disconnected) => break false,
             }
-            if stream.is_err() || failed.load(Ordering::Relaxed) {
-                break;
-            }
-            if switch_flag.swap(false, Ordering::Acquire) {
-                switched = true;
-                break;
-            }
+        };
+        if let Ok(mut name) = active_default.lock() {
+            *name = None;
         }
-        if let Ok(mut g) = active_device.lock() {
-            *g = None;
-        }
-        drop(stream);
         ok.store(false, Ordering::Relaxed);
-        // Reconnect fast. A device that's just waking up is usually back in a
-        // moment, and a waiting beep gets the quickest retry of all.
-        let wait = if switched || !pending.is_empty() { Duration::from_millis(50) } else { backoff };
-        std::thread::sleep(wait);
-        backoff = if switched { Duration::from_millis(100) } else { (backoff * 2).min(Duration::from_millis(1500)) };
+        drop(stream);
+        if !retry {
+            break;
+        }
     }
+    stop_watch.store(true, Ordering::Relaxed);
+}
+
+fn output_names() -> Vec<String> {
+    use cpal::traits::{DeviceTrait, HostTrait};
+    let mut names: Vec<_> = cpal::default_host()
+        .output_devices()
+        .into_iter()
+        .flatten()
+        .filter_map(|device| device.name().ok())
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    names
 }
 
 /// The output the system is set to use right now.
@@ -321,13 +404,18 @@ fn render<T: Copy>(synth: &mut synth::Synth, data: &mut [T], channels: usize, si
     }
 }
 
-/// Opens the system's default output. Also returns its name, if it has one.
-fn build_stream(rx: Receiver<AudioCmd>, failed: Arc<AtomicBool>) -> Result<(cpal::Stream, Option<String>), String> {
+/// Opens the selected output, or the system default when none is selected.
+fn build_stream(rx: Receiver<AudioCmd>, failed: Arc<AtomicBool>, selected: Option<&str>) -> Result<(cpal::Stream, Option<String>), String> {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
     let host = cpal::default_host();
-    let device = host
-        .default_output_device()
-        .ok_or_else(|| "no audio output device".to_string())?;
+    let device = match selected {
+        Some(name) => host
+            .output_devices()
+            .map_err(|e| e.to_string())?
+            .find(|device| device.name().ok().as_deref() == Some(name))
+            .ok_or_else(|| format!("{} is disconnected", name))?,
+        None => host.default_output_device().ok_or_else(|| "no audio output device".to_string())?,
+    };
     let name = device.name().ok();
     let supported = device.default_output_config().map_err(|e| e.to_string())?;
     let format = supported.sample_format();
@@ -416,4 +504,29 @@ fn build_stream(rx: Receiver<AudioCmd>, failed: Arc<AtomicBool>) -> Result<(cpal
     .map_err(|e| e.to_string())?;
     stream.play().map_err(|e| e.to_string())?;
     Ok((stream, name))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn separate_outputs_keep_keypad_and_siren_commands_apart() {
+        for cmd in [AudioCmd::KeyBeep, AudioCmd::Speak(vec!["ready".into()]), AudioCmd::Ring(true)] {
+            assert!(Route::Keypad.accepts(&cmd));
+            assert!(!Route::Siren.accepts(&cmd));
+            assert!(Route::Both.accepts(&cmd));
+        }
+        for cmd in [
+            AudioCmd::Bell(BellPattern::Steady),
+            AudioCmd::Squawk(1),
+            AudioCmd::Preview { model: SirenModel::Wave2F, warble: true, ms: 1000 },
+        ] {
+            assert!(!Route::Keypad.accepts(&cmd));
+            assert!(Route::Siren.accepts(&cmd));
+            assert!(Route::Both.accepts(&cmd));
+        }
+        assert!(Route::Keypad.accepts(&AudioCmd::Silence));
+        assert!(Route::Siren.accepts(&AudioCmd::Silence));
+    }
 }

@@ -125,14 +125,17 @@ impl Panel {
             }
             Key::Digit(5) if disarmed => KpMode::NeedCode { purpose: CodeFor::UserCodes, buf: String::new() },
             Key::Digit(6) if disarmed => KpMode::NeedCode { purpose: CodeFor::UserFns, buf: String::new() },
-            Key::Digit(7) => {
-                if self.ee.raw(self.model, "24") == "03" {
-                    return KpMode::NeedCode { purpose: CodeFor::CmdOut, buf: String::new() };
+            Key::Digit(7) => match self.ee.raw(self.model, "24").as_str() {
+                "03" => KpMode::NeedCode { purpose: CodeFor::CmdOut, buf: String::new() },
+                "02" | "04" => {
+                    self.classic_utility_output(now);
+                    KpMode::Normal
                 }
-                self.util_until = Some(now + Duration::from_secs(5));
-                self.sensor_reset(now);
-                KpMode::Normal
-            }
+                _ => {
+                    self.error_tone();
+                    KpMode::Normal
+                }
+            },
             Key::Digit(8) if disarmed => KpMode::NeedCode { purpose: CodeFor::Installer, buf: String::new() },
             Key::Digit(9) if disarmed => KpMode::NeedCode { purpose: CodeFor::NoEntry, buf: String::new() },
             Key::Digit(0) => {
@@ -151,6 +154,17 @@ impl Panel {
                 self.error_tone();
                 KpMode::Normal
             }
+        }
+    }
+
+    /// Only the normally-low reset programming cuts smoke detector power.
+    pub(crate) fn classic_utility_output(&mut self, now: Instant) {
+        let until = now + Duration::from_secs(5);
+        self.util_until = Some(until);
+        if self.ee.raw(self.model, "24") == "04" {
+            self.sensor_reset(now);
+        } else {
+            self.log(EvKind::Info, "Utility output active for five seconds");
         }
     }
 

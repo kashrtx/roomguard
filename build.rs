@@ -10,6 +10,7 @@ fn main() {
     // Release builds made by GitHub Actions set this so the update checker
     // knows which repository its releases come from.
     println!("cargo:rerun-if-env-changed=ROOMGUARD_REPO");
+    println!("cargo:rerun-if-env-changed=ROOMGUARD_EXPERIMENTAL");
     println!("cargo:rerun-if-changed=assets/icon/icon.ico");
 
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {

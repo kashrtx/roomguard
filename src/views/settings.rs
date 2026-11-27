@@ -12,7 +12,7 @@ use crate::update::{UpdateState, Updater};
 use crate::util;
 use crate::vision::{CamCmd, CameraHandle};
 
-const TABS: [&str; 7] = ["General", "Panel", "Camera", "Sound", "Monitoring", "Updates", "About"];
+const TABS: [&str; 8] = ["General", "Panel", "Camera", "Sound", "Phone alerts", "Updates", "Home Assistant", "About"];
 
 #[derive(Default)]
 pub struct SettingsView {
@@ -20,6 +20,7 @@ pub struct SettingsView {
     pub restart: bool,
     pub rerun_setup: bool,
     pub tab: u8,
+    home_ui: super::home::HomeUi,
     new_pass: String,
     enroll_name: String,
     face_tex: Option<egui::TextureHandle>,
@@ -108,6 +109,7 @@ impl SettingsView {
                                 3 => self.sound(ui, cfg, changed, audio),
                                 4 => self.monitoring(ui, cfg, changed, view, engine),
                                 5 => self.updates(ui, cfg, changed, updater),
+                                6 => self.home_ui.ui(ui, cfg, changed, view, engine),
                                 _ => self.about(ui),
                             }
                         });
@@ -132,10 +134,10 @@ impl SettingsView {
             if ui.radio_value(&mut cfg.model, Model::Pc1550, "LED keypad (RmG Classic, PC1550 compatible, 6 zones)").changed() {
                 *changed = true;
             }
-            if ui.radio_value(&mut cfg.model, Model::Pc1832, "LCD keypad (GuardSeries, PC1832 compatible, 8 zones)").changed() {
+            if ui.radio_value(&mut cfg.model, Model::Pc1832, "LCD keypad (GuardSeries, PC1832, 32 zones)").changed() {
                 *changed = true;
             }
-            if ui.radio_value(&mut cfg.model, Model::Vista20p, "Voice LCD keypad (VistaGuard 20P, 6160V compatible, 8 zones)").changed() {
+            if ui.radio_value(&mut cfg.model, Model::Vista20p, "Voice LCD keypad (VistaGuard 20P, 6160V, 48 zones)").changed() {
                 *changed = true;
             }
         });
@@ -148,9 +150,11 @@ impl SettingsView {
         let model = cfg.model;
         let cam_cfg = cfg.camera.clone();
         let labels = cfg.labels_mut(model);
+        let zones = super::zone_page(ui, egui::Id::new(("zone-name-page", model.file_key())), labels.len());
         egui::Grid::new("settings-zones").num_columns(3).spacing([10.0, 6.0]).show(ui, |ui| {
-            for (i, label) in labels.iter_mut().enumerate() {
-                let z = i as u8 + 1;
+            for zone in zones {
+                let z = zone as u8;
+                let label = &mut labels[zone - 1];
                 ui.label(RichText::new(format!("Zone {}", z)).color(theme::MUTED));
                 if ui.add_sized([210.0, 24.0], egui::TextEdit::singleline(label).char_limit(24)).changed() {
                     *changed = true;
@@ -161,8 +165,10 @@ impl SettingsView {
                     "Drawn on map"
                 } else if z == 2 && cam_cfg.uses_room_fallback() {
                     "Rest of room"
-                } else {
+                } else if z <= 8 {
                     "Simulated (drawable on map)"
+                } else {
+                    "Simulated"
                 };
                 ui.label(theme::muted(role));
                 ui.end_row();
@@ -450,6 +456,33 @@ impl SettingsView {
 
     fn sound(&mut self, ui: &mut egui::Ui, cfg: &mut AppConfig, changed: &mut bool, audio: &AudioHandle) {
         let s = &mut cfg.sound;
+        section(ui, "Audio outputs");
+        let devices = audio.devices();
+        for (label, default, output, online) in [
+            ("Keypad & voice", "System default", &mut s.keypad_output, audio.keypad_ok()),
+            ("Siren", "Same as keypad", &mut s.siren_output, audio.is_ok()),
+        ] {
+            ui.horizontal(|ui| {
+                ui.label(label);
+                egui::ComboBox::from_id_salt(("sound-output", label))
+                    .selected_text(output.as_deref().unwrap_or(default))
+                    .width(210.0)
+                    .show_ui(ui, |ui| {
+                        *changed |= ui.selectable_value(output, None, default).changed();
+                        for device in &devices {
+                            *changed |= ui.selectable_value(output, Some(device.clone()), device).changed();
+                        }
+                    });
+                if !online {
+                    ui.label(theme::muted("Output unavailable"));
+                }
+                if label == "Keypad & voice" && ui.small_button("Test keypad").clicked() {
+                    audio.send(AudioCmd::KeyBeep);
+                }
+            });
+        }
+        ui.label(theme::muted("Choose a separate speaker for the siren. Use Test below to check it."));
+        ui.label(theme::muted("Place a dedicated speaker somewhere stable and ventilated, out of casual reach. Keep it clear of vents, fabrics, and exit paths. Test audibility from the rooms you want to cover."));
         section(ui, "Volume");
         egui::Grid::new("settings-volume").num_columns(3).spacing([12.0, 6.0]).show(ui, |ui| {
             for (label, v) in [("Everything", &mut s.master), ("Siren", &mut s.siren), ("Keypad", &mut s.keypad)] {
@@ -492,60 +525,26 @@ impl SettingsView {
 
     fn monitoring(&mut self, ui: &mut egui::Ui, cfg: &mut AppConfig, changed: &mut bool, view: &View, engine: &EngineHandle) {
         let o = &mut cfg.operator;
-        section(ui, "Operator");
-        if ui.checkbox(&mut o.enabled, "Simulate a monitoring center that messages and calls you about alarms").changed() {
-            *changed = true;
-        }
-        egui::Grid::new("settings-operator").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-            ui.label("Operator's name");
-            if ui.add_sized([180.0, 24.0], egui::TextEdit::singleline(&mut o.operator_name)).changed() {
-                *changed = true;
-            }
-            ui.end_row();
-            ui.label("Passcode");
-            ui.horizontal(|ui| {
-                ui.add_sized([180.0, 24.0], egui::TextEdit::singleline(&mut self.new_pass).password(true).hint_text(if o.has_passcode() { "set, type to change" } else { "not set" }));
-                if ui.add_enabled(self.new_pass.trim().len() >= 3, egui::Button::new("Save")).clicked() {
-                    o.set_passcode(&self.new_pass);
-                    self.new_pass.clear();
-                    *changed = true;
-                }
-            });
-            ui.end_row();
+        section(ui, "Intrusion response");
+        ui.horizontal(|ui| {
+            *changed |= ui.selectable_value(&mut o.quiet_intrusion, false, "Use siren").changed();
+            *changed |= ui.selectable_value(&mut o.quiet_intrusion, true, "Quiet intrusion alerts").changed();
         });
-        ui.label(theme::muted("The operator asks for it on the call, like a real monitoring company, to make sure it's really you."));
-
+        if o.quiet_intrusion {
+            ui.label(theme::muted("Burglary and tamper alarms stay quiet. Keypad tones and emergency alarms still work."));
+            if !o.phone_alerts {
+                ui.label(RichText::new("Phone alerts are off. Quiet alarms will only appear in RoomGuard.").color(theme::AMBER));
+            }
+        }
+        ui.label(theme::muted("You can turn off the display while armed. Keep the computer awake and leave the keypad window focused to disarm with a wireless keyboard."));
         section(ui, "Phone alerts");
         if ui.checkbox(&mut o.phone_alerts, "Send alerts to my phone").changed() {
             *changed = true;
         }
         ui.label(theme::muted(
-            "Alerts go through ntfy, a free push notification service. Install the ntfy app on your phone and subscribe to your private topic below.",
+            "Install ntfy on your phone, subscribe using the QR code, then send a test. Confirm that it appears on your phone.",
         ));
         ui.add_space(4.0);
-        egui::Grid::new("settings-ntfy").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-            ui.label("Topic");
-            ui.horizontal(|ui| {
-                if ui.add_sized([220.0, 24.0], egui::TextEdit::singleline(&mut o.ntfy_topic)).changed() {
-                    *changed = true;
-                }
-                if ui.button("New topic").clicked() {
-                    o.ntfy_topic = format!("roomguard-{}", util::random_token(14));
-                    *changed = true;
-                }
-            });
-            ui.end_row();
-            ui.label("Server");
-            if ui.add_sized([220.0, 24.0], egui::TextEdit::singleline(&mut o.ntfy_server)).changed() {
-                *changed = true;
-            }
-            ui.end_row();
-            ui.label("Access token");
-            if ui.add_sized([220.0, 24.0], egui::TextEdit::singleline(&mut o.ntfy_token).password(true).hint_text("only for a private server")).changed() {
-                *changed = true;
-            }
-            ui.end_row();
-        });
         ui.add_space(6.0);
         let url = NtfyCfg::from(o).topic_url();
         let avail = ui.available_width();
@@ -560,30 +559,94 @@ impl SettingsView {
             });
         });
         ui.add_space(6.0);
+        ui.label("Phone alerts include alarms and keypad lockouts when enabled.");
         for (v, label) in [
-            (&mut o.send_photos, "Attach the camera snapshot"),
-            (&mut o.heads_up_on_entry, "Heads up when an entry delay starts"),
-            (&mut o.open_close_reports, "Tell me every time it's armed or disarmed"),
-            (&mut o.trouble_reports, "Tell me about troubles (power, camera, internet)"),
+            (&mut o.send_photos, "Include camera evidence when available"),
+            (&mut o.heads_up_on_entry, "Door opens and your entry countdown starts"),
+            (&mut o.unknown_person_alerts, "Unrecognized person detected while armed"),
+            (&mut o.open_close_reports, "RoomGuard arms or disarms"),
+            (&mut o.trouble_reports, "Camera, speaker, or power needs attention"),
         ] {
             if ui.checkbox(v, label).changed() {
                 *changed = true;
             }
         }
         ui.add_space(4.0);
+        ui.add_enabled_ui(o.send_photos && o.phone_alerts, |ui| {
+            if ui.checkbox(&mut o.send_motion_gifs, "Send a short motion GIF for intrusion events").changed() {
+                *changed = true;
+            }
+        });
         ui.horizontal_wrapped(|ui| {
             if ui.button("Send a test alert").clicked() {
                 engine.send(EngineMsg::TestNotify);
             }
-            if !view.notify_status.is_empty() {
-                ui.label(theme::muted(view.notify_status.clone()));
+            if !view.notify_test_status.is_empty() {
+                ui.label(theme::muted(&view.notify_test_status));
             }
         });
+        if !view.notify_status.is_empty() {
+            ui.label(theme::muted(&view.notify_status));
+        }
+        ui.collapsing("Advanced ntfy setup", |ui| {
+            egui::Grid::new("settings-ntfy").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+                ui.label("Topic");
+                ui.horizontal(|ui| {
+                    if ui.add_sized([220.0, 24.0], egui::TextEdit::singleline(&mut o.ntfy_topic)).changed() {
+                        *changed = true;
+                    }
+                    if ui.button("New topic").clicked() {
+                        o.ntfy_topic = format!("roomguard-{}", util::random_token(14));
+                        *changed = true;
+                    }
+                });
+                ui.end_row();
+                ui.label("Server");
+                if ui.add_sized([220.0, 24.0], egui::TextEdit::singleline(&mut o.ntfy_server)).changed() {
+                    *changed = true;
+                }
+                ui.end_row();
+                ui.label("Access token");
+                if ui.add_sized([220.0, 24.0], egui::TextEdit::singleline(&mut o.ntfy_token).password(true).hint_text("only for a private server")).changed() {
+                    *changed = true;
+                }
+                ui.end_row();
+            });
+        });
+        ui.collapsing("Simulated operator", |ui| {
+            if ui.checkbox(&mut o.enabled, "Simulate a monitoring center that messages and calls you about alarms").changed() {
+                *changed = true;
+            }
+            egui::Grid::new("settings-operator").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+                ui.label("Operator's name");
+                if ui.add_sized([180.0, 24.0], egui::TextEdit::singleline(&mut o.operator_name)).changed() {
+                    *changed = true;
+                }
+                ui.end_row();
+                ui.label("Passcode");
+                ui.horizontal(|ui| {
+                    ui.add_sized([180.0, 24.0], egui::TextEdit::singleline(&mut self.new_pass).password(true).hint_text(if o.has_passcode() { "set, type to change" } else { "not set" }));
+                    if ui.add_enabled(self.new_pass.trim().len() >= 3, egui::Button::new("Save")).clicked() {
+                        o.set_passcode(&self.new_pass);
+                        self.new_pass.clear();
+                        *changed = true;
+                    }
+                });
+                ui.end_row();
+            });
+            ui.label(theme::muted("The practice call and dispatch stay inside RoomGuard."));
+
+        });
+
     }
 
     fn updates(&mut self, ui: &mut egui::Ui, cfg: &mut AppConfig, changed: &mut bool, updater: &Updater) {
         section(ui, "Updates");
-        ui.label(format!("You have version {}.", env!("CARGO_PKG_VERSION")));
+        if let Some(build) = crate::update::experimental_build() {
+            ui.label(format!("Experimental build {build}"));
+        } else {
+            ui.label(format!("Stable version {}", env!("CARGO_PKG_VERSION")));
+        }
         if ui.checkbox(&mut cfg.check_updates, "Check for updates when RoomGuard starts").changed() {
             *changed = true;
         }

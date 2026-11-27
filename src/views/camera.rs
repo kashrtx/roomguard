@@ -73,7 +73,7 @@ pub fn zone_color(zone: u8) -> Color32 {
 
 /// Whether a panel zone makes sense as a camera-drawn zone (skip unused & 24h fire/life-safety).
 pub fn zone_drawable(z: &ZoneView) -> bool {
-    z.kind != ZoneKind::Null && !z.kind.is_24h()
+    z.num <= 8 && z.kind != ZoneKind::Null && !z.kind.is_24h()
 }
 
 /// Default visual contact setting for a newly drawn zone: ON for doors/windows/perimeter,

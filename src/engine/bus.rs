@@ -391,7 +391,7 @@ impl Panel {
         if is_instant {
             b8 |= ECP_B3_INSTANT;
         }
-        if matches!(self.vista_mode, VistaKp::Program { .. }) {
+        if matches!(self.vista_mode, VistaKp::Program { .. } | VistaKp::ZoneList(_)) {
             b8 |= ECP_B3_PROGRAM;
         }
         if self.chime {

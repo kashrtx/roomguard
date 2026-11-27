@@ -689,6 +689,8 @@ pub struct Synth {
     buzzer_level: u8,
     piezo: Piezo,
     voice_player: VoicePlayer,
+    memo: Option<(super::memo::Clip, f64)>,
+    voice_level: u8,
     sounder: Gate,
     segs: VecDeque<Seg>,
     seg: Option<(Seg, u32, f32)>,
@@ -732,6 +734,8 @@ impl Synth {
             buzzer_level: 14,
             piezo: Piezo::new(sr, KeypadVoice::Pk5500, 14),
             voice_player: VoicePlayer::new(sr),
+            memo: None,
+            voice_level: 5,
             sounder: Gate { pat: Pattern::Off, pos: 0 },
             segs: VecDeque::new(),
             seg: None,
@@ -812,10 +816,15 @@ impl Synth {
                 self.piezo.set_level(self.buzzer_level);
             }
             AudioCmd::VoiceLevel(level) => {
+                self.voice_level = level.min(7);
                 self.voice_player.set_level(level);
             }
             AudioCmd::Speak(tokens) => {
                 self.voice_player.speak(tokens);
+            }
+            AudioCmd::PlayMemo(clip) => {
+                self.voice_player.stop();
+                self.memo = Some((clip, 0.0));
             }
             AudioCmd::Sounder(p) => {
                 // Starting a brand-new sounder (e.g. exit delay right after arming)
@@ -967,6 +976,7 @@ impl Synth {
                 self.segs.clear();
                 self.seg = None;
                 self.voice_player.stop();
+                self.memo = None;
                 self.bell = BellPattern::Off;
                 self.squawks.clear();
                 self.line.clear();
@@ -1094,6 +1104,22 @@ impl Synth {
         self.click_res.tick(n) * 2.0
     }
 
+    fn memo_next(&mut self) -> f32 {
+        let Some((clip, position)) = self.memo.as_mut() else {
+            return 0.0;
+        };
+        let index = *position as usize;
+        let Some(&sample) = clip.samples.get(index) else {
+            self.memo = None;
+            return 0.0;
+        };
+        let next = clip.samples.get(index + 1).copied().unwrap_or(sample);
+        let interpolated = sample + (next - sample) * position.fract() as f32;
+        *position += f64::from(clip.rate) / f64::from(self.sr);
+        let gain = if self.voice_level == 0 { 0.0 } else { 0.28 + 0.72 * f32::from(self.voice_level) / 7.0 };
+        interpolated * gain
+    }
+
     pub fn next(&mut self) -> f32 {
         let (bg_on_raw, bg_freq) = self.sounder.next(self.sr);
         let key_ducked = if self.key_duck_left > 0 {
@@ -1113,12 +1139,14 @@ impl Synth {
             None => (bg_on, bg_freq.unwrap_or(self.piezo.tone), 1.0),
         };
         let power = self.bell_gate() | self.squawk_next();
-        let speaking = self.voice_player.is_speaking();
+        let playing_memo = self.memo.is_some();
+        let speaking = self.voice_player.is_speaking() || playing_memo;
         let voice_active = self.voice_player.is_active();
         // Fast path when every voice is silent: skip 48 kHz resonator and tanh
         // math so idle audio uses near-zero CPU and battery.
         let idle = !on
             && !voice_active
+            && !playing_memo
             && self.piezo.quiet()
             && !power
             && self.siren.quiet()
@@ -1137,7 +1165,9 @@ impl Synth {
             // always drains smoothly so interrupting speech never clicks.
             let keypad_on = if has_seg { on } else { on && !speaking };
             let keypad = self.piezo.next(keypad_on, freq, amp) * self.vol_keypad;
-            let spoken = if has_seg && speaking && !self.voice_player.is_fading() {
+            let spoken = if playing_memo {
+                if has_seg { 0.0 } else { self.memo_next() * self.vol_keypad }
+            } else if has_seg && speaking && !self.voice_player.is_fading() {
                 0.0
             } else {
                 self.voice_player.next() * self.vol_keypad

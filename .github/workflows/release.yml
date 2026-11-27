@@ -1,10 +1,13 @@
 name: Release
 
 # Push a tag like v2.0.0 to build every platform and publish a release with
-# the notes for that version taken from CHANGELOG.md.
+# the notes for that version taken from CHANGELOG.md. The experimental
+# branch publishes prereleases with a separate update channel.
 on:
   push:
     tags: ['v*']
+    branches: ['experimental/roomguard']
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -25,9 +28,12 @@ jobs:
           - name: macOS
             os: macos-15
             asset: roomguard-macos-universal.dmg
+    if: github.ref_type == 'tag' || github.ref == 'refs/heads/experimental/roomguard'
     runs-on: ${{ matrix.os }}
     env:
       ROOMGUARD_REPO: ${{ github.repository }}
+      ROOMGUARD_EXPERIMENTAL: ${{ github.ref == 'refs/heads/experimental/roomguard' && format('{0}.{1}', github.run_number, github.run_attempt) || '' }}
+      ASSET: ${{ github.ref == 'refs/heads/experimental/roomguard' && format('experimental-{0}', matrix.asset) || matrix.asset }}
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -41,35 +47,43 @@ jobs:
           sudo apt-get install -y pkg-config clang libasound2-dev libudev-dev libv4l-dev \
             libxkbcommon-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libgl1-mesa-dev
       - name: Test
-        run: cargo test --release
+        run: cargo test --locked --release
       - name: Build Windows
         if: runner.os == 'Windows'
         shell: bash
         run: |
-          cargo build --release
+          cargo build --locked --release
           mkdir -p dist
-          cp target/release/roomguard.exe "dist/${{ matrix.asset }}"
+          cp target/release/roomguard.exe "dist/$ASSET"
       - name: Build Linux
         if: runner.os == 'Linux'
         run: |
-          cargo build --release
+          cargo build --locked --release
           mkdir -p dist
-          cp target/release/roomguard "dist/${{ matrix.asset }}"
-          chmod +x "dist/${{ matrix.asset }}"
+          cp target/release/roomguard "dist/$ASSET"
+          chmod +x "dist/$ASSET"
       - name: Build macOS app and disk image
         if: runner.os == 'macOS'
         run: |
-          cargo build --release --target aarch64-apple-darwin
-          cargo build --release --target x86_64-apple-darwin
+          cargo build --locked --release --target aarch64-apple-darwin
+          cargo build --locked --release --target x86_64-apple-darwin
           VERSION=$(grep -m1 '^version' Cargo.toml | cut -d '"' -f 2)
           STAGE=dmg-stage
-          APP="$STAGE/RoomGuard.app"
+          APP_NAME=RoomGuard
+          BUNDLE_ID=com.kaushalbhingaradia.roomguard
+          if [ -n "$ROOMGUARD_EXPERIMENTAL" ]; then
+            APP_NAME="RoomGuard Experimental"
+            BUNDLE_ID=com.kaushalbhingaradia.roomguard.experimental
+          fi
+          APP="$STAGE/$APP_NAME.app"
           rm -rf "$STAGE"
           mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" dist
           lipo -create -output "$APP/Contents/MacOS/roomguard" \
             target/aarch64-apple-darwin/release/roomguard target/x86_64-apple-darwin/release/roomguard
           chmod +x "$APP/Contents/MacOS/roomguard"
-          sed "s/__VERSION__/$VERSION/g" assets/macos/Info.plist > "$APP/Contents/Info.plist"
+          sed -e "s/__VERSION__/$VERSION/g" -e "s|<string>RoomGuard</string>|<string>$APP_NAME</string>|g" \
+            -e "s|<string>com.kaushalbhingaradia.roomguard</string>|<string>$BUNDLE_ID</string>|g" \
+            assets/macos/Info.plist > "$APP/Contents/Info.plist"
           cp assets/icon/icon.icns "$APP/Contents/Resources/RoomGuard.icns"
           touch "$APP"
           codesign --force --deep --sign - "$APP"
@@ -80,7 +94,7 @@ jobs:
           fi
           # Explicit DMG staging size avoids macOS 15 hdiutil auto-size ENOSPC on large universal binaries.
           SIZE_MB=$(( $(du -sm "$STAGE" | cut -f1) + 128 ))
-          hdiutil create -volname RoomGuard -srcfolder "$STAGE" -size "${SIZE_MB}m" -fs HFS+ -ov -format UDZO "dist/${{ matrix.asset }}"
+          hdiutil create -volname "$APP_NAME" -srcfolder "$STAGE" -size "${SIZE_MB}m" -fs HFS+ -ov -format UDZO "dist/$ASSET"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset }}
@@ -96,10 +110,25 @@ jobs:
           path: dist
           merge-multiple: true
       - name: Release notes from CHANGELOG.md
+        if: github.ref_type == 'tag'
         run: python3 tools/release_notes.py "${GITHUB_REF_NAME#v}" > notes.md
       - uses: softprops/action-gh-release@v2
+        if: github.ref_type == 'tag'
         with:
           name: RoomGuard ${{ github.ref_name }}
           body_path: notes.md
           files: dist/*
           prerelease: ${{ contains(github.ref_name, '-') }}
+
+      - uses: softprops/action-gh-release@v2
+        if: github.ref == 'refs/heads/experimental/roomguard'
+        with:
+          tag_name: experimental-${{ github.run_number }}.${{ github.run_attempt }}
+          target_commitish: ${{ github.sha }}
+          name: RoomGuard Experimental ${{ github.run_number }}.${{ github.run_attempt }}
+          body: |
+            Test build from the experimental RoomGuard branch.
+            Commit: ${{ github.sha }}
+          files: dist/*
+          prerelease: true
+          make_latest: false

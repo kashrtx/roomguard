@@ -29,6 +29,7 @@ pub mod tb {
     pub const ZONE_TAMPER: u32 = 64;
     pub const CLOCK: u32 = 128;
     pub const FIRE_LOOP: u32 = 256;
+    pub const HOME_SENSOR: u32 = 512;
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -167,7 +168,9 @@ pub enum KpMode {
 
 pub enum Out {
     Audio(AudioCmd),
+    Memo(crate::audio::memo::Command),
     Report(Report),
+    PhoneReport(Report),
     Snapshot(String),
     Save,
     LearnFace,
@@ -229,10 +232,9 @@ pub struct VistaSched {
     pub days: u8,
     /// Repeat option: 0=once, 1=weekly, 2=biweekly, 3=every 3rd week, 4=every 4th week.
     pub repeat: u8,
-    #[serde(skip)]
-    pub last_fired_ordinal: Option<u32>,
-    #[serde(skip)]
-    pub last_fired_min: Option<u16>,
+    pub start_day: Option<i32>,
+    pub first_run_week: Option<i32>,
+    pub last_run_day: Option<i32>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -259,6 +261,8 @@ pub struct PanelSave {
     pub vista_macros: [String; 4],
     pub vista_outputs: Vec<bool>,
     pub vista_schedules: Vec<VistaSched>,
+    pub vista_night_stay: bool,
+    pub vista_armed_bypass: Vec<u8>,
 }
 
 impl Default for PanelSave {
@@ -285,6 +289,8 @@ impl Default for PanelSave {
             vista_macros: Default::default(),
             vista_outputs: Vec::new(),
             vista_schedules: Vec::new(),
+            vista_night_stay: false,
+            vista_armed_bypass: Vec::new(),
         }
     }
 }
@@ -301,6 +307,8 @@ pub struct Panel {
     pub zones: Vec<ZoneRt>,
     pub labels: Vec<String>,
     pub camera_zone: [bool; 8],
+    pub quiet_intrusion: bool,
+    pub home_sensor_unavailable: bool,
     pub exit: Option<ExitRt>,
     pub armed: Option<ArmedRt>,
     pub entry: Option<EntryRt>,
@@ -390,6 +398,9 @@ pub struct Panel {
     pub vista_msg_recording: Option<Instant>,
     /// True when a recorded 6160V voice message is waiting (# + 0 + 3 plays & clears).
     pub vista_msg_waiting: bool,
+    pub vista_msg_saving: Option<Instant>,
+    pub vista_memo: Option<crate::audio::memo::Clip>,
+    pub vista_msg_play_until: Option<Instant>,
     /// Last voice status press (# + 0 + * or # + *): pressing * again within 10 s speaks up to 3 faults.
     pub vista_status_at: Option<Instant>,
     /// Which user slot armed the system (used for Guest authority level 2 enforcement).
@@ -400,8 +411,6 @@ pub struct Panel {
     pub vista_partition: u8,
     /// When GoTo Partition switched away from Partition 1 (returns after 120 s idle).
     pub vista_partition_at: Option<Instant>,
-    /// Periodic test report interval in days (set via [Installer] + # + 0 + 0/1/2).
-    pub vista_periodic_test_days: u8,
     /// Latest wall-clock ms passed into tick(), used for #63 clock editing & schedules.
     pub vista_wall_ms: i64,
     /// True after a VISTA-20P Exit Error Alarm (`0xEA` on the ECP wire) until disarmed.
@@ -432,6 +441,8 @@ impl Panel {
             zones: vec![ZoneRt::default(); model.zone_count()],
             labels,
             camera_zone: [true, true, false, false, false, false, false, false],
+            quiet_intrusion: false,
+            home_sensor_unavailable: false,
             exit: None,
             armed: None,
             entry: None,
@@ -510,17 +521,20 @@ impl Panel {
             vista_schedules: save.vista_schedules,
             vista_msg_recording: None,
             vista_msg_waiting: false,
+            vista_msg_saving: None,
+            vista_memo: None,
+            vista_msg_play_until: None,
             vista_status_at: None,
             vista_armed_by_slot: None,
             vista_reminder_until: None,
             vista_partition: 1,
             vista_partition_at: None,
-            vista_periodic_test_days: 0,
             vista_wall_ms: util::now_ms(),
             vista_exit_alarm: false,
         };
         // Like a real panel after a power cut, come back armed if it was armed.
-        if let Some(a) = save.armed {
+        let restore_armed = model != Model::Vista20p || p.ee.entry_or(model, "39", 0, 1) != 0;
+        if let Some(a) = save.armed.filter(|_| restore_armed) {
             p.armed = Some(ArmedRt {
                 mode: a.mode,
                 no_entry: a.no_entry,
@@ -530,9 +544,20 @@ impl Panel {
                 shunt_until: Some(now + Duration::from_secs(60)),
                 reactivate_at: None,
             });
+            if model == Model::Vista20p {
+                p.vista_night = save.vista_night_stay && a.mode == ArmMode::Stay && !a.no_entry;
+                for zone in save.vista_armed_bypass {
+                    let zone = usize::from(zone);
+                    if (1..=p.n()).contains(&zone) && p.cfg(zone).bypassable {
+                        p.zones[zone - 1].bypassed = true;
+                    }
+                }
+            }
             if a.mode == ArmMode::Stay {
+                let night_zones = if p.vista_night { p.vista_zone_list(5) } else { 0 };
                 for z in 1..=p.zones.len() {
-                    if p.cfg(z).kind.is_stay_away() {
+                    let night_zone = night_zones & (1u64 << (z - 1)) != 0;
+                    if p.cfg(z).kind.is_stay_away() && !night_zone && !p.zones[z - 1].bypassed {
                         p.zones[z - 1].bypassed = true;
                         p.zones[z - 1].auto_bypass = true;
                     }
@@ -582,6 +607,15 @@ impl Panel {
             vista_macros: self.vista_macros.clone(),
             vista_outputs: self.vista_outputs.to_vec(),
             vista_schedules: self.vista_schedules.clone(),
+            vista_night_stay: self.vista_night,
+            vista_armed_bypass: if self.model == Model::Vista20p && (self.armed.is_some() || self.exit.is_some()) {
+                self.zones.iter().enumerate()
+                    .filter(|(_, zone)| zone.bypassed && !zone.auto_bypass)
+                    .map(|(index, _)| (index + 1) as u8)
+                    .collect()
+            } else {
+                Vec::new()
+            },
         }
     }
 
@@ -656,7 +690,9 @@ impl Panel {
         self.audio(AudioCmd::Beeps { count: 1, on_ms: ms, off_ms: 0 });
     }
     pub fn squawk(&mut self, n: u8) {
-        self.audio(AudioCmd::Squawk(n));
+        if !self.quiet_intrusion {
+            self.audio(AudioCmd::Squawk(n));
+        }
     }
 
     pub fn log(&mut self, kind: EvKind, text: impl Into<String>) {
@@ -699,15 +735,12 @@ impl Panel {
                 }
             }
         }
-        if !self.comms_enabled() {
-            return self.next_report;
-        }
         let zone_label = if zu > 0 && matches!(kind, ReportKind::Alarm(_) | ReportKind::EntryStarted) {
             self.label(zu as usize)
         } else {
             String::new()
         };
-        self.out.push(Out::Report(Report {
+        let report = Report {
             id: self.next_report,
             kind,
             cid,
@@ -717,7 +750,8 @@ impl Panel {
             text,
             delay_s,
             ts: util::now_ms(),
-        }));
+        };
+        self.out.push(if self.comms_enabled() { Out::Report(report) } else { Out::PhoneReport(report) });
         self.next_report
     }
 
@@ -776,7 +810,7 @@ impl Panel {
     // ----- state queries -----
 
     pub fn is_programming(&self) -> bool {
-        matches!(self.kp, KpMode::Program(_)) || matches!(self.vista_mode, VistaKp::Program { .. })
+        matches!(self.kp, KpMode::Program(_)) || matches!(self.vista_mode, VistaKp::Program { .. } | VistaKp::ZoneList(_))
     }
 
     pub fn violated(&self, z: usize) -> bool {
@@ -789,7 +823,7 @@ impl Panel {
             if c.kind == ZoneKind::Null || c.kind == ZoneKind::NonAlarm || c.kind.is_24h() || self.zones[z - 1].bypassed {
                 continue;
             }
-            if c.force_arm && self.zones[z - 1].open {
+            if c.force_arm && self.zones[z - 1].open && !self.zones[z - 1].fault {
                 continue;
             }
             if self.violated(z) {
@@ -1139,7 +1173,7 @@ impl Panel {
             }
             // A force armed zone that's still open is left out until it
             // closes, then it works normally.
-            if c.force_arm && !kind.is_delay() && !zr.tamper {
+            if c.force_arm && !kind.is_delay() && !zr.tamper && !zr.fault {
                 continue;
             }
             if !zr.tamper && (kind.is_delay() || (self.model == Model::Vista20p && kind.is_stay_away())) && self.entry.is_none() {
@@ -1435,7 +1469,7 @@ impl Panel {
                 }
                 VistaKp::Bypass { buf, .. } => {
                     if buf.is_empty() {
-                        "Zone bypass: enter a 2-digit zone (01-08), or press # for quick bypass (*23). Wait 5 s to view bypassed zones."
+                        "Zone bypass: enter a 2-digit zone (01-48), or press # for quick bypass (*23). Wait 5 s to view bypassed zones."
                     } else {
                         "Zone bypass: enter the second digit of the zone number."
                     }
@@ -1461,6 +1495,7 @@ impl Panel {
                     (Some(_), true) => "Reviewing field: press *XX to edit another field, #XX to view another, or *99 to exit.",
                     (Some(_), false) => "Editing field: enter the new value digits (press # to finish a phone number), or *99 to exit.",
                 },
+                VistaKp::ZoneList(_) => "Zone lists (*81): enter a two-digit list or zone number, then *. Enter 00* to finish that step.",
                 VistaKp::Volume => "Voice volume: press 3 louder, 6 quieter, 4 toggle voice status/chime on or off, # when done.",
                 VistaKp::NightWait { .. } => "Armed STAY: press 3 (STAY) again within 5 seconds for NIGHT-STAY.",
                 VistaKp::TimeDate { can_edit, editing, .. } => {
@@ -1851,8 +1886,7 @@ impl Panel {
                             KpMode::Normal
                         }
                         CodeFor::CmdOut => {
-                            self.util_until = Some(now + Duration::from_secs(5));
-                            self.sensor_reset(now);
+                            self.classic_utility_output(now);
                             KpMode::Normal
                         }
                         CodeFor::NoEntry => {
@@ -2045,8 +2079,10 @@ impl Panel {
                     }
                     "903" => {
                         self.beeps(3);
-                        self.temp_at("Supervision", "01 PK5500 Keypad", 3500, now);
-                        self.log(EvKind::Program, "Supervision field viewed: Slot 01 PK5500");
+                        let assignment = self.ee.raw(self.model, "000.0");
+                        let slot = assignment.get(1..2).and_then(|slot| slot.parse::<u8>().ok()).filter(|slot| (1..=8).contains(slot)).unwrap_or(1);
+                        self.temp_at("Supervision", &format!("{:02} PK5500 Keypad", slot), 3500, now);
+                        self.log(EvKind::Program, format!("Supervision field viewed: Slot {:02} PK5500", slot));
                     }
                     "989" => {
                         self.beeps(2);
@@ -2106,11 +2142,9 @@ impl Panel {
     }
 
     fn commit(&mut self, key: &str, work: &[char], kind: Kind) {
-        let prev = if self.model == Model::Pc1832 && key == "001" {
-            Some(self.ee.raw(self.model, "001"))
-        } else {
-            None
-        };
+        if self.model == Model::Pc1832 {
+            self.ee.default_changed_pc1832_zone_attrs(key, &work.iter().collect::<String>());
+        }
         match kind {
             Kind::Toggle(_) => {
                 let mut v: Vec<char> = work.to_vec();
@@ -2122,20 +2156,6 @@ impl Panel {
                 self.ee.sections.insert(key.to_string(), work.iter().collect());
             }
             _ => {}
-        }
-        // PC1832 manual: changing a zone's definition in [001] auto-defaults its [101]-[108] attributes.
-        if let Some(old) = prev {
-            let new_s: String = work.iter().collect();
-            for z in 1..=8usize {
-                let i = (z - 1) * 2;
-                let o = old.get(i..i + 2);
-                let n = new_s.get(i..i + 2);
-                if o != n {
-                    if let Some(code) = n.and_then(|s| s.parse::<u32>().ok()) {
-                        self.ee.sections.insert(format!("{:03}", 100 + z), Eeprom::default_zone_attrs(code).to_string());
-                    }
-                }
-            }
         }
         self.log(EvKind::Program, format!("Section [{}] programmed", key.trim_start_matches("kp")));
         self.dirty = true;
@@ -2347,7 +2367,7 @@ impl Panel {
         }
         let c = self.cfg(z);
         let chime_allowed = if self.model == Model::Vista20p && self.ee.entry_or(Model::Vista20p, "26", 0, 0) != 0 {
-            self.ee.entry_or(Model::Vista20p, "chime_list", z.saturating_sub(1), 0) != 0
+            self.vista_zone_list(3) & (1u64 << z.saturating_sub(1)) != 0
         } else {
             c.chime
         };
@@ -2748,30 +2768,23 @@ impl Panel {
             0 => {} // Null function key
             3 => self.fn_arm(ArmHow::StayKey, now),
             4 => self.fn_arm(ArmHow::AwayKey, now),
-            5 => {
-                if self.armed.is_none() && self.exit.is_none() {
-                    self.kp = KpMode::NeedCode { purpose: CodeFor::NoEntry, buf: String::new() };
-                } else {
-                    self.error_tone();
-                }
-            }
-            6 => self.toggle_chime_at(now),
+            5 => self.kp = self.star_function(9, now),
+            6 => self.kp = self.star_function(4, now),
             7 => self.system_test(now),
-            8 => {
-                if self.armed.is_none() && self.exit.is_none() {
-                    self.kp = KpMode::Bypass { buf: String::new(), idx: 0 };
-                } else {
-                    self.error_tone();
-                }
+            8 if self.armed.is_none() && self.exit.is_none() => self.kp = self.star_function(1, now),
+            9 => self.kp = self.star_function(2, now),
+            10 => self.kp = self.star_function(3, now),
+            11 => self.kp = self.star_function(5, now),
+            12 => self.kp = self.star_function(6, now),
+            13 | 14 | 19 | 21 => {
+                let output = match code {
+                    13 => 1,
+                    14 => 2,
+                    19 => 3,
+                    _ => 4,
+                };
+                self.kp = self.command_output(output, now);
             }
-            9 => {
-                self.ack_troubles();
-                self.kp = KpMode::Troubles { idx: 0, sub: 0, mem: false };
-            }
-            10 => {
-                self.kp = KpMode::Memory { level: 0, idx: 0 };
-            }
-            14 => self.sensor_reset(now),
             16 => self.quick_exit(now),
             17 => {
                 if self.armed.is_some() {
@@ -2779,6 +2792,10 @@ impl Panel {
                 } else {
                     self.error_tone();
                 }
+            }
+            26 => {
+                let clock = util::local(util::now_ms() + self.clock_offset_ms);
+                self.temp_at(&clock.format("%I:%M %p").to_string(), &clock.format("%m/%d/%Y").to_string(), 4000, now);
             }
             _ => self.error_tone(),
         }
@@ -3005,6 +3022,9 @@ impl Panel {
                 t |= tb::ZONE_TAMPER;
             }
         }
+        if self.home_sensor_unavailable {
+            t |= tb::HOME_SENSOR;
+        }
         if t == self.troubles {
             if t & tb::AC != 0 && !self.ac_reported {
                 let delay_min = self.ac_delay_mins();
@@ -3026,6 +3046,9 @@ impl Panel {
             }
             if gone & bit != 0 {
                 self.log(EvKind::Restore, format!("Trouble restored: {}", name));
+                if matches!(bit, tb::ZONE_FAULT | tb::ZONE_TAMPER | tb::BELL | tb::HOME_SENSOR) {
+                    self.report(ReportKind::Restore, trouble_cid(bit), 0, format!("{} cleared", name), 0);
+                }
             }
         }
         if new & tb::AC != 0 {
@@ -3062,6 +3085,10 @@ impl Panel {
             .collect()
     }
 
+    pub(crate) fn mute_alarm_kind(&self, kind: AlarmKind) -> bool {
+        self.quiet_intrusion && matches!(kind, AlarmKind::Burglary | AlarmKind::Tamper)
+    }
+
     fn sounder_wanted(&self, now: Instant) -> Pattern {
         if self.lockout_until.map_or(false, |t| now < t) {
             return Pattern::Off;
@@ -3071,7 +3098,7 @@ impl Panel {
         }
         let mut fire = false;
         let mut buzzer_alarm = false;
-        for a in self.live_alarms(now) {
+        for a in self.live_alarms(now).filter(|a| !self.mute_alarm_kind(a.kind)) {
             if a.kind.pulsed() && (a.audible || a.buzzer) {
                 fire = true;
             } else if a.buzzer {
@@ -3094,7 +3121,7 @@ impl Panel {
             // 1019 Hz taking turns every 505 ms with no gap. Entering a code
             // quiets the keypad.
             let muted = self.vista_sounder_mute_until.map_or(false, |t| now < t);
-            let burg = self.live_alarms(now).any(|a| (a.audible || a.buzzer) && !a.kind.pulsed());
+            let burg = self.live_alarms(now).any(|a| (a.audible || a.buzzer) && !a.kind.pulsed() && !self.mute_alarm_kind(a.kind));
             if burg {
                 return if muted { Pattern::Off } else { Pattern::HiLo { hi_hz: 1360, lo_hz: 1019, step_ms: 505 } };
             }
@@ -3211,7 +3238,7 @@ impl Panel {
         let mut co = false;
         let mut burg = false;
         for a in self.live_alarms(now) {
-            if !a.audible {
+            if !a.audible || self.mute_alarm_kind(a.kind) {
                 continue;
             }
             if a.kind.pulsed() {
@@ -3249,7 +3276,7 @@ impl Panel {
         if burg {
             return BellPattern::Steady;
         }
-        if self.entry.as_ref().map_or(false, |e| e.exit_fault) {
+        if !self.quiet_intrusion && self.entry.as_ref().map_or(false, |e| e.exit_fault) {
             return BellPattern::Steady;
         }
         BellPattern::Off
@@ -3369,6 +3396,9 @@ impl Panel {
             };
             return (StatusKind::Program, "Installer programming".into(), what);
         }
+        if matches!(self.vista_mode, VistaKp::ZoneList(_)) {
+            return (StatusKind::Program, "Installer programming".into(), "Zone lists (*81)".into());
+        }
         if let VistaKp::Program { field, .. } = &self.vista_mode {
             let what = match field {
                 Some(f) => format!("Field *{}", f),
@@ -3442,6 +3472,7 @@ pub fn trouble_names(model: Model) -> Vec<(u32, &'static str)> {
             (tb::CLOCK, "Loss of time"),
             (tb::ZONE_FAULT, "Camera offline"),
             (tb::ZONE_TAMPER, "Camera view blocked"),
+            (tb::HOME_SENSOR, "Home Assistant sensor unavailable"),
         ],
         Model::Pc1832 | Model::Vista20p => vec![
             (tb::LOW_BATT, "Low battery"),
@@ -3451,6 +3482,7 @@ pub fn trouble_names(model: Model) -> Vec<(u32, &'static str)> {
             (tb::FTC, "Failure to communicate"),
             (tb::ZONE_FAULT, "Zone fault"),
             (tb::ZONE_TAMPER, "Zone tamper"),
+            (tb::HOME_SENSOR, "Home Assistant sensor unavailable"),
             (tb::CLOCK, "Loss of time"),
         ],
     }
@@ -3464,7 +3496,7 @@ fn trouble_cid(bit: u32) -> u16 {
         tb::FTC => 354,
         tb::TLM => 351,
         tb::FIRE_LOOP => 373,
-        tb::ZONE_FAULT => 380,
+        tb::ZONE_FAULT | tb::HOME_SENSOR => 380,
         tb::ZONE_TAMPER => 383,
         _ => 300,
     }

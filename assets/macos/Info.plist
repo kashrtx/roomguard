@@ -24,6 +24,8 @@
   <true/>
   <key>NSCameraUsageDescription</key>
   <string>RoomGuard uses the camera as the sensors for your room alarm. Pictures stay on this computer unless you turn on phone alerts with snapshots.</string>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>RoomGuard uses the microphone when you record a Vista keypad voice memo.</string>
   <key>NSHumanReadableCopyright</key>
   <string>Copyright 2026 Kaushal Bhingaradia. Apache License 2.0.</string>
 </dict>

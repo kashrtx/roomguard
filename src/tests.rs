@@ -2062,10 +2062,19 @@ fn vista_macros_outputs_schedules_message_center_and_extras() {
     // 3. Voice Message Center (#01 Record -> MSG LED steady, 1 Stop -> flashing, #03 Play -> off)
     keys(&mut p, "#01", t0 + secs(30));
     assert_eq!(p.leds_vista()[2], Led::On, "MSG LED steady while recording");
+    let memo_id = p.vista_msg_recording.unwrap();
     keys(&mut p, "1", t0 + secs(32));
+    assert_eq!(p.leds_vista()[2], Led::Off, "A pending recording is not a saved message");
+    let samples: std::sync::Arc<[f32]> = std::sync::Arc::from([0.13, -0.24, 0.32]);
+    let clip = crate::audio::memo::Clip { samples: samples.clone(), rate: 8000 };
+    p.vista_memo_result(memo_id, Ok(clip), t0 + secs(33));
     assert_eq!(p.leds_vista()[2], Led::Flash, "MSG LED flashes when memo waiting");
     keys(&mut p, "#03", t0 + secs(34));
     assert_eq!(p.leds_vista()[2], Led::Off, "MSG LED turns off after playback");
+    assert!(p.out.iter().any(|out| matches!(out, Out::Audio(AudioCmd::PlayMemo(clip)) if clip.samples == samples)));
+    p.out.clear();
+    keys(&mut p, "#03", t0 + secs(36));
+    assert!(p.out.iter().any(|out| matches!(out, Out::Audio(AudioCmd::PlayMemo(clip)) if clip.samples == samples)));
 
     // 4. Double-* Voice Status announces up to 3 faulted zones
     p.set_zone(1, true, false, false, t0 + secs(40));
@@ -2399,4 +2408,194 @@ fn wire_protocol_vista_20p_ecp_f7_frames_cycling_and_extras() {
     assert_ne!(f_pgm.byte8_status2 & ECP_B3_PROGRAM, 0);
     assert!(f_pgm.prompt_pos >= 16, "Programming mode must place blinking cursor on Line 2 (got {})", f_pgm.prompt_pos);
     keys(&mut p, "*99", t0 + secs(151));
+}
+
+#[test]
+fn classic_utility_output_respects_the_programmed_pgm_type() {
+    let now = Instant::now();
+    let mut p = panel(Model::Pc1550);
+    p.ee.sections.insert("24".into(), "05".into());
+    keys(&mut p, "*7", now);
+    assert!(p.util_until.is_none());
+
+    p.ee.sections.insert("24".into(), "03".into());
+    keys(&mut p, "*7", now + secs(1));
+    assert!(p.util_until.is_none());
+    keys(&mut p, "1234", now + secs(2));
+    assert_eq!(p.util_until, Some(now + secs(7)));
+    assert!(p.fire_reset_until.is_none());
+
+    p.ee.sections.insert("24".into(), "04".into());
+    keys(&mut p, "*7", now + secs(8));
+    assert_eq!(p.fire_reset_until, Some(now + secs(13)));
+}
+
+#[test]
+fn powerseries_function_keys_use_the_same_access_rules_as_the_star_menu() {
+    let now = Instant::now();
+    let mut p = panel(Model::Pc1832);
+    p.ee.sections.insert("000.1".into(), "08".into());
+    p.ee.sections.insert("015".into(), "12457".into());
+    p.key(Key::Stay, true, now);
+    p.tick(now + secs(3), crate::util::now_ms());
+    p.key(Key::Stay, false, now + secs(3));
+    assert!(matches!(p.kp, KpMode::NeedCode { purpose: crate::engine::panel::CodeFor::Bypass, .. }));
+
+    keys(&mut p, "#", now + secs(4));
+    p.ee.sections.insert("000.1".into(), "19".into());
+    p.key(Key::Stay, true, now + secs(5));
+    p.tick(now + secs(8), crate::util::now_ms());
+    p.key(Key::Stay, false, now + secs(8));
+    assert!(matches!(p.cmd_out_active, Some((3, _))));
+}
+
+#[test]
+fn vista_power_up_can_start_disarmed_and_biweekly_schedule_survives_restart() {
+    use chrono::{Local, TimeZone};
+    let now = Instant::now();
+    let model = Model::Vista20p;
+    let mut p = panel(model);
+    keys(&mut p, "12343", now);
+    let mut saved = p.to_save(true);
+    assert!(saved.armed.is_some());
+    saved.ee.sections.insert("39".into(), "0".into());
+    let mut p = Panel::new(model, saved, crate::config::default_labels(model), "Tester".into(), now);
+    assert!(p.armed.is_none());
+
+    let monday = Local.with_ymd_and_hms(2026, 11, 30, 12, 0, 0).single().unwrap().timestamp_millis();
+    p.vista_schedules.push(crate::engine::panel::VistaSched {
+        num: 1,
+        event: 1,
+        device: 2,
+        hour: 12,
+        days: 1 << 1,
+        repeat: 2,
+        ..Default::default()
+    });
+    p.tick(now, monday);
+    assert!(p.vista_outputs[1]);
+    p.vista_outputs[1] = false;
+    let json = serde_json::to_string(&p.to_save(true)).unwrap();
+    let mut p = Panel::new(model, serde_json::from_str(&json).unwrap(), crate::config::default_labels(model), "Tester".into(), now);
+    p.tick(now + secs(1), monday + 1000);
+    assert!(!p.vista_outputs[1], "restart during the scheduled minute must not replay the action");
+    p.tick(now + secs(2), monday + 7 * 86_400_000);
+    assert!(!p.vista_outputs[1], "a biweekly schedule must skip the following week");
+    p.tick(now + secs(3), monday + 14 * 86_400_000);
+    assert!(p.vista_outputs[1], "the schedule must fire again after two weeks");
+}
+
+#[test]
+fn vista_zone_list_menu_programs_chime_and_night_stay_lists() {
+    let now = Instant::now();
+    let mut p = panel(Model::Vista20p);
+    keys(&mut p, "4112800*81", now);
+    assert!(p.is_programming());
+    assert!(p.lcd_vista(now, 0).lines[0].starts_with("Zone List No."));
+    // Add zones 02 and 08 to Night-Stay, then selectively remove zone 02.
+    keys(&mut p, "05*02*08*00*0102*00*", now);
+    assert_eq!(p.ee.raw(Model::Vista20p, "81"), "00000001");
+    // Clear the Chime-by-Zone list and return to installer programming.
+    keys(&mut p, "03*00*100**99", now);
+    assert_eq!(p.ee.raw(Model::Vista20p, "chime_list"), "00000000");
+    assert!(!p.is_programming());
+}
+
+#[test]
+fn expanded_zones_use_their_own_programming_and_can_be_bypassed() {
+    let now = Instant::now();
+    let mut dsc = panel(Model::Pc1832);
+    assert_eq!(dsc.n(), 32);
+    keys(&mut dsc, "*8555500203##", now);
+    assert_eq!(dsc.cfg(17).kind, ZoneKind::Instant);
+    assert!(dsc.cfg(17).audible);
+
+    let mut vista = panel(Model::Vista20p);
+    assert_eq!(vista.n(), 48);
+    vista.ee.sections.insert("56".into(), "0104030104090210".into());
+    vista.ee.sections.insert("resp".into(), "02222222".into());
+    let mut definitions = vista.ee.raw(Model::Vista20p, "56");
+    assert_eq!(definitions.len(), 96);
+    definitions.replace_range(94..96, "03");
+    vista.ee.sections.insert("56".into(), definitions);
+    assert_eq!(vista.loop_response_ms(48), 350);
+    assert_eq!(vista.cfg(48).kind, ZoneKind::Instant);
+    vista.set_zone(48, true, false, false, now);
+    assert!(!vista.ready());
+    keys(&mut vista, "1234648#", now + secs(1));
+    assert!(vista.zones[47].bypassed);
+}
+
+#[test]
+fn vista_periodic_test_command_programs_schedule_32() {
+    let now = Instant::now();
+    let mut p = panel(Model::Vista20p);
+    let wall = crate::util::now_ms() / 60_000 * 60_000;
+    p.tick(now, wall);
+    keys(&mut p, "4112#01", now + secs(1));
+    assert!(p.vista_schedules.iter().any(|schedule| schedule.num == 32 && schedule.event == 11));
+    p.out.clear();
+    p.tick(now + secs(2), wall + 11 * 3_600_000);
+    assert!(!p.out.iter().any(|out| matches!(out, Out::Report(report) if report.cid == 602)));
+    p.tick(now + secs(3), wall + 12 * 3_600_000);
+    assert!(p.out.iter().any(|out| matches!(out, Out::Report(report) if report.cid == 602)));
+}
+
+#[test]
+fn vista_restores_night_stay_and_manual_bypasses() {
+    let now = Instant::now();
+    let model = Model::Vista20p;
+    let mut p = panel(model);
+    p.ee.sections.insert("81".into(), "01000000".into());
+    keys(&mut p, "1234603#123433", now);
+    assert!(p.vista_night);
+    let saved = p.to_save(true);
+    let restored = Panel::new(model, saved, crate::config::default_labels(model), "Tester".into(), now);
+    assert!(restored.vista_night);
+    assert!(!restored.zones[1].bypassed, "a selected Night-Stay zone remains armed");
+    assert!(restored.zones[2].bypassed && !restored.zones[2].auto_bypass, "manual bypass stays in effect");
+}
+
+#[test]
+fn quiet_intrusion_keeps_phone_reports_and_fire_audio() {
+    let now = Instant::now();
+    let mut p = panel(Model::Vista20p);
+    p.quiet_intrusion = true;
+    p.ee.sections.insert("41".into(), String::new());
+    p.trigger(AlarmKind::Burglary, 1, true, true, now);
+    p.tick(now, crate::util::now_ms());
+    assert_eq!(p.bell_sent, BellPattern::Off);
+    assert_eq!(p.sounder_sent, Pattern::Off);
+    let report = p.out.iter().find_map(|out| match out {
+        Out::PhoneReport(report) if report.kind == ReportKind::Alarm(AlarmKind::Burglary) => Some(report),
+        _ => None,
+    }).expect("burglary must still be available for phone delivery");
+    let cfg = crate::config::OperatorCfg { phone_alerts: true, ..Default::default() };
+    let (job, snapshot) = crate::notify::for_report(report, &cfg).unwrap();
+    assert_eq!(job.title, "Burglary alarm: Room Door");
+    assert_eq!(job.priority, 5);
+    assert!(snapshot);
+    assert!(job.photo.is_none());
+
+    p.trigger(AlarmKind::Fire, 6, true, true, now);
+    p.tick(now, crate::util::now_ms());
+    assert_eq!(p.bell_sent, BellPattern::Temporal3);
+}
+
+#[test]
+fn optional_alerts_follow_settings_and_delivery_failures_do_not_loop() {
+    let mut cfg = crate::config::OperatorCfg { phone_alerts: true, ..Default::default() };
+    let mut report = Report {
+        id: 1, kind: ReportKind::EntryStarted, cid: 0, qualifier: 'E',
+        zone_or_user: 1, zone_label: "Door".into(), text: "Entry delay".into(),
+        delay_s: 30, ts: crate::util::now_ms(),
+    };
+    assert!(crate::notify::for_report(&report, &cfg).is_none());
+    cfg.heads_up_on_entry = true;
+    assert_eq!(crate::notify::for_report(&report, &cfg).unwrap().0.title, "Door opened");
+    report.kind = ReportKind::Trouble;
+    report.cid = 354;
+    assert!(crate::notify::for_report(&report, &cfg).is_none());
+    report.cid = 380;
+    assert_eq!(crate::notify::for_report(&report, &cfg).unwrap().0.title, "RoomGuard needs attention");
 }

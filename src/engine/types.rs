@@ -11,10 +11,11 @@ pub enum Model {
 }
 
 impl Model {
-    pub fn zone_count(self) -> usize {
+    pub const fn zone_count(self) -> usize {
         match self {
             Model::Pc1550 => 6,
-            Model::Pc1832 | Model::Vista20p => 8,
+            Model::Pc1832 => 32,
+            Model::Vista20p => 48,
         }
     }
     pub fn panel_name(self) -> &'static str {

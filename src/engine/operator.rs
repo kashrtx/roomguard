@@ -14,13 +14,11 @@ use super::types::*;
 use super::OpInput;
 use crate::audio::{AudioCmd, ToneSeg};
 use crate::config::OperatorCfg;
-use crate::notify::NotifyJob;
 use crate::util;
 
 const MAX_CHAT: usize = 200;
 
 pub enum OpOut {
-    Notify(NotifyJob),
     Audio(AudioCmd),
 }
 
@@ -74,10 +72,6 @@ pub struct Operator {
     dirty: bool,
 }
 
-fn notify(title: &str, message: String, priority: u8, tags: &str, photo: Option<PathBuf>) -> OpOut {
-    OpOut::Notify(NotifyJob { title: title.to_string(), message, priority, tags: tags.to_string(), photo, test: false })
-}
-
 fn cap(s: &str) -> String {
     let mut c = s.chars();
     match c.next() {
@@ -93,17 +87,6 @@ fn zone_phrase(z: u16, label: &str) -> String {
         format!("zone {}", z)
     } else {
         format!("zone {}, {}", z, label)
-    }
-}
-
-fn tag_for(kind: AlarmKind) -> &'static str {
-    match kind {
-        AlarmKind::Fire | AlarmKind::Heat => "fire",
-        AlarmKind::Medical => "ambulance",
-        AlarmKind::Panic | AlarmKind::Holdup => "sos",
-        AlarmKind::Tamper => "warning",
-        AlarmKind::Water | AlarmKind::Freeze => "droplet",
-        _ => "rotating_light",
     }
 }
 
@@ -326,7 +309,7 @@ impl Operator {
 
     pub fn note_shutdown(&mut self, name: &str) {
         let text = format!(
-            "Hi {}, your RoomGuard app was closed at {} while the system was armed. When it opens again it will come back armed, just like a real panel after a power cut.",
+            "Hi {}, your RoomGuard app was closed at {} while the system was armed.",
             name,
             util::fmt_clock(util::now_ms())
         );
@@ -379,9 +362,6 @@ impl Operator {
                 "I couldn't reach you, so I'm treating this as a real alarm and dispatching police. (Simulated, nobody is actually sent.)",
                 None,
             );
-            if cfg.phone_alerts {
-                out.push(notify("Police dispatched (simulated)", "You didn't answer the call, so the operator dispatched. This is a simulation and nobody was sent.".to_string(), 5, "police_car", None));
-            }
         }
         out
     }
@@ -397,18 +377,6 @@ impl Operator {
             ReportKind::Alarm(kind) => {
                 if kind == AlarmKind::Duress {
                     // Never shown on screen: whoever forced you to disarm could be watching.
-                    if cfg.phone_alerts {
-                        out.push(notify(
-                            "Duress code used",
-                            format!(
-                                "Someone disarmed RoomGuard with the duress code at {}. A real monitoring center would send police without calling. (Simulated.)",
-                                util::fmt_clock(r.ts)
-                            ),
-                            5,
-                            "warning",
-                            p.photo,
-                        ));
-                    }
                     return;
                 }
                 self.say(ChatFrom::System, sig, None);
@@ -428,16 +396,6 @@ impl Operator {
                         ),
                     };
                     self.say(ChatFrom::Operator, line, p.photo.clone());
-                }
-                if cfg.phone_alerts {
-                    let calling = if cfg.enabled { " RoomGuard Central is calling you." } else { "" };
-                    out.push(notify(
-                        &format!("{} alarm", kind.label()),
-                        format!("{} at {}.{}", cap(&where_), util::fmt_clock(r.ts), calling),
-                        5,
-                        tag_for(kind),
-                        p.photo.clone(),
-                    ));
                 }
                 self.incident = Some((kind, r.zone_or_user));
                 if cfg.enabled && self.call.is_none() {
@@ -462,38 +420,19 @@ impl Operator {
                         None,
                     );
                 }
-                if cfg.phone_alerts && cfg.trouble_reports {
-                    out.push(notify("Trouble", format!("{} at {}", r.text, util::fmt_clock(r.ts)), 3, "warning", None));
-                }
             }
             ReportKind::Restore => {
                 self.say(ChatFrom::System, sig, None);
-                if cfg.phone_alerts && cfg.trouble_reports {
-                    out.push(notify("Restored", format!("{} at {}", r.text, util::fmt_clock(r.ts)), 2, "white_check_mark", None));
-                }
             }
             ReportKind::Opening | ReportKind::Closing => {
                 if cfg.open_close_reports {
                     self.say(ChatFrom::System, format!("{}. {}", sig, r.text), None);
-                    if cfg.phone_alerts {
-                        let closing = r.kind == ReportKind::Closing;
-                        out.push(notify(
-                            if closing { "Armed" } else { "Disarmed" },
-                            format!("{} at {}", r.text, util::fmt_clock(r.ts)),
-                            2,
-                            if closing { "lock" } else { "unlock" },
-                            None,
-                        ));
-                    }
                 }
             }
             ReportKind::PowerUp => {
                 self.say(ChatFrom::System, sig, None);
                 if cfg.enabled {
                     self.say(ChatFrom::Operator, format!("Hi {}, your system just came back online and it's still armed. Just letting you know.", name), None);
-                }
-                if cfg.phone_alerts {
-                    out.push(notify("RoomGuard restarted while armed", format!("It came back armed at {}.", util::fmt_clock(r.ts)), 3, "electric_plug", None));
                 }
             }
             ReportKind::Lockout => {
@@ -505,32 +444,8 @@ impl Operator {
                         p.photo.clone(),
                     );
                 }
-                if cfg.phone_alerts {
-                    out.push(notify("Keypad lockout", format!("Several wrong codes were entered at {}.", util::fmt_clock(r.ts)), 4, "no_entry", p.photo.clone()));
-                }
             }
-            ReportKind::EntryStarted => {
-                if cfg.phone_alerts && cfg.heads_up_on_entry {
-                    out.push(notify(
-                        "Entry delay started",
-                        format!("{} opened at {}. Whoever it is has the entry delay to key in a code.", cap(&zone_phrase(r.zone_or_user, &r.zone_label)), util::fmt_clock(r.ts)),
-                        4,
-                        "door",
-                        p.photo,
-                    ));
-                }
-            }
-            ReportKind::Stranger => {
-                if cfg.phone_alerts {
-                    out.push(notify(
-                        "Unknown person in your room",
-                        format!("The camera saw someone it doesn't recognize at {} while armed.", util::fmt_clock(r.ts)),
-                        4,
-                        "bust_in_silhouette",
-                        p.photo,
-                    ));
-                }
-            }
+            ReportKind::EntryStarted | ReportKind::Stranger => {}
             ReportKind::Shutdown | ReportKind::Cancel => {
                 self.say(ChatFrom::System, sig, None);
             }
@@ -609,9 +524,6 @@ impl Operator {
                 if self.call.take().is_some() {
                     out.push(OpOut::Audio(AudioCmd::Ring(false)));
                     self.say(ChatFrom::Operator, "You declined the call, so I'm dispatching police. (Simulated, nobody is actually sent.)", None);
-                    if cfg.phone_alerts {
-                        out.push(notify("Police dispatched (simulated)", "The call was declined, so the operator dispatched. Nobody was actually sent.".to_string(), 5, "police_car", None));
-                    }
                     self.incident = None;
                 }
             }
@@ -638,9 +550,6 @@ impl Operator {
                         self.call = None;
                         self.incident = None;
                         self.say(ChatFrom::Operator, "I'm sorry, that still doesn't match, so I have to dispatch police. (Simulated.) If this is a mistake, disarm at your keypad.", None);
-                        if cfg.phone_alerts {
-                            out.push(notify("Police dispatched (simulated)", "The passcode given on the call was wrong twice. Nobody was actually sent.".to_string(), 5, "police_car", None));
-                        }
                     }
                 }
             }
@@ -655,9 +564,6 @@ impl Operator {
                         "Okay, I'm sending police now. (Simulated, nobody is actually coming.) Stay somewhere safe and don't go looking for the intruder.",
                         None,
                     );
-                    if cfg.phone_alerts {
-                        out.push(notify("Police dispatched (simulated)", "You asked for help on the call. Nobody was actually sent.".to_string(), 5, "police_car", None));
-                    }
                 } else {
                     self.say(ChatFrom::Operator, "No problem, I'll cancel it. Remember to disarm at the keypad if it's still sounding.", None);
                 }

@@ -1120,19 +1120,21 @@ pub fn ui(ui: &mut egui::Ui, prog: &ProgView, armed: bool, engine: &EngineHandle
 
     // --- 4. Zones (Definitions & Chime Sounds) ---
     section_hdr(ui, "Zone programming");
+    let zones = super::zone_page(ui, egui::Id::new(("zone-program-page", m.file_key())), m.zone_count());
     ui.add_enabled_ui(!armed, |ui| {
         if m == Model::Pc1832 {
-            let raw001 = raw_val(prog, "001");
             egui::Grid::new("panel-zones-1832").num_columns(4).spacing([8.0, 6.0]).show(ui, |ui| {
                 ui.label(theme::muted("Zone"));
-                ui.label(theme::muted("Definition ([001])"));
+                ui.label(theme::muted("Definition ([001] / [002])"));
                 ui.label(theme::muted("Chime sound"));
-                ui.label(theme::muted("Options ([101] to [108])"));
+                ui.label(theme::muted("Options ([101] to [132])"));
                 ui.end_row();
 
-                for z in 1..=8usize {
+                for z in zones {
                     ui.label(RichText::new(format!("Z{}", z)).font(theme::semi(12.5)));
-                    let cur_code = raw001.get((z - 1) * 2..(z - 1) * 2 + 2).unwrap_or("00");
+                    let (section, index) = eeprom::pc1832_zone_section(z);
+                    let definitions = raw_val(prog, section);
+                    let cur_code = definitions.get(index * 2..index * 2 + 2).unwrap_or("00");
                     let cur_name = zone_type_1832(cur_code);
                     egui::ComboBox::from_id_salt(("zdef1832", z))
                         .selected_text(format!("{} {}", cur_code, cur_name))
@@ -1140,8 +1142,8 @@ pub fn ui(ui: &mut egui::Ui, prog: &ProgView, armed: bool, engine: &EngineHandle
                         .show_ui(ui, |ui| {
                             for &(code_str, label) in ZONE_CHOICES_1832 {
                                 if ui.selectable_label(cur_code == code_str, format!("{} {}", code_str, label)).clicked() {
-                                    let next = replace_entry_str(&raw001, 16, 2, z - 1, code_str);
-                                    engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: "001".into(), value: next }));
+                                    let next = replace_entry_str(&definitions, 16, 2, index, code_str);
+                                    engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: section.into(), value: next }));
                                 }
                             }
                         });
@@ -1187,7 +1189,7 @@ pub fn ui(ui: &mut egui::Ui, prog: &ProgView, armed: bool, engine: &EngineHandle
                 ui.label(theme::muted("Loop Response"));
                 ui.end_row();
 
-                for z in 1..=8usize {
+                for z in zones {
                     ui.label(RichText::new(format!("Zone {:02}", z)).font(theme::semi(12.5)));
                     let cur_code = raw56.get((z - 1) * 2..(z - 1) * 2 + 2).unwrap_or("00");
                     egui::ComboBox::from_id_salt(("zdefvista", z))
@@ -1196,7 +1198,7 @@ pub fn ui(ui: &mut egui::Ui, prog: &ProgView, armed: bool, engine: &EngineHandle
                         .show_ui(ui, |ui| {
                             for &(code_str, label) in ZONE_CHOICES_VISTA {
                                 if ui.selectable_label(cur_code == code_str, format!("{} {}", code_str, label)).clicked() {
-                                    let next = replace_entry_str(&raw56, 8, 2, z - 1, code_str);
+                                    let next = replace_entry_str(&raw56, m.zone_count(), 2, z - 1, code_str);
                                     engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: "56".into(), value: next }));
                                 }
                             }
@@ -1214,7 +1216,7 @@ pub fn ui(ui: &mut egui::Ui, prog: &ProgView, armed: bool, engine: &EngineHandle
                         .show_ui(ui, |ui| {
                             for (c, lbl) in [('0', "10 ms (Fast)"), ('1', "350 ms (Normal)"), ('2', "700 ms"), ('3', "1.2 s")] {
                                 if ui.selectable_label(cur_r == c, lbl).clicked() {
-                                    let next = replace_entry_str(&raw_resp, 8, 1, z - 1, &c.to_string());
+                                    let next = replace_entry_str(&raw_resp, m.zone_count(), 1, z - 1, &c.to_string());
                                     engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: "resp".into(), value: next }));
                                 }
                             }

@@ -43,6 +43,10 @@ pub enum UpdateState {
 struct GhRelease {
     tag_name: String,
     #[serde(default)]
+    prerelease: bool,
+    #[serde(default)]
+    draft: bool,
+    #[serde(default)]
     body: Option<String>,
     html_url: String,
     #[serde(default)]
@@ -96,8 +100,37 @@ fn agent(secs: u64) -> ureq::Agent {
     ureq::AgentBuilder::new().timeout(Duration::from_secs(secs)).build()
 }
 
+pub fn experimental_build() -> Option<&'static str> {
+    option_env!("ROOMGUARD_EXPERIMENTAL").filter(|build| !build.is_empty())
+}
+
+fn experimental_number(tag: &str) -> Option<(u64, u64)> {
+    let (build, attempt) = tag.strip_prefix("experimental-")?.split_once('.')?;
+    Some((build.parse().ok()?, attempt.parse().ok()?))
+}
+
+fn choose_release(releases: Vec<GhRelease>, experimental: Option<&str>, stable_version: &str) -> Option<GhRelease> {
+    if let Some(build) = experimental {
+        let local = experimental_number(&format!("experimental-{build}")).unwrap_or_default();
+        releases.into_iter().filter(|release| release.prerelease && !release.draft)
+            .filter(|release| experimental_number(&release.tag_name).is_some_and(|version| version > local))
+            .max_by_key(|release| experimental_number(&release.tag_name))
+    } else {
+        releases.into_iter().find(|release| {
+            !release.prerelease && !release.draft
+                && release.tag_name.strip_prefix('v').is_some_and(|version| {
+                    let parts: Vec<_> = version.split('.').collect();
+                    parts.len() == 3 && parts.iter().all(|part| part.parse::<u64>().is_ok())
+                        && newer(version, stable_version)
+                })
+        })
+    }
+}
+
 fn fetch_latest(repo: &str) -> Result<Option<Release>, String> {
-    let url = format!("https://api.github.com/repos/{}/releases/latest", repo);
+    let experimental = experimental_build();
+    let endpoint = if experimental.is_some() { "releases?per_page=100" } else { "releases/latest" };
+    let url = format!("https://api.github.com/repos/{repo}/{endpoint}");
     let resp = agent(20)
         .get(&url)
         .set("User-Agent", "RoomGuard")
@@ -108,12 +141,16 @@ fn fetch_latest(repo: &str) -> Result<Option<Release>, String> {
             other => other.to_string(),
         })?;
     let body = resp.into_string().map_err(|e| e.to_string())?;
-    let gh: GhRelease = serde_json::from_str(&body).map_err(|e| e.to_string())?;
-    let version = gh.tag_name.trim_start_matches('v').to_string();
-    if !newer(&version, env!("CARGO_PKG_VERSION")) {
+    let releases = if experimental.is_some() {
+        serde_json::from_str::<Vec<GhRelease>>(&body).map_err(|e| e.to_string())?
+    } else {
+        vec![serde_json::from_str::<GhRelease>(&body).map_err(|e| e.to_string())?]
+    };
+    let Some(gh) = choose_release(releases, experimental, env!("CARGO_PKG_VERSION")) else {
         return Ok(None);
-    }
-    let asset = gh.assets.iter().find(|a| a.name.ends_with(asset_suffix()));
+    };
+    let version = gh.tag_name.trim_start_matches('v').to_string();
+    let asset = gh.assets.iter().find(|a| a.name.ends_with(asset_suffix()) && a.name.starts_with("experimental-") == experimental.is_some());
     Ok(Some(Release {
         version,
         notes: gh.body.unwrap_or_default(),
@@ -215,7 +252,8 @@ impl Updater {
             let dest = dir.join(if rel.asset_name.is_empty() { "RoomGuard.dmg" } else { rel.asset_name.as_str() });
             self.download(url, &dest, ctx)?;
             let _ = open::that(&dest);
-            return Ok("The new version's disk image is open. Drag RoomGuard into Applications to replace this one, then reopen it.".to_string());
+            let name = if experimental_build().is_some() { "RoomGuard Experimental" } else { "RoomGuard" };
+            return Ok(format!("The disk image is open. Drag {name} into Applications, then reopen it."));
         }
         let dest: PathBuf = util::data_dir().join(format!("roomguard-update-{}", rel.version));
         self.download(url, &dest, ctx)?;
@@ -262,5 +300,29 @@ fn clean_leftovers() {
 pub fn relaunch() {
     if let Ok(exe) = std::env::current_exe() {
         let _ = std::process::Command::new(exe).arg("--restarted").spawn();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn candidate(tag: &str, prerelease: bool, draft: bool) -> GhRelease {
+        GhRelease { tag_name: tag.into(), prerelease, draft, body: None, html_url: String::new(), assets: Vec::new() }
+    }
+
+    #[test]
+    fn stable_and_experimental_updates_stay_on_their_channels() {
+        let releases = || vec![
+            candidate("experimental-9.2", true, false),
+            candidate("experimental-10.1", true, false),
+            candidate("experimental-11.1", true, true),
+            candidate("v2.4.0", false, false),
+            candidate("v2.5.0-beta", true, false),
+        ];
+        assert_eq!(choose_release(releases(), None, "2.3.0").unwrap().tag_name, "v2.4.0");
+        assert_eq!(choose_release(releases(), Some("9.2"), "2.3.0").unwrap().tag_name, "experimental-10.1");
+        assert!(choose_release(releases(), Some("10.1"), "2.3.0").is_none());
+        assert!(choose_release(releases(), None, "2.4.0").is_none());
     }
 }

@@ -192,7 +192,7 @@ impl SetupView {
             (
                 Model::Pc1832,
                 "LCD keypad (GuardSeries)",
-                "PC1832 style · 8 zones",
+                "PC1832 · 32 zones",
                 [
                     "Green backlit 2\u{00d7}16 dot-matrix display",
                     "Stay, Away, Chime, Reset & Exit keys",
@@ -202,7 +202,7 @@ impl SetupView {
             (
                 Model::Vista20p,
                 "Voice LCD (VistaGuard 20P)",
-                "6160V Voice style · 8 zones",
+                "6160V Voice · 48 zones",
                 [
                     "Speaks status & alarms with 6160V voice",
                     "[Code]+Action keys & 2-step alarm clear",
@@ -413,7 +413,7 @@ impl SetupView {
 
     fn phone(&mut self, ui: &mut egui::Ui, cfg: &mut AppConfig, changed: &mut bool, engine: &EngineHandle) -> bool {
         title(ui, "Alerts on your phone");
-        ui.label("RoomGuard can push alarms, with a camera snapshot, to your phone through ntfy, a free notification app. There's no account to make.");
+        ui.label("RoomGuard can send phone alerts through ntfy. You can choose whether to include a camera snapshot.");
         ui.add_space(8.0);
         if ui.checkbox(&mut cfg.operator.phone_alerts, "Send alerts to my phone").changed() {
             *changed = true;
@@ -442,16 +442,22 @@ impl SetupView {
                         self.tested = true;
                     }
                     if self.tested {
-                        ui.label(theme::muted("Sent. It should arrive within a few seconds."));
+                        ui.label(theme::muted(engine.view().notify_test_status.clone()));
                     }
                 });
             });
         }
         ui.add_space(10.0);
-        ui.label(RichText::new("A passcode for the operator (optional)").font(theme::semi(13.5)));
-        ui.add_space(2.0);
-        ui.add(egui::TextEdit::singleline(&mut self.passcode).password(true).hint_text("A word only you know").desired_width(220.0));
-        ui.label(theme::muted("When the operator calls about an alarm, they ask for it to make sure it's really you."));
+        if cfg.operator.phone_alerts {
+            *changed |= ui.checkbox(&mut cfg.operator.quiet_intrusion, "Keep burglary and tamper alarms quiet").changed();
+            *changed |= ui.checkbox(&mut cfg.operator.send_photos, "Include an event snapshot when available").changed();
+        }
+        ui.collapsing("Simulated operator", |ui| {
+            *changed |= ui.checkbox(&mut cfg.operator.enabled, "Enable practice calls in RoomGuard").changed();
+            if cfg.operator.enabled {
+                ui.add(egui::TextEdit::singleline(&mut self.passcode).password(true).hint_text("Optional operator passcode").desired_width(220.0));
+            }
+        });
         true
     }
 
@@ -459,8 +465,8 @@ impl SetupView {
         title(ui, "You're all set");
         let tips = [
             ("To arm", "Type your code on the keypad, then leave through the doorway before the exit delay ends. On the LCD keypad you can also hold Away or Stay for two seconds."),
-            ("To disarm", "Come back in and type your code before the entry delay runs out. If you've taught it your face, it can disarm for you."),
-            ("If something happens", "The siren sounds, the camera saves a snapshot, and the operator messages you and calls you here."),
+            ("To disarm", "Type your code before the entry countdown ends. On Vista, follow your code with 1 (OFF)."),
+            ("If something happens", "RoomGuard logs the event and sends a phone alert if enabled. Check Settings → Phone alerts to choose when the siren sounds."),
         ];
         for (head, text) in tips {
             ui.label(RichText::new(head).font(theme::semi(14.0)));
