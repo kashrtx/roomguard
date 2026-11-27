@@ -18,7 +18,9 @@ pub fn ui(ui: &mut egui::Ui, view: &View, cfg: &CameraCfg, engine: &EngineHandle
     ui.horizontal(|ui| {
         ui.label(theme::heading("Zones"));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(theme::muted("Click Draw to place on map"));
+            if cfg.enabled {
+                ui.label(theme::muted("Click Draw to place on map"));
+            }
         });
     });
     ui.add_space(4.0);
@@ -43,7 +45,7 @@ pub fn ui(ui: &mut egui::Ui, view: &View, cfg: &CameraCfg, engine: &EngineHandle
         };
         let home = view.home_zones[usize::from(z.num) - 1];
         let can_draw = !home && cfg.enabled && zone_drawable(z);
-        let mapped_box = !home && cfg.zone_rect(z.num).is_some();
+        let mapped_box = cfg.enabled && !home && cfg.zone_rect(z.num).is_some();
         let right_reserve = if !z.camera {
             (if z.alarm { 178.0 } else { 132.0 }) + if can_draw { 46.0 } else { 0.0 }
         } else if z.alarm {

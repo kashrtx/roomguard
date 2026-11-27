@@ -98,6 +98,9 @@ impl SetupView {
                 ui.horizontal(|ui| {
                     if self.step > 0 && ui.button("Back").clicked() {
                         self.step -= 1;
+                        if self.step == 2 && cfg.setup_done {
+                            self.step = 1;
+                        }
                         self.error.clear();
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -157,6 +160,9 @@ impl SetupView {
             _ => {}
         }
         self.step += 1;
+        if self.step == 2 && cfg.setup_done {
+            self.step = 3;
+        }
         false
     }
 
@@ -267,10 +273,13 @@ impl SetupView {
 
     fn camera(&mut self, ui: &mut egui::Ui, cfg: &mut AppConfig, changed: &mut bool, cam: &CameraHandle) -> bool {
         title(ui, "Your camera");
-        ui.label("RoomGuard watches through your webcam. Point it so it can see the door into the room. No webcam handy? Pick the demo camera to try everything out.");
+        ui.label("Use a webcam to watch the room, or turn it off and add Home Assistant sensors after setup. The demo camera works without a physical camera.");
         ui.add_space(12.0);
-        if ui.checkbox(&mut cfg.camera.enabled, "Use a camera").changed() {
+        if ui.checkbox(&mut cfg.camera.enabled, "Use webcam").changed() {
             *changed = true;
+        }
+        if !cfg.camera.enabled {
+            return true;
         }
         ui.add_space(6.0);
         let devices = cam.shared.lock().map(|s| s.devices.clone()).unwrap_or_default();

@@ -352,6 +352,7 @@ impl Worker {
         let db = faces::FaceDb::load();
         let gallery = db.gallery();
         let ptz = ptz::Ptz::new(&cfg.ptz, cfg.lens.hfov());
+        let pose = if cfg.enabled { pose::PoseWorker::start() } else { None };
         let now = Instant::now();
         let w = Worker {
             cfg,
@@ -407,7 +408,7 @@ impl Worker {
             clip_buffer: clip::Buffer::default(),
             entry_clip: None,
             demo_t: 0.0,
-            pose: pose::PoseWorker::start(),
+            pose,
             people: Vec::new(),
             people_at: None,
             pose_sent_at: None,
@@ -533,13 +534,44 @@ impl Worker {
         match cmd {
             CamCmd::Config(c) => {
                 let c = *c;
-                let reopen = c.device != self.cfg.device || (c.enabled && !self.cfg.enabled);
+                let enabled_changed = c.enabled != self.cfg.enabled;
+                let reopen = c.device != self.cfg.device || enabled_changed;
                 let ptz_changed = c.ptz != self.cfg.ptz || c.lens != self.cfg.lens;
                 let old_cfg = self.cfg.clone();
                 self.cfg = c;
                 if reopen {
                     self.close();
                     self.retry_at = Instant::now();
+                }
+                if enabled_changed {
+                    if self.cfg.enabled {
+                        self.pose = pose::PoseWorker::start();
+                        if self.cfg.device == DEMO_DEVICE {
+                            self.set_status(CamStatus::Running);
+                            self.report_camera(true, false);
+                        }
+                    } else {
+                        self.pose = None;
+                        self.people.clear();
+                        self.people_at = None;
+                        self.calib = None;
+                        self.enroll = None;
+                        self.recent_face = None;
+                        self.sweep = None;
+                        self.snap_queue.clear();
+                        self.covered = false;
+                        self.cover_since = None;
+                        self.sent_camera = None;
+                        self.motion.reset();
+                        self.tracker.clear();
+                        if let Ok(mut shared) = self.shared.lock() {
+                            shared.preview = None;
+                            shared.enroll = None;
+                            shared.calib = None;
+                            shared.mapping_progress = None;
+                            shared.last_frame_ms = 0;
+                        }
+                    }
                 }
                 if reopen || !self.cfg.enabled || old_cfg.mirror != self.cfg.mirror {
                     self.alert_clips.clear();

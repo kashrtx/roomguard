@@ -68,6 +68,7 @@ pub enum EngineMsg {
     EditPanel(PanelEdit),
     /// Checks a code without pressing keys, used before closing while armed.
     VerifyCode { code: String, reply: std::sync::mpsc::Sender<bool> },
+    UnlockInstaller { model: Model, code: String, reply: Sender<Result<(), &'static str>> },
     TestNotify,
     ClearEvents,
     HomeAssistant { epoch: u64, update: ha::Update },
@@ -638,6 +639,9 @@ impl Engine {
             }
             EngineMsg::NetStatus(ok) => self.panel.inputs.net_ok = ok,
             EngineMsg::SetMasterCode(code) => {
+                if self.cfg.setup_done || self.panel.is_on() {
+                    return true;
+                }
                 let model = self.panel.model;
                 self.panel.ee.set_code(master_slot(model), &code);
                 self.panel.log(EvKind::Program, "Master code set during setup");
@@ -659,6 +663,10 @@ impl Engine {
                     self.panel.bad_code(now);
                 }
                 let _ = reply.send(ok);
+            }
+            EngineMsg::UnlockInstaller { model, code, reply } => {
+                let _ = reply.send(self.panel.verify_installer_master(model, &code, now));
+                self.ctx.request_repaint();
             }
             EngineMsg::TestNotify => {
                 self.notify.send(NotifyJob {
@@ -872,6 +880,9 @@ impl Engine {
     }
 
     fn vision(&mut self, ev: VisionEvent, now: Instant) {
+        if !self.cfg.camera.enabled {
+            return;
+        }
         match ev {
             VisionEvent::Motion { zone, open } => {
                 if (1..=8).contains(&zone) {
@@ -1162,6 +1173,7 @@ impl Engine {
         let followed_panel_changed = new.home_assistant.followed_panel() != self.cfg.home_assistant.followed_panel();
         let model_changed = new.model != self.panel.model;
         let cam_changed = new.camera != self.cfg.camera;
+        let webcam_toggled = new.camera.enabled != self.cfg.camera.enabled;
         let sound_changed = new.sound != self.cfg.sound;
         let microphone_changed = new.sound.microphone != self.cfg.sound.microphone;
         let outputs_changed = new.sound.keypad_output != self.cfg.sound.keypad_output || new.sound.siren_output != self.cfg.sound.siren_output;
@@ -1185,6 +1197,15 @@ impl Engine {
         if cam_changed {
             self.entry_evidence = None;
             self.grace_until = now + Duration::from_secs(10);
+            if webcam_toggled {
+                self.cam_online = true;
+                self.cam_covered = false;
+                if !self.cfg.camera.enabled && !destination_changed {
+                    for (_, job, _) in self.pending_photos.drain(..) {
+                        self.notify.send(job);
+                    }
+                }
+            }
             self.cam.send(CamCmd::Config(Box::new(self.cfg.camera.clone())));
         }
         if microphone_changed {
@@ -1280,7 +1301,7 @@ impl Engine {
 
     fn phone_report(&mut self, report: &Report, now: Instant) {
         let gifs_enabled = self.cfg.operator.motion_gifs_enabled();
-        if gifs_enabled && matches!(report.kind, ReportKind::EntryStarted | ReportKind::PhysicalEntry) {
+        if gifs_enabled && self.cfg.camera.enabled && matches!(report.kind, ReportKind::EntryStarted | ReportKind::PhysicalEntry) {
             self.entry_evidence = Some((report.zone_or_user, now));
             self.cam.send(CamCmd::MarkEntryForClip(now));
         }
@@ -1327,9 +1348,10 @@ impl Engine {
                     let res = self.op.report(r, now, dial, &self.cfg.operator);
                     self.handle_op(res);
                 }
-                Out::Snapshot(reason) => self.cam.send(CamCmd::Snapshot(reason)),
+                Out::Snapshot(reason) if self.cfg.camera.enabled => self.cam.send(CamCmd::Snapshot(reason)),
                 Out::Save => self.save_due = Some(now + Duration::from_millis(400)),
-                Out::LearnFace => self.cam.send(CamCmd::LearnOwner),
+                Out::LearnFace if self.cfg.camera.enabled => self.cam.send(CamCmd::LearnOwner),
+                Out::Snapshot(_) | Out::LearnFace => {}
                 Out::Disarmed { after_alarm } => {
                     self.entry_evidence = None;
                     let res = self.op.disarmed(after_alarm, now, &self.cfg.operator);

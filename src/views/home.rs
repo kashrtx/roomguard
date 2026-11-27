@@ -51,6 +51,14 @@ impl HomeUi {
             });
         });
 
+        ui.add_space(8.0);
+        if ui.checkbox(&mut cfg.camera.enabled, "Use webcam").changed() {
+            *changed = true;
+        }
+        if !cfg.camera.enabled {
+            ui.label(theme::muted("Webcam capture is off. Home Assistant zones and text alerts still work."));
+        }
+
         ui.add_space(12.0);
         ui.label(theme::heading("Follow physical panel"));
         let partition = home.follow_panel.as_deref().and_then(|id| view.home.entities.get(id));

@@ -374,6 +374,7 @@ pub struct Panel {
     pub vista_mode: VistaKp,
     pub vista_armed_by_inst: bool,
     pub vista_sounder_mute_until: Option<Instant>,
+    pub vista_entry_mute_until: Option<Instant>,
     pub vista_last_voice_alarm: Option<Instant>,
     pub vista_exit_voice_done: bool,
     pub vista_fault_idx: usize,
@@ -508,6 +509,7 @@ impl Panel {
             vista_mode: VistaKp::Normal,
             vista_armed_by_inst: false,
             vista_sounder_mute_until: None,
+            vista_entry_mute_until: None,
             vista_last_voice_alarm: None,
             vista_exit_voice_done: false,
             vista_fault_idx: 0,
@@ -795,6 +797,31 @@ impl Panel {
             return self.ee.find_code(&code[..4]);
         }
         None
+    }
+
+    pub(crate) fn verify_installer_master(&mut self, model: Model, code: &str, now: Instant) -> Result<(), &'static str> {
+        if self.model != model {
+            return Err("The panel changed. Open the prompt again.");
+        }
+        if self.is_on() || self.alarm_sounding(now) {
+            return Err("Disarm the panel before opening Installer.");
+        }
+        if self.lockout_until.is_some_and(|until| now < until) {
+            return Err("The keypad is locked. Try again after the lockout ends.");
+        }
+        if code.len() != self.code_len() || !code.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(if self.code_len() == 6 { "Enter the six-digit master code." } else { "Enter the four-digit master code." });
+        }
+        let slot = super::master_slot(model);
+        let matches = self.ee.code_matches(slot, code)
+            || (code.len() == 6 && code.ends_with("00") && self.ee.code_matches(slot, &code[..4]));
+        if matches {
+            self.bad_codes = 0;
+            Ok(())
+        } else {
+            self.bad_code(now);
+            Err("Incorrect master code.")
+        }
     }
 
     /// PC1832 `[016]` Option 3: keypad blanks after 30 s idle when no delay, alarm, or menu is active
@@ -1362,6 +1389,8 @@ impl Panel {
         self.entry = None;
         self.alarms.clear();
         self.auto_pre = None;
+        self.vista_sounder_mute_until = None;
+        self.vista_entry_mute_until = None;
         self.vista_exit_alarm = false;
         self.recent_close_logged = false;
         for z in self.zones.iter_mut() {
@@ -1409,6 +1438,7 @@ impl Panel {
             return;
         }
         self.vista_pending_status = None;
+        self.vista_entry_mute_until = None;
         let kind = self.cfg(zone as usize).kind;
         let secs = self.entry_secs(kind);
         self.entry = Some(EntryRt { started: now, dur: Duration::from_secs(secs), zone, exit_fault, followers: Vec::new() });
@@ -3309,7 +3339,7 @@ impl Panel {
                 // a video of a real 6160 shows (the user guide only lists the
                 // slow part). Coming home after an alarm beeps rapidly all the
                 // way. The beeps stop once a code is in.
-                if self.vista_sounder_mute_until.map_or(false, |t| now < t) {
+                if self.vista_entry_mute_until.is_some_and(|t| now < t) {
                     return Pattern::Off;
                 }
                 if self.memory_flag || left <= 10.0 {

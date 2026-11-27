@@ -119,11 +119,15 @@ For a dedicated external siren speaker, use a stable, ventilated spot away from 
 
 ## Home Assistant sensors
 
+Use [the Windows Home Assistant lab](docs/HOME_ASSISTANT_WINDOWS.md) to test with virtual sensors and an alarm panel on your Windows PC.
+
 1. In your Home Assistant profile, create a long-lived access token. In RoomGuard open **Settings → Home Assistant → Connection**, enter the base URL and token, and select **Connect**. Use HTTPS when connecting remotely. RoomGuard saves the token in its local configuration.
 2. Search for an entity and choose an enabled zone. For a door or motion sensor, **Is on** usually means the zone is open. For a numeric sensor, choose **Above** or **Below** and enter a threshold. **Changes** briefly opens a zone on a live state change, useful for event entities. Zone definitions still decide which alarm behavior applies.
 3. Open and close the sensor while disarmed and check its zone on the keypad. A disconnected or unavailable sensor appears as a zone fault. On connection and reconnection, RoomGuard first reads the current states and then reacts to live changes.
 
 Any readable entity with a compatible state can be a zone source. Each zone has one source and the panel still sets the number of zones. Pairing, battery status, and device configuration stay in Home Assistant. Select a camera entity and choose **Load snapshot** for one on-demand JPEG preview. For camera motion, assign a motion entity exposed by Home Assistant. Previewing a camera starts no continuous stream or tracking worker.
+
+Turn off **Use webcam** in **Settings → Home Assistant** or **Settings → Camera** to stop webcam capture and tracking. Home Assistant zones remain active and phone alerts can still send text.
 
 ### Follow a physical alarm panel
 

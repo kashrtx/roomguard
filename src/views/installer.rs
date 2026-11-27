@@ -17,7 +17,6 @@ use crate::theme;
 
 #[derive(Default)]
 pub struct InstallerState {
-    pub last_model: Option<Model>,
     pub filter: String,
     pub master_code: String,
     pub installer_code: String,
@@ -719,17 +718,8 @@ fn zone_type_vista(code: &str) -> &'static str {
 }
 
 /// Draws the live-editable Panel & Installer Programming tab.
-pub fn ui(ui: &mut egui::Ui, prog: &ProgView, armed: bool, engine: &EngineHandle, st: &mut InstallerState) {
+pub fn ui(ui: &mut egui::Ui, prog: &ProgView, armed: bool, engine: &EngineHandle) {
     let m = prog.model;
-    if st.last_model != Some(m) {
-        st.last_model = Some(m);
-        st.raw_drafts.clear();
-        st.master_code.clear();
-        st.installer_code.clear();
-        st.extra_code.clear();
-        st.confirm_default = false;
-    }
-    let code = installer_code(m);
 
     section_hdr(
         ui,
@@ -740,8 +730,8 @@ pub fn ui(ui: &mut egui::Ui, prog: &ProgView, armed: bool, engine: &EngineHandle
         },
     );
     ui.label(theme::muted(match m {
-        Model::Vista20p => "Change Vista installer programming (*fields) and 6160V voice settings directly here. No 4112+800 sequences required.",
-        _ => "Change installer and keypad programming directly here. No keypad codes required. Everything writes to the same panel EEPROM as [*][8] programming.",
+        Model::Vista20p => "Adjust VISTA delays, zones, and 6160V voice settings.",
+        _ => "Adjust panel delays, zones, and keypad settings.",
     }));
     if armed {
         ui.add_space(4.0);
@@ -1073,10 +1063,6 @@ pub fn ui(ui: &mut egui::Ui, prog: &ProgView, armed: bool, engine: &EngineHandle
             });
         });
 
-        let mut lock = prog.installer_lockout;
-        if ui.checkbox(&mut lock, "Installer lockout (factory reset keeps your installer code)").changed() {
-            engine.send(EngineMsg::EditPanel(PanelEdit::SetInstallerLockout(lock)));
-        }
     });
 
     // --- 3. PK5500 LCD & Buzzer Levels (PC1832) ---
@@ -1272,7 +1258,17 @@ pub fn ui(ui: &mut egui::Ui, prog: &ProgView, armed: bool, engine: &EngineHandle
         }
     });
 
-    // --- 5. Access Codes ---
+}
+
+pub fn advanced_ui(ui: &mut egui::Ui, prog: &ProgView, armed: bool, engine: &EngineHandle, st: &mut InstallerState) {
+    let m = prog.model;
+    let code = installer_code(m);
+    let mut lock = prog.installer_lockout;
+    if ui.add_enabled(!armed, egui::Checkbox::new(&mut lock, "Installer lockout (factory reset keeps your installer code)")).changed() {
+        engine.send(EngineMsg::EditPanel(PanelEdit::SetInstallerLockout(lock)));
+    }
+
+    // Access codes
     section_hdr(ui, "Access codes");
     ui.add_enabled_ui(!armed, |ui| {
         let master_slot = match m {

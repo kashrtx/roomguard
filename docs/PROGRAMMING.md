@@ -2,7 +2,7 @@
 
 Each panel saves its programming separately. The tables list the supported keypad commands, installer sections, and data fields.
 
-You don't have to memorize any of this. Open **Settings -> Panel** for plain-English controls (delays, chime, quick arm, zone types, buzzer/voice levels) synced live with the keypad, or open **Settings -> About** and tap the version number five times to reveal the full raw **Installer** section/field table.
+Open **Settings → Panel** for delays, chime, quick arm, zones, and keypad levels. To open the raw programming table, disarm the panel, open **Settings → About**, tap the version number five times, and enter the active panel’s master code. The **Installer** tab includes raw fields, access codes, and the programming reset. It locks again when you close Settings, switch panels, or arm.
 
 Default codes: master code `1234` until you set your own during setup. Installer code `1500` on **RmG Classic (`PC1550`)**, `5555` on **GuardSeries (`PC1832`)**, and `4112` on **VistaGuard 20P (`VISTA-20P`)**.
 

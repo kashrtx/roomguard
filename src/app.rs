@@ -135,8 +135,8 @@ pub struct RoomGuardApp {
     wiped: bool,
     /// True once the automatic fresh empty-room calibration for this app launch has started.
     startup_calib_started: bool,
-    /// Last configured camera device ID so switching webcams triggers a fresh calibration.
-    last_cam_device: u32,
+    /// Camera source and power state used to restart calibration if needed.
+    last_cam_source: (u32, bool),
 }
 
 fn icon_button(ui: &mut egui::Ui, icon: Icon, tip: &str) -> egui::Response {
@@ -193,7 +193,7 @@ impl RoomGuardApp {
         let lights = if cfg.ui.lights_on { 1.0 } else { 0.0 };
         let right_tab = cfg.ui.right_tab.min(1);
         let applied_autostart = autostart::is_enabled();
-        let last_cam_device = cfg.camera.device;
+        let last_cam_source = (cfg.camera.device, cfg.camera.enabled);
         RoomGuardApp {
             cfg,
             engine,
@@ -223,7 +223,7 @@ impl RoomGuardApp {
             shots: shots.map(|dir| Shots { dir, stage: 0, start: None, mark: 0.0, awaiting: None }),
             wiped: false,
             startup_calib_started: false,
-            last_cam_device,
+            last_cam_source,
         }
     }
 
@@ -243,8 +243,9 @@ impl RoomGuardApp {
     }
 
     fn push_cfg(&mut self) {
-        if self.cfg.camera.device != self.last_cam_device {
-            self.last_cam_device = self.cfg.camera.device;
+        let source = (self.cfg.camera.device, self.cfg.camera.enabled);
+        if source != self.last_cam_source {
+            self.last_cam_source = source;
             self.startup_calib_started = false;
         }
         self.engine.send(EngineMsg::Config(Box::new(self.cfg.clone())));

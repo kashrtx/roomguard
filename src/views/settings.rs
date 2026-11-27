@@ -1,5 +1,7 @@
 //! The settings window.
 
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+
 use eframe::egui::{self, Color32, Rect, RichText, Sense};
 
 use crate::audio::{AudioCmd, AudioHandle};
@@ -30,6 +32,19 @@ fn audio_device_picker(ui: &mut egui::Ui, label: &str, value: &mut Option<String
 }
 
 const TABS: [&str; 8] = ["General", "Panel", "Camera", "Sound", "Phone alerts", "Updates", "Home Assistant", "About"];
+const ABOUT_TAB: u8 = 7;
+const INSTALLER_TAB: u8 = 8;
+
+#[derive(Default)]
+struct InstallerAccess {
+    taps: u8,
+    requested: Option<Model>,
+    unlocked: Option<Model>,
+    code: String,
+    error: Option<&'static str>,
+    reply: Option<Receiver<Result<(), &'static str>>>,
+    focus: bool,
+}
 
 #[derive(Default)]
 pub struct SettingsView {
@@ -46,6 +61,7 @@ pub struct SettingsView {
     /// Set once you confirm erasing everything; the app does the erasing.
     pub wipe: bool,
     panel_ui: super::installer::InstallerState,
+    installer: InstallerAccess,
 }
 
 /// Draws a QR code for `data`.
@@ -77,14 +93,43 @@ fn section(ui: &mut egui::Ui, title: &str) {
 }
 
 impl SettingsView {
+    fn lock_installer(&mut self) {
+        self.installer = InstallerAccess::default();
+        self.panel_ui = super::installer::InstallerState::default();
+        if self.tab == INSTALLER_TAB {
+            self.tab = ABOUT_TAB;
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn window(&mut self, ctx: &egui::Context, cfg: &mut AppConfig, changed: &mut bool, view: &View, engine: &EngineHandle, cam: &CameraHandle, audio: &AudioHandle, updater: &Updater) {
         if !self.open {
+            self.lock_installer();
             return;
         }
+        if view.armed
+            || self.installer.unlocked.or(self.installer.requested).is_some_and(|model| model != view.model)
+        {
+            self.lock_installer();
+        }
+        if let Some(reply) = self.installer.reply.take() {
+            match reply.try_recv() {
+                Ok(Ok(())) => {
+                    self.installer.unlocked = self.installer.requested.take();
+                    self.tab = INSTALLER_TAB;
+                }
+                Ok(Err(error)) => {
+                    self.installer.error = Some(error);
+                    self.installer.focus = true;
+                }
+                Err(TryRecvError::Empty) => self.installer.reply = Some(reply),
+                Err(TryRecvError::Disconnected) => self.installer.error = Some("RoomGuard could not check the code. Try again."),
+            }
+        }
+        let installer_open = self.installer.unlocked == Some(view.model);
         let mut open = self.open;
-        if self.tab as usize >= TABS.len() {
-            self.tab = 0;
+        if self.tab >= INSTALLER_TAB && !installer_open {
+            self.tab = ABOUT_TAB;
         }
         egui::Window::new("Settings")
             .open(&mut open)
@@ -98,10 +143,11 @@ impl SettingsView {
                 ui.horizontal_top(|ui| {
                     ui.vertical(|ui| {
                         ui.set_width(136.0);
-                        for (i, name) in TABS.iter().enumerate() {
+                        let installer_tab = installer_open.then_some("Installer");
+                        for (i, name) in TABS.into_iter().chain(installer_tab).enumerate() {
                             let selected = self.tab == i as u8;
                             let btn = egui::Button::new(
-                                RichText::new(*name)
+                                RichText::new(name)
                                     .font(if selected { theme::semi(13.5) } else { theme::regular(13.5) })
                                     .color(if selected { Color32::WHITE } else { theme::MUTED }),
                             )
@@ -110,6 +156,9 @@ impl SettingsView {
                             .min_size(egui::vec2(132.0, 28.0));
                             if ui.add(btn).clicked() {
                                 self.tab = i as u8;
+                                if self.tab != ABOUT_TAB && !installer_open {
+                                    self.lock_installer();
+                                }
                             }
                         }
                     });
@@ -121,19 +170,29 @@ impl SettingsView {
                             ui.set_max_width((body_w - 14.0).max(320.0));
                             match self.tab {
                                 0 => self.general(ui, cfg, changed, view),
-                                1 => super::installer::ui(ui, &view.prog, view.armed, engine, &mut self.panel_ui),
+                                1 => super::installer::ui(ui, &view.prog, view.armed, engine),
                                 2 => self.camera(ui, cfg, changed, cam),
                                 3 => self.sound(ui, cfg, changed, view, engine, audio),
                                 4 => self.monitoring(ui, cfg, changed, view, engine),
                                 5 => self.updates(ui, cfg, changed, updater),
                                 6 => self.home_ui.ui(ui, cfg, changed, view, engine),
-                                _ => self.about(ui),
+                                INSTALLER_TAB if installer_open => {
+                                    if ui.button("Lock Installer").clicked() {
+                                        self.lock_installer();
+                                    } else {
+                                        super::installer::advanced_ui(ui, &view.prog, view.armed, engine, &mut self.panel_ui);
+                                    }
+                                }
+                                _ => self.about(ui, view, engine),
                             }
                         });
                     });
                 });
             });
         self.open = open;
+        if !open {
+            self.lock_installer();
+        }
     }
 
     fn general(&mut self, ui: &mut egui::Ui, cfg: &mut AppConfig, changed: &mut bool, view: &View) {
@@ -274,8 +333,11 @@ impl SettingsView {
             .map(|s| (s.devices.clone(), s.people.clone(), s.enroll.clone(), s.preview.clone()))
             .unwrap_or_default();
         section(ui, "Camera");
-        if ui.checkbox(&mut c.enabled, "Use the camera as the room's sensors").changed() {
+        if ui.checkbox(&mut c.enabled, "Use webcam").changed() {
             *changed = true;
+        }
+        if !c.enabled {
+            ui.label(theme::muted("Webcam capture is off. Home Assistant zones and text alerts still work."));
         }
         ui.horizontal(|ui| {
             let current = devices
@@ -738,9 +800,48 @@ impl SettingsView {
         }
     }
 
-    fn about(&mut self, ui: &mut egui::Ui) {
+    fn about(&mut self, ui: &mut egui::Ui, view: &View, engine: &EngineHandle) {
         section(ui, "RoomGuard");
-        ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
+        let mut version = format!("Version {}", env!("CARGO_PKG_VERSION"));
+        if let Some(build) = crate::update::experimental_build() {
+            version.push_str(&format!(" · Experimental {build}"));
+        }
+        let version_row = ui.add_enabled(!view.armed, egui::Button::new(version).frame(false))
+            .on_disabled_hover_text("Disarm before opening Installer");
+        if version_row.clicked() && self.installer.requested.is_none() && self.installer.unlocked.is_none() {
+            self.installer.taps += 1;
+            if self.installer.taps == 5 {
+                self.installer.requested = Some(view.model);
+                self.installer.focus = true;
+            }
+        }
+        if self.installer.requested == Some(view.model) {
+            ui.group(|ui| {
+                ui.label(theme::heading("Unlock Installer"));
+                ui.label("Enter this panel’s master code.");
+                let pending = self.installer.reply.is_some();
+                let field = ui.add_enabled(!pending, egui::TextEdit::singleline(&mut self.installer.code)
+                    .password(true).char_limit(6).hint_text("Master code"));
+                if self.installer.focus {
+                    field.request_focus();
+                    self.installer.focus = false;
+                }
+                let submit = field.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                let ready = !pending && !self.installer.code.is_empty();
+                if ui.add_enabled(ready, egui::Button::new("Unlock")).clicked() || (ready && submit) {
+                    let (send, receive) = mpsc::channel();
+                    engine.send(EngineMsg::UnlockInstaller { model: view.model, code: std::mem::take(&mut self.installer.code), reply: send });
+                    self.installer.reply = Some(receive);
+                    self.installer.error = None;
+                }
+                if ui.small_button("Cancel").clicked() {
+                    self.lock_installer();
+                }
+                if let Some(error) = self.installer.error {
+                    ui.label(RichText::new(error).color(theme::AMBER));
+                }
+            });
+        }
         ui.label("Copyright 2026 Kaushal Bhingaradia. Licensed under the Apache License 2.0.");
         ui.add_space(6.0);
         ui.label(theme::muted(

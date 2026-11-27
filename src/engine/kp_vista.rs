@@ -451,11 +451,10 @@ impl Panel {
         // VISTA-20P Installation Manual p.70: "Pressing any key will silence the
         // keypad sounder for 10 seconds. Disarming the system will silence both
         // keypad and external sounders."
-        if self.alarms.iter().any(|a| !a.silenced && !a.kind.pulsed() && (a.audible || a.buzzer)) {
-            let ten_s = now + Duration::from_secs(10);
-            if self.vista_sounder_mute_until.map_or(true, |t| t < ten_s) {
-                self.vista_sounder_mute_until = Some(ten_s);
-            }
+        if self.vista_sounder_mute_until.map_or(true, |until| now >= until)
+            && self.live_alarms(now).any(|a| matches!(a.kind, AlarmKind::Burglary | AlarmKind::Tamper) && (a.audible || a.buzzer))
+        {
+            self.vista_sounder_mute_until = Some(now + Duration::from_secs(10));
         }
 
         let mode = std::mem::replace(&mut self.vista_mode, VistaKp::Normal);
@@ -576,8 +575,8 @@ impl Panel {
                 if self.buf.len() >= 4 {
                     let code = std::mem::take(&mut self.buf);
                     let urgent = self.entry.is_some() || self.alarms.iter().any(|a| !a.silenced);
-                    if urgent {
-                        self.vista_sounder_mute_until = Some(now + Duration::from_secs(15));
+                    if self.entry.is_some() && self.vista_entry_mute_until.map_or(true, |until| now >= until) {
+                        self.vista_entry_mute_until = Some(now + Duration::from_secs(15));
                     }
                     if let Some(slot) = self.ee.find_code(&code) {
                         self.bad_codes = 0;
@@ -2574,6 +2573,7 @@ impl Panel {
     pub(crate) fn vista_off(&mut self, slot: &str, user: u8, now: Instant) {
         self.vista_code_disarm = None;
         self.vista_sounder_mute_until = None;
+        self.vista_entry_mute_until = None;
         let is_armed = self.armed.is_some() || self.exit.is_some();
         let has_live_alarm = self.alarms.iter().any(|a| !a.silenced);
 

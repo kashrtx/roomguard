@@ -37,6 +37,64 @@ fn keys(p: &mut Panel, ks: &str, t: Instant) {
 }
 
 #[test]
+fn installer_prompt_requires_the_active_panels_master_code() {
+    let now = Instant::now();
+    for model in [Model::Pc1550, Model::Pc1832, Model::Vista20p] {
+        let mut p = panel(model);
+        p.ee.set_code(if model == Model::Pc1550 { "2" } else { "04" }, "5678");
+        assert!(p.verify_installer_master(model, "5678", now).is_err());
+        assert!(p.verify_installer_master(model, model.installer_default(), now).is_err());
+        assert!(p.verify_installer_master(model, "1234", now).is_ok());
+        p.arm(ArmHow::AwayKey, 0, now);
+        assert!(p.verify_installer_master(model, "1234", now).is_err());
+    }
+    let mut p = panel(Model::Pc1832);
+    p.ee.sections.insert("701".into(), "5".into());
+    assert!(p.verify_installer_master(Model::Pc1832, "1234", now).is_err());
+    assert!(p.verify_installer_master(Model::Pc1832, "123400", now).is_ok());
+    p.ee.set_code("40", "654321");
+    assert!(p.verify_installer_master(Model::Pc1832, "654321", now).is_ok());
+    assert!(p.verify_installer_master(Model::Pc1550, "654321", now).is_err());
+}
+
+#[test]
+fn webcam_off_stops_the_feed_and_can_restart_the_same_source() {
+    use crate::vision::{CamCmd, CamStatus, DEMO_DEVICE};
+    setup();
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut cfg = crate::config::CameraCfg { device: DEMO_DEVICE, ..Default::default() };
+    let cam = crate::vision::start(cfg.clone(), tx, eframe::egui::Context::default());
+    let wait = |powered: bool| {
+        let until = Instant::now() + secs(5);
+        while Instant::now() < until {
+            let matched = {
+                let shared = cam.shared.lock().unwrap();
+                if powered {
+                    shared.status == CamStatus::Running && shared.preview.is_some()
+                } else {
+                    shared.status == CamStatus::Off && shared.preview.is_none()
+                }
+            };
+            if matched {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        panic!("Camera didn't switch to powered={powered}");
+    };
+    wait(true);
+    cfg.enabled = false;
+    cam.send(CamCmd::Config(Box::new(cfg.clone())));
+    wait(false);
+    assert_eq!(cam.shared.lock().unwrap().last_frame_ms, 0);
+    cfg.enabled = true;
+    cam.send(CamCmd::Config(Box::new(cfg)));
+    wait(true);
+    cam.send(CamCmd::Shutdown);
+    cam.wait_stopped(secs(3));
+}
+
+#[test]
 fn all_panels_follow_physical_arming_and_keep_guarding_when_the_link_drops() {
     use crate::home_assistant::AlarmState::*;
 
@@ -1494,8 +1552,11 @@ fn final_audit_audio_sync_vista_maximum_and_manual_rules() {
     v.tick(t0 + secs(72), 0);
     assert_eq!(v.sounder_sent, Pattern::Off, "any key mutes 6160V keypad sounder for 10s");
     assert_eq!(v.bell_sent, BellPattern::Steady, "external siren keeps sounding until disarmed");
+    keys(&mut v, "9999", t0 + secs(79));
+    v.tick(t0 + secs(80), 0);
+    assert_eq!(v.sounder_sent, Pattern::Off);
     v.tick(t0 + secs(82), 0);
-    assert!(matches!(v.sounder_sent, Pattern::HiLo { .. }), "keypad sounder resumes after 10s if not disarmed");
+    assert!(matches!(v.sounder_sent, Pattern::HiLo { .. }), "keypad sounder resumes 10s after the first key, even after more digits");
 
     // 4. Disarming Vista emits exactly ONE confirmation tone (no duplicate from Panel::disarm),
     //    and pressing a key cancels pending post-OFF status voice so it never overlaps.
@@ -1859,6 +1920,29 @@ fn keypress_ducks_exit_and_entry_countdown_beeps_without_overlap() {
         resumed_peak = resumed_peak.max(s.next().abs());
     }
     assert!(resumed_peak > 0.05, "exit countdown should resume if user stops typing (peak={})", resumed_peak);
+}
+
+#[test]
+fn more_keypresses_do_not_extend_the_running_sounder_pause() {
+    use crate::audio::synth::Synth;
+    for voice in [crate::audio::KeypadVoice::Classic, crate::audio::KeypadVoice::Pk5500, crate::audio::KeypadVoice::Vista6160] {
+        let mut s = Synth::new(48_000.0);
+        s.apply(AudioCmd::Voice(voice));
+        s.apply(AudioCmd::Sounder(Pattern::Steady));
+        for _ in 0..4 {
+            s.apply(AudioCmd::KeyBeep);
+            for _ in 0..19_200 {
+                s.next();
+            }
+        }
+        let quiet = (0..4_800).map(|_| s.next().abs()).fold(0.0, f32::max);
+        assert!(quiet < 0.02);
+        for _ in 0..4_800 {
+            s.next();
+        }
+        let resumed = (0..4_800).map(|_| s.next().abs()).fold(0.0, f32::max);
+        assert!(resumed > 0.05, "{voice:?} should resume 1.8s after the first key");
+    }
 }
 
 #[test]

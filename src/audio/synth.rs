@@ -843,11 +843,10 @@ impl Synth {
             AudioCmd::KeyBeep => {
                 // A keypress is ~80 ms on PC1550, ~65 ms on PC1832, or a crisp ~46 ms
                 // chirp on Vista 6160V. When an exit/entry/trouble sounder is already
-                // running, duck it for 1.8 s after each keypress so typing a code never
-                // overlaps with countdown beeps. Pressing a key also fades out any
-                // in-progress 6160V voice phrase cleanly without a click.
+                // running, the first key starts a 1.8 s pause. Further keys
+                // get their own chirps without extending that pause.
                 let was_ducking = self.key_duck_left > 0;
-                if self.sounder.pat != Pattern::Off {
+                if !was_ducking && self.sounder.pat != Pattern::Off {
                     self.key_duck_left = ms(self.sr, 1800);
                 }
                 self.segs.clear();

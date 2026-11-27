@@ -369,8 +369,6 @@ pub struct UiCfg {
     pub lock_layout_while_armed: bool,
     pub show_motion: bool,
     pub show_tracks: bool,
-    /// The hidden installer tab in Settings has been unlocked.
-    pub installer_view: bool,
     /// Draw with OpenGL instead of Direct3D, Vulkan or Metal.
     pub opengl: bool,
 }
@@ -389,7 +387,6 @@ impl Default for UiCfg {
             lock_layout_while_armed: false,
             show_motion: true,
             show_tracks: true,
-            installer_view: false,
             opengl: false,
         }
     }
