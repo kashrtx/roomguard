@@ -16,7 +16,7 @@ Default codes: master code `1234` until you set your own during setup. Installer
 | `*` `3` | Alarm memory. |
 | `*` `4` | PC1832: door chime on (three beeps) or off (a two second tone). PC1550: the downloading call. |
 | `*` `5` + master code | User codes. |
-| `*` `6` + master code | User functions: clock, auto arm, chime on the PC1550, system test, and on the LCD keypad the event buffer, brightness, contrast and the 21 step buzzer pitch. |
+| `*` `6` + master code | User functions: clock, auto arm, chime on the PC1550, system test, and on the LCD keypad the event buffer, brightness, contrast, 21 step buzzer pitch, **Display Blank (privacy mode)**, and **Zone Chime** (per-zone toggle & 4 chime melodies). |
 | `*` `7` | PC1550: utility output, which from the factory is the 5 second smoke detector reset. PC1832: command outputs, `*` `7` `2` is sensor reset. |
 | `*` `8` + installer code | Installer programming. |
 | `*` `9` + code | Arm with no entry delay. The Armed light flashes. |
@@ -24,7 +24,7 @@ Default codes: master code `1234` until you set your own during setup. Installer
 | Hold `F`, `A` or `P` | Fire, auxiliary (medical) and panic. One second on the PC1550, two on the PC1832. Holding one also closes any open menu. |
 | `#` | Back out of anything, and silence trouble beeps. |
 
-On the GuardSeries LCD keypad, hold **Stay**, **Away**, **Chime**, **Reset** or **Exit** for two seconds. Holding the digits `1` to `5` for two seconds does the same, exactly like the real PowerSeries keypads. Function keys don't work inside a `*` menu, and the keypad gives its error tone. Use `<` and `>` to scroll the screen and menus.
+On the GuardSeries LCD keypad, hold **Stay**, **Away**, **Chime**, **Reset** or **Exit** for two seconds. Holding digits `1` to `5` for two seconds triggers those same function keys, and holding `0` for two seconds triggers Quick Exit (while armed) or Quick Arm (while disarmed). Function keys don't work inside a `*` menu, and the keypad gives its error tone. Use `<` and `>` to scroll open zones, screens, and menus.
 
 ## How it sounds
 
@@ -68,7 +68,7 @@ The real PC1550 only has the six troubles on its zone lights, so RoomGuard shows
 
 ## RmG Classic PC1550 sections (v4.1)
 
-Enter installer programming with `*` `8` `1500`, then a two digit section. Zone lights 1 to 4 show the digit under the cursor in binary. `F` skips a digit, `*` switches to hex entry, and `#` leaves a section (finished entries are kept) and then leaves programming. Programming times out after two minutes without a key.
+Enter installer programming with `*` `8` `1500`, then a two digit section. Zone lights 1 to 4 show the digit under the cursor in binary. `F` skips a digit, `*` switches to hex entry (`0`–`5` enter `A`–`F`), and `#` leaves a section (finished entries are kept) and then leaves programming. Zone lights use distinct cadences: slow flash for open zones, fast flash for alarm memory, and steady on for bypassed zones in `*` `1`. Programming times out after two minutes without a key.
 
 | Section | Contents | Default |
 | --- | --- | --- |
@@ -172,7 +172,7 @@ Advanced 6160V keypad commands:
 - **100-Event History Log (`#60`):** `[Master/Installer]` + `#` + `60` displays events in Contact ID format (`001 E401 U002 P1` / timestamp); `*` = older, `#` = newer.
 - **Schedules (`#64`):** `[Master/Installer]` + `#` + `64` configures schedules (`01`–`16` user, `17`–`32` installer) for Output On (`01`), Forced Stay (`04`), Forced Away (`05`), Auto Disarm (`06`), Reminder (`07`), or Periodic Test (`11`). `[Installer]` + `#` + `0` + `0`/`1`/`2` sets 24h / 7d / 28d test intervals.
 - **Macros (`#66`) & Outputs (`#7`/`#8`):** `[Master]` + `#` + `66` programs Macros 1–4 (`AWAY`/D inserts `F` separator and saves on second press); `[Code]` + `#` + `7`/`8` + `[01-18]` activates/deactivates virtual outputs.
-- **User Attributes:** `[Master]` + `8` + `[03-49]` + `#` + `0` (delete), `#` + `1` + `0`–`4` (authority: `0` Standard, `1` Arm-Only, `2` Guest, `3` Duress CID 121, `4` Partition Master), `#` + `2` + `0`–`8` (access group), `#` + `3` + `0` + `1`–`3` + `#` (partition), `#` + `5` + `0`/`1` (pager). `[Installer]` + `8` + `02` + `[4-digit]` sets the Master code in a single entry.
+- **User Attributes:** `[Master]` + `8` + `[03-49]` + `#` + `0` (delete), `#` + `1` + `0`–`5` (authority: `0` Standard, `1` Arm-Only, `2` Guest, `3` Duress CID 121, `4` Partition Master, `5` One-Time Maid/Guest that auto-deletes after arming and disarming once), `#` + `2` + `0`–`8` (access group), `#` + `3` + `0` + `1`–`3` + `#` (partition), `#` + `5` + `0`/`1` (pager). `[Installer]` + `8` + `02` + `[4-digit]` sets the Master code in a single entry.
 - **Partition Commands:** `[Code]` + `*` + `0`–`3` GoTo Partition; `[Code]` + `0` + `1`/`2`/`3`/`4`/`7` Multi-Partition global command.
 
 ## Hardware coverage

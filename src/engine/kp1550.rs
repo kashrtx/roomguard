@@ -539,7 +539,7 @@ impl Panel {
                 l[2] = Led::Flash;
                 if let Some(list) = self.memory.get(*level) {
                     for &z in list {
-                        zone(&mut l, z as usize, Led::Flash);
+                        zone(&mut l, z as usize, Led::Fast);
                     }
                 }
                 return l;
@@ -568,9 +568,9 @@ impl Panel {
             for z in 1..=self.n().min(6) {
                 let r = self.zones[z - 1];
                 if self.mem_flash_until.is_some() && r.alarm {
-                    zone(&mut l, z, Led::Flash);
+                    zone(&mut l, z, Led::Fast);
                 } else if r.open || r.tamper || r.fault {
-                    zone(&mut l, z, Led::On);
+                    zone(&mut l, z, Led::Flash);
                 }
             }
         } else {
@@ -589,7 +589,7 @@ impl Panel {
             if self.ee.toggle(self.model, "12", 3) {
                 for z in 1..=self.n().min(6) {
                     if self.zones[z - 1].alarm {
-                        zone(&mut l, z, Led::Flash);
+                        zone(&mut l, z, Led::Fast);
                     }
                 }
             }

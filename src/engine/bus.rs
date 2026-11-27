@@ -231,7 +231,7 @@ impl Panel {
                 };
             }
             KpMode::CmdOut { .. } => return 0xB2,
-            KpMode::Events { .. } | KpMode::Level { .. } => return 0xA9,
+            KpMode::Events { .. } | KpMode::Level { .. } | KpMode::ZoneChime { .. } => return 0xA9,
             KpMode::Normal => {}
         }
 

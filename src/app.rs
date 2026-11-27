@@ -307,8 +307,13 @@ impl RoomGuardApp {
                                 let (r, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
                                 ui.painter().circle_filled(r.center(), 4.5, col);
                                 ui.label(RichText::new(&view.status_title).font(theme::semi(14.0)).color(col));
-                                if view.following_panel && !view.physical_unavailable {
-                                    ui.label(theme::muted("Linked panel"));
+                                if view.panel_link != crate::home_assistant::PanelLink::Independent && !view.physical_unavailable {
+                                    let badge = if view.panel_link == crate::home_assistant::PanelLink::TwoWay {
+                                        "Two-way panel"
+                                    } else {
+                                        "Linked panel"
+                                    };
+                                    ui.label(theme::muted(badge));
                                 }
                                 if view.armed && self.cfg.operator.quiet_intrusion {
                                     ui.label(theme::muted("Quiet intrusion"));

@@ -80,10 +80,12 @@ const MAX_PANEL_ZONES: usize = Model::Vista20p.zone_count();
 
 #[derive(Clone, Default)]
 pub struct HomeView {
+    pub state: ha::ConnectionState,
     pub status: String,
     pub online: bool,
     pub entities: Arc<ha::Entities>,
     pub preview: Option<(String, Result<Arc<crate::vision::frame::Rgb>, String>)>,
+    pub service_notice: Option<(bool, String)>,
 }
 
 #[derive(Clone)]
@@ -110,6 +112,7 @@ pub struct View {
     pub call: Option<CallView>,
     pub armed: bool,
     pub following_panel: bool,
+    pub panel_link: ha::PanelLink,
     pub physical_unavailable: bool,
     pub programming: bool,
     pub notify_status: String,
@@ -235,6 +238,7 @@ impl Default for View {
             call: None,
             armed: false,
             following_panel: false,
+            panel_link: ha::PanelLink::Independent,
             physical_unavailable: false,
             programming: false,
             notify_status: String::new(),
@@ -331,7 +335,11 @@ fn voice_for(model: Model) -> KeypadVoice {
 
 fn load_panel(model: Model, cfg: &AppConfig, now: Instant) -> Panel {
     let save = util::load_json::<PanelSave>(&panel_path(model)).unwrap_or_else(|| PanelSave::fresh(model));
-    Panel::new(model, save, cfg.labels(model).clone(), cfg.display_name(), cfg.home_assistant.followed_panel().is_some(), now)
+    let link = cfg.home_assistant.panel_link();
+    let mut p = Panel::new(model, save, cfg.labels(model).clone(), cfg.display_name(), link != ha::PanelLink::Independent, now);
+    p.panel_link = link;
+    p.following_panel = link == ha::PanelLink::FollowOnly;
+    p
 }
 
 struct Engine {
@@ -439,6 +447,10 @@ impl Engine {
         };
         e.saved_events = e.panel.events_seq;
         e.push_settings();
+        if e.cfg.home_assistant.enabled {
+            e.home.state = ha::ConnectionState::Connecting;
+            e.home.status = "Connecting to Home Assistant...".into();
+        }
         e.hub.configure(&e.cfg.home_assistant, e.hub_epoch);
         let armed = e.panel.is_on();
         e.cam.send(CamCmd::Armed(armed));
@@ -958,16 +970,42 @@ impl Engine {
                 }
                 return;
             }
-            ha::Update::Status(status) => {
-                self.home.online = false;
-                self.home.status = status;
-                self.home.preview = None;
-                self.home_pulses.clear();
-                self.sync_physical_panel(false, now);
+            ha::Update::Connection(conn) => {
+                self.home.online = matches!(conn, ha::ConnectionState::Connected);
+                self.home.status = match &conn {
+                    ha::ConnectionState::Disconnected => "Disconnected".into(),
+                    ha::ConnectionState::Connecting => "Connecting to Home Assistant...".into(),
+                    ha::ConnectionState::Connected => "Connected".into(),
+                    ha::ConnectionState::Error(err) => err.clone(),
+                };
+                self.home.state = conn;
+                if !self.home.online {
+                    self.home.preview = None;
+                    self.home_pulses.clear();
+                    self.sync_physical_panel(false, now);
+                }
+            }
+            ha::Update::ServiceResult { action, result } => {
+                match result {
+                    Ok(()) => {
+                        self.home.service_notice = Some((true, format!("Sent {} to Home Assistant panel", action.label())));
+                    }
+                    Err(err) => {
+                        let msg = format!("Home Assistant panel rejected {}: {}", action.label(), err);
+                        self.home.service_notice = Some((false, msg.clone()));
+                        self.panel.log(EvKind::Trouble, msg);
+                        // Clear outbound suppression so HA's real state re-syncs immediately.
+                        self.panel.ha_outbound_until = None;
+                        self.panel.ha_expect_armed = None;
+                    }
+                }
+                self.panel.dirty = true;
+                return;
             }
             ha::Update::Snapshot(entities) => {
                 self.home.entities = Arc::new(entities);
                 self.home.online = true;
+                self.home.state = ha::ConnectionState::Connected;
                 self.home.status = "Connected".into();
                 self.home_pulses.clear();
                 self.sync_home_baseline(now);
@@ -1011,8 +1049,9 @@ impl Engine {
     }
 
     fn sync_physical_panel(&mut self, live: bool, now: Instant) {
+        let link = self.cfg.home_assistant.panel_link();
+        self.panel.set_panel_link(link, now);
         let id = self.cfg.home_assistant.followed_panel();
-        self.panel.set_following_panel(id.is_some(), now);
         let state = id.filter(|_| self.home.online)
             .and_then(|id| self.home.entities.get(id))
             .and_then(|entity| ha::AlarmState::parse(&entity.state));
@@ -1052,15 +1091,12 @@ impl Engine {
             self.zone_want[i] = if let Some(binding) = self.cfg.home_assistant.binding(self.panel.model, (i + 1) as u8) {
                 let active = self.home_active(binding);
                 let available = active.is_some();
-                let zone = &mut self.panel.zones[i];
-                // Transport failure is a supervision fault, never a motion edge.
-                zone.fault = !available;
-                zone.tamper = false;
                 if let Some(camera) = self.panel.camera_zone.get_mut(i) {
                     *camera = false;
                 }
                 self.panel.home_sensor_unavailable |= !available;
-                (active.unwrap_or(zone.open), false, !available)
+                // Transport failure is a supervision fault, never a motion edge.
+                (active.unwrap_or(self.panel.zones[i].open), false, !available)
             } else if !mask.get(i).copied().unwrap_or(false) {
                 (self.sim[i], false, false)
             } else {
@@ -1170,7 +1206,8 @@ impl Engine {
             || new.home_assistant.url != self.cfg.home_assistant.url
             || new.home_assistant.token != self.cfg.home_assistant.token;
         let bindings_changed = new.home_assistant.bindings != self.cfg.home_assistant.bindings;
-        let followed_panel_changed = new.home_assistant.followed_panel() != self.cfg.home_assistant.followed_panel();
+        let followed_panel_changed = new.home_assistant.followed_panel() != self.cfg.home_assistant.followed_panel()
+            || new.home_assistant.panel_sync != self.cfg.home_assistant.panel_sync;
         let model_changed = new.model != self.panel.model;
         let cam_changed = new.camera != self.cfg.camera;
         let webcam_toggled = new.camera.enabled != self.cfg.camera.enabled;
@@ -1257,6 +1294,13 @@ impl Engine {
         if hub_changed {
             self.hub_epoch += 1;
             self.home = HomeView::default();
+            if self.cfg.home_assistant.enabled {
+                self.home.state = ha::ConnectionState::Connecting;
+                self.home.status = "Connecting to Home Assistant...".into();
+            } else {
+                self.home.state = ha::ConnectionState::Disconnected;
+                self.home.status = "Disconnected".into();
+            }
             self.home_pulses.clear();
             self.hub.configure(&self.cfg.home_assistant, self.hub_epoch);
         }
@@ -1358,8 +1402,51 @@ impl Engine {
                     self.handle_op(res);
                 }
                 Out::Armed(a) => self.cam.send(CamCmd::Armed(a)),
+                Out::HaPanelCmd(cmd) => self.send_ha_panel_cmd(cmd),
             }
         }
+    }
+
+    fn send_ha_panel_cmd(&mut self, cmd: panel::HaPanelCmd) {
+        if self.cfg.home_assistant.panel_link() != ha::PanelLink::TwoWay || !self.home.online {
+            return;
+        }
+        let Some(entity_id) = self.cfg.home_assistant.followed_panel().map(str::to_owned) else {
+            return;
+        };
+        let entity = self.home.entities.get(&entity_id);
+        let configured_code = self.cfg.home_assistant.panel_code.trim();
+        let (action, entered_code) = match cmd {
+            panel::HaPanelCmd::Arm { mode, night, code } => {
+                let act = if night {
+                    if entity.map_or(true, ha::Entity::supports_night) {
+                        ha::AlarmAction::ArmNight
+                    } else {
+                        ha::AlarmAction::ArmHome
+                    }
+                } else {
+                    match mode {
+                        ArmMode::Stay => ha::AlarmAction::ArmHome,
+                        ArmMode::Away => ha::AlarmAction::ArmAway,
+                    }
+                };
+                (act, code)
+            }
+            panel::HaPanelCmd::Disarm { code } => (ha::AlarmAction::Disarm, code),
+        };
+        // Pick the code to send: explicit Settings HA panel code wins; otherwise fall back
+        // to the keypad code the user just typed (only when HA indicates a code format, or on Disarm).
+        let needs_code = entity.map_or(true, |e| {
+            matches!(action, ha::AlarmAction::Disarm) && e.needs_code() || e.code_arm_required()
+        });
+        let code = if !configured_code.is_empty() {
+            Some(configured_code.to_owned())
+        } else if needs_code {
+            entered_code.filter(|c| !c.trim().is_empty())
+        } else {
+            None
+        };
+        self.hub.call_alarm(self.hub_epoch, entity_id, action, code);
     }
 
     fn tick(&mut self) {
@@ -1537,6 +1624,7 @@ impl Engine {
             call: self.op.call_view(),
             armed: p.is_on(),
             following_panel: p.following_panel,
+            panel_link: p.panel_link,
             physical_unavailable: p.physical_unavailable_since.is_some(),
             programming: p.is_programming(),
             notify_status: self.notify_status.clone(),

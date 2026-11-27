@@ -8,7 +8,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::home_assistant::AlarmState;
+use crate::home_assistant::{AlarmState, PanelLink};
 
 use serde::{Deserialize, Serialize};
 
@@ -166,7 +166,14 @@ pub enum KpMode {
     Program(Prog),
     Events { idx: usize, detail: bool },
     Level { which: u8 },
+    ZoneChime { zone: usize },
     CmdOut { idx: usize },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HaPanelCmd {
+    Arm { mode: ArmMode, night: bool, code: Option<String> },
+    Disarm { code: Option<String> },
 }
 
 pub enum Out {
@@ -179,6 +186,7 @@ pub enum Out {
     LearnFace,
     Disarmed { after_alarm: bool },
     Armed(bool),
+    HaPanelCmd(HaPanelCmd),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -313,8 +321,12 @@ pub struct Panel {
     pub quiet_intrusion: bool,
     pub home_sensor_unavailable: bool,
     pub following_panel: bool,
+    pub panel_link: PanelLink,
     pub physical_state: Option<AlarmState>,
     pub physical_unavailable_since: Option<Instant>,
+    pub ha_outbound_until: Option<Instant>,
+    pub ha_expect_armed: Option<bool>,
+    pub last_entered_code: Option<String>,
     pub exit: Option<ExitRt>,
     pub armed: Option<ArmedRt>,
     pub entry: Option<EntryRt>,
@@ -451,8 +463,12 @@ impl Panel {
             quiet_intrusion: false,
             home_sensor_unavailable: false,
             following_panel,
+            panel_link: if following_panel { PanelLink::FollowOnly } else { PanelLink::Independent },
             physical_state: None,
             physical_unavailable_since: following_panel.then_some(now),
+            ha_outbound_until: None,
+            ha_expect_armed: None,
+            last_entered_code: None,
             exit: None,
             armed: None,
             entry: None,
@@ -1029,27 +1045,36 @@ impl Panel {
     }
 
     pub fn set_following_panel(&mut self, following: bool, now: Instant) {
-        if self.following_panel != following {
-            if self.is_programming() {
+        self.set_panel_link(if following { PanelLink::FollowOnly } else { PanelLink::Independent }, now);
+    }
+
+    pub fn set_panel_link(&mut self, link: PanelLink, now: Instant) {
+        if self.panel_link != link {
+            if link == PanelLink::FollowOnly && self.is_programming() {
                 self.exit_programming();
             }
-            self.following_panel = following;
+            self.panel_link = link;
+            self.following_panel = link == PanelLink::FollowOnly;
             self.physical_state = None;
-            self.physical_unavailable_since = following.then_some(now);
-            self.auto_pre = None;
-            self.buf.clear();
-            self.held = None;
-            self.kp = KpMode::Normal;
-            self.vista_mode = VistaKp::Normal;
-            self.vista_code_disarm = None;
-            self.temp_msg = None;
+            self.physical_unavailable_since = (link != PanelLink::Independent).then_some(now);
+            self.ha_outbound_until = None;
+            self.ha_expect_armed = None;
+            if link == PanelLink::FollowOnly {
+                self.auto_pre = None;
+                self.buf.clear();
+                self.held = None;
+                self.kp = KpMode::Normal;
+                self.vista_mode = VistaKp::Normal;
+                self.vista_code_disarm = None;
+                self.temp_msg = None;
+            }
             self.dirty = true;
         }
     }
 
     pub fn sync_physical_panel(&mut self, state: Option<AlarmState>, live: bool, now: Instant) {
         use AlarmState::*;
-        if !self.following_panel {
+        if self.panel_link == PanelLink::Independent {
             return;
         }
         let Some(state) = state else {
@@ -1060,6 +1085,24 @@ impl Panel {
             return;
         };
         self.dirty |= self.physical_unavailable_since.take().is_some();
+        // Two-way echo / race guard: while an outbound RoomGuard -> HA command is
+        // in flight (up to 4 s), ignore the stale opposite HA state until HA moves
+        // into the expected family (preventing accidental self-disarm or echo loops).
+        if self.panel_link == PanelLink::TwoWay {
+            if let (Some(until), Some(expect_armed)) = (self.ha_outbound_until, self.ha_expect_armed) {
+                if now < until {
+                    let is_ha_armed = !matches!(state, Disarmed);
+                    if is_ha_armed != expect_armed {
+                        return;
+                    }
+                    self.ha_outbound_until = None;
+                    self.ha_expect_armed = None;
+                } else {
+                    self.ha_outbound_until = None;
+                    self.ha_expect_armed = None;
+                }
+            }
+        }
         let previous = self.physical_state;
         if previous == Some(state) {
             return;
@@ -1071,14 +1114,32 @@ impl Panel {
             Disarmed => {
                 if self.armed.is_some() || self.exit.is_some() {
                     self.disarm_internal(None, now);
+                    if self.model == Model::Vista20p && live {
+                        self.vista_speak_if_on(vec!["disarmed".into()]);
+                    }
                     return;
                 }
                 if was_on {
                     self.log(EvKind::Disarm, "Physical panel disarmed");
                 }
             }
-            Stay | Night => self.arm_from_physical(ArmMode::Stay, state == Night, now),
-            Away | Vacation | CustomBypass => self.arm_from_physical(ArmMode::Away, false, now),
+            Stay | Night => {
+                let already_stay = self.armed.is_some_and(|a| a.mode == ArmMode::Stay)
+                    && self.vista_night == (state == Night && self.model == Model::Vista20p);
+                self.arm_from_physical(ArmMode::Stay, state == Night, now);
+                if self.model == Model::Vista20p && live && !already_stay {
+                    let no_entry = self.armed.map_or(false, |a| a.no_entry);
+                    self.vista_speak_armed(ArmMode::Stay, no_entry);
+                }
+            }
+            Away | Vacation | CustomBypass => {
+                let already_away = self.armed.is_some_and(|a| a.mode == ArmMode::Away);
+                self.arm_from_physical(ArmMode::Away, false, now);
+                if self.model == Model::Vista20p && live && !already_away {
+                    let no_entry = self.armed.map_or(false, |a| a.no_entry);
+                    self.vista_speak_armed(ArmMode::Away, no_entry);
+                }
+            }
             Pending => {
                 if self.armed.is_none() {
                     self.arm_from_physical(ArmMode::Away, false, now);
@@ -1103,7 +1164,11 @@ impl Panel {
 
     fn arm_from_physical(&mut self, mode: ArmMode, night: bool, now: Instant) {
         let night = night && self.model == Model::Vista20p;
-        if self.armed.is_some_and(|a| a.mode == mode && !a.no_entry) && self.vista_night == night {
+        // Preserve local no_entry (Instant / Maximum) when Two-Way HA confirms Stay/Away.
+        let keep_no_entry = self.panel_link == PanelLink::TwoWay
+            && (self.armed.is_some_and(|a| a.mode == mode && a.no_entry)
+                || self.exit.is_some_and(|e| matches!(e.how, ArmHow::NoEntry | ArmHow::MaxKey)));
+        if self.armed.is_some_and(|a| a.mode == mode && a.no_entry == keep_no_entry) && self.vista_night == night {
             return;
         }
         if self.armed.is_none() && self.alarms.is_empty() {
@@ -1119,7 +1184,8 @@ impl Panel {
         }
         let night_zones = if night { self.vista_zone_list(5) } else { 0 };
         for z in 1..=self.n() {
-            let auto_bypass = mode == ArmMode::Stay && self.cfg(z).kind.is_stay_away()
+            let auto_bypass = mode == ArmMode::Stay
+                && self.cfg(z).kind.is_stay_away()
                 && night_zones & (1u64 << (z - 1)) == 0;
             let zone = &mut self.zones[z - 1];
             if !zone.bypassed || zone.auto_bypass {
@@ -1130,17 +1196,23 @@ impl Panel {
         self.exit = None;
         self.vista_night = night;
         self.armed = Some(ArmedRt {
-            mode, no_entry: false, user: 0, since: now, quick_exit: None, shunt_until: None, reactivate_at: None,
+            mode,
+            no_entry: keep_no_entry,
+            user: 0,
+            since: now,
+            quick_exit: None,
+            shunt_until: None,
+            reactivate_at: None,
         });
         let state = self.physical_state.map_or("Armed", AlarmState::label);
-        self.log(EvKind::Arm, format!("Following physical panel: {state}"));
+        self.log(EvKind::Arm, format!("Synced with Home Assistant panel: {state}"));
         self.out.push(Out::Save);
     }
 
     pub fn physical_phase(&self) -> Option<(StatusKind, &'static str)> {
         use AlarmState::*;
         match self.physical_state? {
-            Arming => Some((StatusKind::Exit, "Physical panel arming")),
+            Arming if self.exit.is_none() && self.armed.is_none() => Some((StatusKind::Exit, "Physical panel arming")),
             Pending => Some((StatusKind::Entry, "Physical panel entry delay")),
             Triggered => Some((StatusKind::Alarm, "Physical panel alarm")),
             Disarming => Some((StatusKind::Armed, "Physical panel disarming")),
@@ -1150,10 +1222,11 @@ impl Panel {
 
     pub fn physical_lcd(&self) -> Option<(&'static str, &'static str)> {
         use AlarmState::*;
+        let two_way = self.panel_link == PanelLink::TwoWay;
         match self.physical_state? {
-            Arming => Some(("EXIT DELAY", "PHYSICAL PANEL")),
-            Pending => Some(("ENTRY DELAY", "DISARM AT PANEL")),
-            Triggered => Some(("PANEL ALARM", "CHECK REAL PANEL")),
+            Arming if self.exit.is_none() && self.armed.is_none() => Some(("EXIT DELAY", "PHYSICAL PANEL")),
+            Pending => Some(("ENTRY DELAY", if two_way { "ENTER YOUR CODE" } else { "DISARM AT PANEL" })),
+            Triggered => Some(("PANEL ALARM", if two_way { "ENTER CODE OFF" } else { "CHECK REAL PANEL" })),
             Disarming => Some(("DISARMING", "PHYSICAL PANEL")),
             _ => None,
         }
@@ -1249,6 +1322,19 @@ impl Panel {
         };
         self.log(EvKind::Arm, format!("{} by {}", what, self.who(user)));
         self.report(ReportKind::Closing, closing_cid, user as u16, format!("Closing by {}", self.who(user)), 0);
+        if self.panel_link == PanelLink::TwoWay {
+            let mode = match how {
+                ArmHow::StayKey | ArmHow::NoEntry => ArmMode::Stay,
+                _ => ArmMode::Away,
+            };
+            self.ha_outbound_until = Some(now + Duration::from_secs(4));
+            self.ha_expect_armed = Some(true);
+            self.out.push(Out::HaPanelCmd(HaPanelCmd::Arm {
+                mode,
+                night: false,
+                code: self.last_entered_code.take(),
+            }));
+        }
         self.out.push(Out::Armed(true));
         self.out.push(Out::Save);
         self.dirty = true;
@@ -1424,6 +1510,12 @@ impl Panel {
             }
             self.log(EvKind::Disarm, format!("Disarmed by {}", self.who(user)));
             self.report(ReportKind::Opening, 401, user as u16, format!("Opening by {}", self.who(user)), 0);
+            if self.panel_link == PanelLink::TwoWay {
+                self.physical_state = Some(AlarmState::Disarmed);
+                self.ha_outbound_until = Some(now + Duration::from_secs(4));
+                self.ha_expect_armed = Some(false);
+                self.out.push(Out::HaPanelCmd(HaPanelCmd::Disarm { code: self.last_entered_code.take() }));
+            }
         } else {
             self.log(EvKind::Disarm, "Physical panel disarmed");
         }
@@ -1458,13 +1550,15 @@ impl Panel {
         self.vista_pending_status = None;
         if zone > 0 && (zone as usize) <= self.n() {
             let limit = self.swinger_limit();
+            let swinger_enabled = self.model != Model::Pc1832
+                || self.ee.toggle(Model::Pc1832, &format!("{:03}", 100 + zone as usize), 6);
             let r = &mut self.zones[zone as usize - 1];
-            if limit > 0 && r.trips >= limit && !matches!(kind, AlarmKind::Fire) {
+            if swinger_enabled && limit > 0 && r.trips >= limit && !matches!(kind, AlarmKind::Fire) {
                 return;
             }
             r.trips = r.trips.saturating_add(1);
             r.alarm = true;
-            if r.trips == limit && limit > 0 {
+            if swinger_enabled && r.trips == limit && limit > 0 {
                 let label = self.label(zone as usize);
                 self.log(EvKind::Info, format!("Zone {} ({}) shut down after {} alarms (swinger)", zone, label, limit));
             }
@@ -1666,7 +1760,7 @@ impl Panel {
                     } else if buf == "#" {
                         "User attributes: 0 delete, 1 authority (0-4), 2 access group, 3 partition, 5 pager."
                     } else if buf == "#1" {
-                        "Authority level: 0 Standard, 1 Arm-Only, 2 Guest (disarms only if used to arm), 3 Duress (CID 121), 4 Partition Master."
+                        "Authority level: 0 Standard, 1 Arm-Only, 2 Guest, 3 Duress (CID 121), 4 Partition Master, 5 One-Time Maid/Guest."
                     } else if buf.starts_with('#') {
                         "Enter attribute value digit(s) to save."
                     } else if !first.is_empty() {
@@ -1808,6 +1902,7 @@ impl Panel {
                     ""
                 }
             }
+            KpMode::ZoneChime { .. } => "Zone chime: scroll zones with < >, press * to cycle tones (or 0=Off, 1-4 tone), # saves.",
             _ => "Scroll with < >, # goes back.",
         };
         text.to_string()
@@ -1924,7 +2019,7 @@ impl Panel {
             self.log(EvKind::Info, format!("Auto arm cancelled by {}", self.who(user)));
             return;
         }
-        if self.exit.is_some() || self.armed.is_some() {
+        if self.exit.is_some() || self.armed.is_some() || (self.panel_link == PanelLink::TwoWay && self.is_on()) {
             // PC1832 [008] Maintenance code can arm, but cannot disarm unless in alarm.
             if self.model == Model::Pc1832 && slot == "maint" && !self.alarm_sounding(now) {
                 self.error_tone();
@@ -1932,7 +2027,9 @@ impl Panel {
                 return;
             }
             let one_time = self.model == Model::Pc1832 && (self.ee.attrs(&slot) & (1 << 7)) != 0;
+            self.last_entered_code = Some(code.to_string());
             self.disarm(user, now);
+            self.last_entered_code = None;
             if one_time {
                 self.ee.clear_code(&slot);
                 self.log(EvKind::Program, format!("One-time code {} used and cleared", slot));
@@ -1944,7 +2041,9 @@ impl Panel {
         } else if self.alarms.iter().any(|a| !a.silenced) {
             self.silence(user);
         } else {
+            self.last_entered_code = Some(code.to_string());
             let armed = self.arm(ArmHow::Code, user, now);
+            self.last_entered_code = None;
             // PC1550 [13] Light 5: 6th user code is Maid's (one-time) code, erased after arming.
             if armed && self.model == Model::Pc1550 && slot == "6" && self.ee.toggle(self.model, "13", 5) {
                 self.ee.clear_code("6");
@@ -2075,11 +2174,15 @@ impl Panel {
                             KpMode::Normal
                         }
                         CodeFor::NoEntry => {
+                            self.last_entered_code = Some(code.to_string());
                             self.arm(ArmHow::NoEntry, user, now);
+                            self.last_entered_code = None;
                             KpMode::Normal
                         }
                         CodeFor::Arm(how) => {
+                            self.last_entered_code = Some(code.to_string());
                             self.arm(how, user, now);
+                            self.last_entered_code = None;
                             KpMode::Normal
                         }
                         _ => KpMode::Normal,
@@ -2353,9 +2456,18 @@ impl Panel {
             return KpMode::Program(p);
         };
         let kind = sp.kind;
+        let is_1550 = self.model == Model::Pc1550;
         let hex_digit = |d: u8, hex: bool| -> Option<char> {
             if hex {
-                if (1..=6).contains(&d) {
+                if is_1550 {
+                    // Authentic PC1550 Hex Mode: [*] + 0..=5 enters A..=F.
+                    if d <= 5 {
+                        Some((b'A' + d) as char)
+                    } else {
+                        None
+                    }
+                } else if (1..=6).contains(&d) {
+                    // Authentic PC1832 Hex Mode: [*] + 1..=6 enters A..=F.
                     Some((b'A' + d - 1) as char)
                 } else {
                     None
@@ -2835,10 +2947,9 @@ impl Panel {
             Model::Pc1832 => self.press_1832(key, now),
             Model::Vista20p => self.press_vista(key, now),
         }
-        // PowerSeries keypads: "These buttons can also be activated by
-        // pressing and holding numbers [1] through [5] respectively for 2
-        // seconds." Only the first digit of a code can start a hold.
-        if self.model == Model::Pc1832 && matches!(key, Key::Digit(1..=5)) && matches!(self.kp, KpMode::Normal) && self.buf.len() == 1 {
+        // PowerSeries keypads: holding [1]..=[5] for 2 seconds triggers function
+        // keys 1..=5, and holding [0] for 2 seconds triggers Quick Exit (or Quick Arm).
+        if self.model == Model::Pc1832 && matches!(key, Key::Digit(0..=5)) && matches!(self.kp, KpMode::Normal) && self.buf.len() == 1 {
             self.held = Some(HeldKey { key, since: now, fired: false });
         }
     }
@@ -2921,6 +3032,25 @@ impl Panel {
             return;
         }
         if self.model == Model::Vista20p {
+            return;
+        }
+        // Holding [0] for 2 seconds on GuardSeries PC1832 triggers Quick Exit (when armed)
+        // or Quick Arm (when disarmed & quick arm enabled).
+        if self.model == Model::Pc1832 && key == Key::Digit(0) {
+            self.buf.clear();
+            if !matches!(self.kp, KpMode::Normal) {
+                self.error_tone();
+                self.temp_at("Function Not", "Available", 2000, now);
+                return;
+            }
+            if self.armed.is_some() {
+                self.quick_exit(now);
+            } else if self.exit.is_none() && self.quick_arm_enabled() {
+                self.arm(ArmHow::Quick, 0, now);
+            } else {
+                self.error_tone();
+                self.temp_at("Function Not", "Available", 2000, now);
+            }
             return;
         }
         // A held 1 to 5 on the PowerSeries is function key 1 to 5.

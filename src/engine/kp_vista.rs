@@ -581,6 +581,7 @@ impl Panel {
                     if let Some(slot) = self.ee.find_code(&code) {
                         self.bad_codes = 0;
                         let user = eeprom::slot_user(&slot);
+                        self.last_entered_code = Some(code);
                         if urgent {
                             self.vista_code_disarm = Some((now + Duration::from_secs(15), user, slot.clone()));
                         }
@@ -1141,7 +1142,7 @@ impl Panel {
                         return VistaKp::Normal;
                     }
                     match buf.as_str() {
-                        "#1" if d <= 4 => {
+                        "#1" if d <= 5 => {
                             let attrs = (self.ee.attrs(&slot) & !0x07) | d;
                             self.ee.set_attrs(&slot, attrs);
                             let name = match d {
@@ -1149,6 +1150,7 @@ impl Panel {
                                 2 => "Guest",
                                 3 => "Duress",
                                 4 => "Partition Master",
+                                5 => "One-Time Maid/Guest",
                                 _ => "Standard",
                             };
                             self.vista_confirm_beep();
@@ -2282,7 +2284,7 @@ impl Panel {
                 } else if buf == "#" {
                     (format!("U{} ATTR: #0/1/2/5", slot), 15)
                 } else if buf == "#1" {
-                    (format!("U{} AUTH (0-4):_", slot), 15)
+                    (format!("U{} AUTH (0-5):_", slot), 15)
                 } else if buf == "#2" {
                     (format!("U{} GROUP (0-8):_", slot), 15)
                 } else if buf.starts_with("#3") {
@@ -2532,7 +2534,8 @@ impl Panel {
         let mut trouble_screens: Vec<(String, String)> = Vec::new();
         if (self.troubles & (tb::ZONE_FAULT | tb::ZONE_TAMPER | tb::HOME_SENSOR)) != 0 {
             for z in 1..=self.n() {
-                if self.camera_zone.get(z - 1).copied().unwrap_or(false) && self.violated(z) {
+                let cam_fault = self.camera_zone.get(z - 1).copied().unwrap_or(false) && self.violated(z);
+                if cam_fault || self.zones[z - 1].fault || self.zones[z - 1].tamper {
                     let lbl = self.label(z).to_ascii_uppercase();
                     trouble_screens.push(split_zone_lines("CHECK", z as u8, &lbl));
                 }
@@ -2574,15 +2577,19 @@ impl Panel {
         self.vista_code_disarm = None;
         self.vista_sounder_mute_until = None;
         self.vista_entry_mute_until = None;
-        let is_armed = self.armed.is_some() || self.exit.is_some();
+        let is_armed = self.armed.is_some()
+            || self.exit.is_some()
+            || (self.panel_link == crate::home_assistant::PanelLink::TwoWay && self.is_on());
         let has_live_alarm = self.alarms.iter().any(|a| !a.silenced);
 
         // Enforce VISTA-20P authority levels (User Guide p.28):
         //   - Installer code can only disarm if it was used to arm.
         //   - Authority 1 (Arm-Only) cannot disarm or silence.
-        //   - Authority 2 (Guest/Babysitter) can only disarm if used to arm.
+        //   - Authority 2 (Guest/Babysitter) & 5 (One-Time Maid/Guest) can only disarm if used to arm;
+        //     Authority 5 automatically deletes itself after completing one arm+disarm cycle.
         //   - Authority 3 (Duress) acts normally and silently sends CID 121 Duress.
         if slot == "inst" && is_armed && !self.vista_armed_by_inst {
+            self.last_entered_code = None;
             self.error_tone();
             return;
         }
@@ -2592,10 +2599,12 @@ impl Panel {
             self.ee.attrs(slot) & 0x07
         };
         if auth == 1 && (is_armed || has_live_alarm || self.entry.is_some()) {
+            self.last_entered_code = None;
             self.error_tone();
             return;
         }
-        if auth == 2 && is_armed && self.vista_armed_by_slot.as_deref() != Some(slot) {
+        if matches!(auth, 2 | 5) && is_armed && self.vista_armed_by_slot.as_deref() != Some(slot) {
+            self.last_entered_code = None;
             self.error_tone();
             return;
         }
@@ -2605,6 +2614,7 @@ impl Panel {
 
         let status_at = now + Duration::from_millis(2190);
         if self.walk_test {
+            self.last_entered_code = None;
             self.walk_test = false;
             self.vista_test_since = None;
             self.vista_off_beep();
@@ -2619,10 +2629,16 @@ impl Panel {
             } else {
                 self.silence(user);
             }
+            self.last_entered_code = None;
             self.vista_off_beep();
             self.vista_armed_by_inst = false;
             self.vista_armed_by_slot = None;
             self.vista_night = false;
+            if auth == 5 && is_armed && !slot.is_empty() {
+                self.ee.clear_code(slot);
+                self.log(EvKind::Program, format!("One-time code {} used and cleared", slot));
+                self.out.push(Out::Save);
+            }
             if let Some((z, k)) = alarmed_info {
                 self.vista_alarm_mem_zone = Some((z, k));
                 self.vista_pending_status = None;
@@ -2666,6 +2682,13 @@ impl Panel {
         self.vista_night = true;
         self.vista_unbypass_night_zones();
         self.log(EvKind::Arm, "Armed NIGHT-STAY");
+        if self.panel_link == crate::home_assistant::PanelLink::TwoWay {
+            self.out.push(Out::HaPanelCmd(HaPanelCmd::Arm {
+                mode: ArmMode::Stay,
+                night: true,
+                code: self.last_entered_code.take(),
+            }));
+        }
         self.out.push(Out::Save);
         self.vista_arm_beeps();
         let toks = self.vista_exit_tokens(ArmHow::StayKey);
@@ -2745,6 +2768,13 @@ impl Panel {
         }
         self.beeps(2);
         self.log(EvKind::Arm, "Armed AWAY (step arming)");
+        if self.panel_link == crate::home_assistant::PanelLink::TwoWay {
+            self.out.push(Out::HaPanelCmd(HaPanelCmd::Arm {
+                mode: ArmMode::Away,
+                night: false,
+                code: None,
+            }));
+        }
         self.out.push(Out::Save);
         if exiting {
             self.vista_exit_voice_done = true;

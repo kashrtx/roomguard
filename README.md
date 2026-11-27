@@ -117,25 +117,22 @@ The display can be off while RoomGuard runs. Keep the computer awake, the camera
 
 For a dedicated external siren speaker, use a stable, ventilated spot away from vents, fabrics, and exit paths. Try **Settings → Sound → Test** after the speaker has been idle and check where it can be heard.
 
-## Home Assistant sensors
+## Home Assistant ecosystem (wireless sensors & two-way panels)
 
-Use [the Windows Home Assistant lab](docs/HOME_ASSISTANT_WINDOWS.md) to test with virtual sensors and an alarm panel on your Windows PC.
+Use [the beginner-friendly Windows Home Assistant guide](docs/HOME_ASSISTANT_WINDOWS.md) to set up virtual sensors and a test alarm panel step by step (`docs/roomguard_lab.yaml`).
 
-1. In your Home Assistant profile, create a long-lived access token. In RoomGuard open **Settings → Home Assistant → Connection**, enter the base URL and token, and select **Connect**. Use HTTPS when connecting remotely. RoomGuard saves the token in its local configuration.
-2. Search for an entity and choose an enabled zone. For a door or motion sensor, **Is on** usually means the zone is open. For a numeric sensor, choose **Above** or **Below** and enter a threshold. **Changes** briefly opens a zone on a live state change, useful for event entities. Zone definitions still decide which alarm behavior applies.
-3. Open and close the sensor while disarmed and check its zone on the keypad. A disconnected or unavailable sensor appears as a zone fault. On connection and reconnection, RoomGuard first reads the current states and then reacts to live changes.
+1. In Home Assistant, click your profile (bottom-left) -> **Security** -> **Long-lived access tokens** -> **Create token**.
+2. In RoomGuard, open **Settings -> Home Assistant -> Connection**, enter your Home Assistant base URL and token, and click **Connect**. A live status card shows a **green checkmark** when connected, an animated **connecting** ring while connecting, and a **red X** if disconnected manually or if a network/VM drop is detected automatically.
+3. Under **Wireless sensors -> Zones**, map any Zigbee, Z-Wave, Matter, Wi-Fi, ESPHome, or virtual sensor (door/window contact, motion, smoke, CO, leak, lock, cover, temperature, or button event) to any enabled RoomGuard zone. RoomGuard fills in sensible default rules automatically and treats `unavailable` sensors as supervisory zone faults instead of false alarms. Select a camera entity and click **Load snapshot** for an on-demand JPEG preview.
+4. Turn off **Use webcam** in **Settings -> Home Assistant** or **Settings -> Camera** if you want to run purely on Home Assistant sensors while keeping phone alerts active.
 
-Any readable entity with a compatible state can be a zone source. Each zone has one source and the panel still sets the number of zones. Pairing, battery status, and device configuration stay in Home Assistant. Select a camera entity and choose **Load snapshot** for one on-demand JPEG preview. For camera motion, assign a motion entity exposed by Home Assistant. Previewing a camera starts no continuous stream or tracking worker.
+### Two-way alarm panel sync
 
-Turn off **Use webcam** in **Settings → Home Assistant** or **Settings → Camera** to stop webcam capture and tracking. Home Assistant zones remain active and phone alerts can still send text.
+Connect a real physical alarm panel to Home Assistant through a compatible bridge (such as Envisalink, Keybus Interface, ESPHome ECP, or Alarmo), or load the test lab panel from [`docs/roomguard_lab.yaml`](docs/roomguard_lab.yaml), then select its `alarm_control_panel.*` entity under **Settings -> Home Assistant -> Alarm panel sync**:
 
-### Follow a physical alarm panel
-
-Connect the real panel to Home Assistant through a compatible bridge, then select its partition in **Settings → Home Assistant → Follow physical panel**. This works with the Classic LED, PowerSeries LCD, and VISTA voice layouts. Arm and disarm at the physical keypad. RoomGuard shows the states the bridge provides, including entry delay and alarm, and applies Stay or Away to its own zones. Night uses the VISTA Night-Stay zone list on the VISTA layout and Stay on the two DSC layouts. Vacation and custom bypass use RoomGuard’s Away rules.
-
-Phone alerts can include evidence from RoomGuard’s camera for a physical panel alarm. The panel link leaves the physical siren in charge of those alarms. RoomGuard still monitors its own zones and uses its local siren and quiet-alert settings for its own alarms. A lost connection shows a fault and keeps the last confirmed arming mode until the link returns.
-
-[Envisalink](https://www.home-assistant.io/integrations/envisalink/), the [DSC Keybus Interface](https://github.com/taligentx/dscKeybusInterface), and [ESPHome VISTA ECP](https://github.com/Dilbert66/esphome-vistaECP) are examples of bridges. RoomGuard needs the integration to publish an `alarm_control_panel` entity for the partition you want to follow.
+- **Two-way sync (recommended):** Arm and disarm from **either** the real panel / Home Assistant **or** RoomGuard's virtual keypad. Enter the Home Assistant panel PIN in Settings (or leave it blank to forward the code typed on RoomGuard's keypad). Stay, Away, Night-Stay, Entry Delay, Alarm, and Disarm stay synchronized in both directions without echo loops.
+- **Follow physical panel only:** Read-only mirror mode where arming and disarming stay exclusively on the real wall keypad while RoomGuard displays the partition state and guards your room zones.
+- If the Home Assistant connection drops while armed, RoomGuard immediately reports the disconnect, raises a link trouble, and keeps its last confirmed arming state until the link returns.
 
 ## Experimental builds
 

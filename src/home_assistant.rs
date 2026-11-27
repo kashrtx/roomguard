@@ -1,6 +1,7 @@
-//! Read-only Home Assistant entity discovery, live states, and on-demand camera snapshots.
+//! Home Assistant entity discovery, live states, two-way alarm panel control,
+//! and on-demand camera snapshots.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{ErrorKind, Read};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::{mpsc, Arc};
@@ -15,6 +16,23 @@ use tungstenite::{Message, WebSocket};
 use crate::engine::{types::Model, EngineMsg};
 use crate::vision::frame::{decode_jpeg_file, Rgb};
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PanelSyncMode {
+    /// Arm and disarm from either the physical Home Assistant panel or RoomGuard's keypad.
+    #[default]
+    TwoWay,
+    /// Read-only mirror: arm and disarm only at the physical panel.
+    FollowOnly,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PanelLink {
+    #[default]
+    Independent,
+    FollowOnly,
+    TwoWay,
+}
+
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -23,12 +41,17 @@ pub struct Config {
     pub token: String,
     pub bindings: Vec<Binding>,
     pub follow_panel: Option<String>,
+    pub panel_sync: PanelSyncMode,
+    pub panel_code: String,
 }
 
 impl std::fmt::Debug for Config {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("HomeAssistant").field("enabled", &self.enabled)
-            .field("bindings", &self.bindings.len()).finish_non_exhaustive()
+        f.debug_struct("HomeAssistant")
+            .field("enabled", &self.enabled)
+            .field("bindings", &self.bindings.len())
+            .field("panel_sync", &self.panel_sync)
+            .finish_non_exhaustive()
     }
 }
 
@@ -37,9 +60,33 @@ impl Config {
         self.follow_panel.as_deref().filter(|id| self.enabled && id.starts_with("alarm_control_panel."))
     }
 
+    pub fn panel_link(&self) -> PanelLink {
+        if self.followed_panel().is_none() {
+            PanelLink::Independent
+        } else {
+            match self.panel_sync {
+                PanelSyncMode::FollowOnly => PanelLink::FollowOnly,
+                PanelSyncMode::TwoWay => PanelLink::TwoWay,
+            }
+        }
+    }
+
     pub fn binding(&self, model: Model, zone: u8) -> Option<&Binding> {
         self.bindings.iter().find(|binding| binding.model == model && binding.zone == zone)
     }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum ConnectionState {
+    /// Manually disconnected or not yet configured.
+    #[default]
+    Disconnected,
+    /// Establishing or re-establishing the WebSocket session.
+    Connecting,
+    /// Live WebSocket authenticated and synced with entity states.
+    Connected,
+    /// Automatically detected disconnect, timeout, or authentication error.
+    Error(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -89,6 +136,34 @@ impl AlarmState {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AlarmAction {
+    Disarm,
+    ArmHome,
+    ArmAway,
+    ArmNight,
+}
+
+impl AlarmAction {
+    pub fn service(self) -> &'static str {
+        match self {
+            Self::Disarm => "alarm_disarm",
+            Self::ArmHome => "alarm_arm_home",
+            Self::ArmAway => "alarm_arm_away",
+            Self::ArmNight => "alarm_arm_night",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Disarm => "Disarm",
+            Self::ArmHome => "Arm Stay",
+            Self::ArmAway => "Arm Away",
+            Self::ArmNight => "Arm Night",
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct Binding {
     pub model: Model,
@@ -98,7 +173,7 @@ pub struct Binding {
     pub operand: String,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Rule {
     Equals,
     NotEquals,
@@ -129,14 +204,15 @@ impl Rule {
     }
 
     pub fn active(self, state: &str, operand: &str) -> Option<bool> {
-        if matches!(state, "unknown" | "unavailable" | "") {
+        let s = state.trim();
+        if s.is_empty() || s.eq_ignore_ascii_case("unknown") || s.eq_ignore_ascii_case("unavailable") {
             return None;
         }
         Some(match self {
-            Self::Equals => state == operand.trim(),
-            Self::NotEquals => state != operand.trim(),
-            Self::Above => number(state)? > number(operand)?,
-            Self::Below => number(state)? < number(operand)?,
+            Self::Equals => s.eq_ignore_ascii_case(operand.trim()),
+            Self::NotEquals => !s.eq_ignore_ascii_case(operand.trim()),
+            Self::Above => number(s)? > number(operand)?,
+            Self::Below => number(s)? < number(operand)?,
             Self::Changes => false,
         })
     }
@@ -160,6 +236,10 @@ pub struct Entity {
 struct Attributes {
     friendly_name: Option<String>,
     unit_of_measurement: Option<String>,
+    device_class: Option<String>,
+    supported_features: Option<u32>,
+    code_format: Option<String>,
+    code_arm_required: Option<bool>,
 }
 
 impl Entity {
@@ -177,6 +257,34 @@ impl Entity {
 
     pub fn binary(&self) -> bool {
         self.entity_id.starts_with("binary_sensor.")
+            || self.entity_id.starts_with("input_boolean.")
+            || self.entity_id.starts_with("switch.")
+    }
+
+    pub fn supports_night(&self) -> bool {
+        // HA AlarmControlPanelEntityFeature.ARM_NIGHT = 4
+        self.attributes.supported_features.map_or(true, |f| (f & 4) != 0)
+    }
+
+    pub fn needs_code(&self) -> bool {
+        self.attributes.code_format.as_deref().is_some_and(|fmt| !fmt.trim().is_empty())
+    }
+
+    pub fn code_arm_required(&self) -> bool {
+        self.attributes.code_arm_required.unwrap_or(false)
+    }
+
+    pub fn default_rule_and_operand(&self) -> (Rule, String) {
+        let domain = self.entity_id.split('.').next().unwrap_or("");
+        match domain {
+            "event" => (Rule::Changes, String::new()),
+            "binary_sensor" | "input_boolean" | "switch" | "light" | "fan" => (Rule::Equals, "on".into()),
+            "cover" => (Rule::Equals, "open".into()),
+            "lock" => (Rule::Equals, "unlocked".into()),
+            "person" | "device_tracker" => (Rule::Equals, "home".into()),
+            "sensor" | "input_number" | "number" if number(&self.state).is_some() => (Rule::Above, self.state.clone()),
+            _ => (Rule::Equals, "on".into()),
+        }
     }
 
     pub fn description(&self) -> String {
@@ -190,9 +298,10 @@ impl Entity {
 pub type Entities = BTreeMap<String, Entity>;
 
 pub enum Update {
-    Status(String),
+    Connection(ConnectionState),
     Snapshot(Entities),
     State { id: String, entity: Option<Entity> },
+    ServiceResult { action: AlarmAction, result: Result<(), String> },
     Preview { id: String, result: Result<Arc<Rgb>, String> },
 }
 
@@ -202,14 +311,27 @@ struct Connection {
     token: String,
 }
 
+#[derive(Clone, Debug)]
+struct ServiceCall {
+    epoch: u64,
+    entity_id: String,
+    action: AlarmAction,
+    code: Option<String>,
+}
+
 pub struct Handle {
     config: mpsc::Sender<Option<Connection>>,
+    calls: mpsc::Sender<ServiceCall>,
     previews: mpsc::SyncSender<(Connection, String)>,
 }
 
 impl Handle {
     pub fn configure(&self, cfg: &Config, epoch: u64) {
         let _ = self.config.send(cfg.enabled.then(|| connection(cfg, epoch)));
+    }
+
+    pub fn call_alarm(&self, epoch: u64, entity_id: String, action: AlarmAction, code: Option<String>) {
+        let _ = self.calls.send(ServiceCall { epoch, entity_id, action, code });
     }
 
     pub fn preview(&self, cfg: &Config, epoch: u64, id: String) -> bool {
@@ -223,40 +345,49 @@ fn connection(cfg: &Config, epoch: u64) -> Connection {
 
 pub fn start(engine: mpsc::Sender<EngineMsg>) -> Handle {
     let (config, settings) = mpsc::channel();
+    let (calls, call_rx) = mpsc::channel();
     let (previews, requests) = mpsc::sync_channel::<(Connection, String)>(1);
     let updates = engine.clone();
-    let _ = std::thread::Builder::new().name("home-assistant".into()).spawn(move || run(settings, updates));
+    let _ = std::thread::Builder::new()
+        .name("home-assistant".into())
+        .spawn(move || run(settings, call_rx, updates));
     let _ = std::thread::Builder::new().name("home-assistant-preview".into()).spawn(move || {
         for (cfg, id) in requests {
             let result = preview(&cfg, &id).map(Arc::new);
             emit(&engine, cfg.epoch, Update::Preview { id, result });
         }
     });
-    Handle { config, previews }
+    Handle { config, calls, previews }
 }
 
 fn emit(engine: &mpsc::Sender<EngineMsg>, epoch: u64, update: Update) {
     let _ = engine.send(EngineMsg::HomeAssistant { epoch, update });
 }
 
-fn run(settings: mpsc::Receiver<Option<Connection>>, engine: mpsc::Sender<EngineMsg>) {
+fn run(
+    settings: mpsc::Receiver<Option<Connection>>,
+    calls: mpsc::Receiver<ServiceCall>,
+    engine: mpsc::Sender<EngineMsg>,
+) {
     let mut selected = None;
     loop {
-        if let Ok(newest) = settings.try_recv() {
+        while let Ok(newest) = settings.try_recv() {
             selected = newest;
         }
         let Some(cfg) = selected.as_ref() else {
+            // Drain any stale queued calls while disconnected.
+            while calls.try_recv().is_ok() {}
             match settings.recv() {
                 Ok(cfg) => selected = cfg,
                 Err(_) => return,
             }
             continue;
         };
-        emit(&engine, cfg.epoch, Update::Status("Connecting to Home Assistant…".into()));
-        match session(cfg, &settings, &engine) {
+        emit(&engine, cfg.epoch, Update::Connection(ConnectionState::Connecting));
+        match session(cfg, &settings, &calls, &engine) {
             Ok(next) => selected = next,
             Err(error) => {
-                emit(&engine, cfg.epoch, Update::Status(error));
+                emit(&engine, cfg.epoch, Update::Connection(ConnectionState::Error(error)));
                 match settings.recv_timeout(Duration::from_secs(4)) {
                     Ok(next) => selected = next,
                     Err(mpsc::RecvTimeoutError::Disconnected) => return,
@@ -268,7 +399,10 @@ fn run(settings: mpsc::Receiver<Option<Connection>>, engine: mpsc::Sender<Engine
 }
 
 fn endpoint(cfg: &Connection) -> Result<tungstenite::http::Uri, String> {
-    let uri = cfg.url.parse::<tungstenite::http::Uri>().map_err(|_| "Enter a Home Assistant URL starting with http:// or https://".to_string())?;
+    let uri = cfg
+        .url
+        .parse::<tungstenite::http::Uri>()
+        .map_err(|_| "Enter a Home Assistant URL starting with http:// or https://".to_string())?;
     if !matches!(uri.scheme_str(), Some("http" | "https"))
         || uri.host().is_none()
         || uri.authority().is_some_and(|authority| authority.as_str().contains('@'))
@@ -291,7 +425,9 @@ fn open(cfg: &Connection) -> Result<Socket, String> {
     let hostname = uri.host().unwrap_or_default().trim_matches(&['[', ']'][..]);
     let port = uri.port_u16().unwrap_or(if secure { 443 } else { 80 });
     let addresses = (hostname, port).to_socket_addrs().map_err(|_| "Home Assistant host could not be resolved")?;
-    let tcp = addresses.take(4).find_map(|address| TcpStream::connect_timeout(&address, Duration::from_secs(3)).ok())
+    let tcp = addresses
+        .take(4)
+        .find_map(|address| TcpStream::connect_timeout(&address, Duration::from_secs(3)).ok())
         .ok_or("Home Assistant is unreachable")?;
     tcp.set_read_timeout(Some(Duration::from_secs(4))).map_err(|_| "Could not set Home Assistant read timeout")?;
     tcp.set_write_timeout(Some(Duration::from_secs(4))).map_err(|_| "Could not set Home Assistant write timeout")?;
@@ -310,7 +446,7 @@ fn open(cfg: &Connection) -> Result<Socket, String> {
         MaybeTlsStream::Rustls(tls) => &mut tls.sock,
         _ => return Err("Unsupported Home Assistant connection".into()),
     };
-    tcp.set_read_timeout(Some(Duration::from_millis(350))).map_err(|_| "Could not set Home Assistant read timeout")?;
+    tcp.set_read_timeout(Some(Duration::from_millis(100))).map_err(|_| "Could not set Home Assistant read timeout")?;
     Ok(socket)
 }
 
@@ -321,6 +457,10 @@ fn send(socket: &mut Socket, value: Value) -> Result<(), String> {
 fn read(socket: &mut Socket) -> Result<Option<Value>, String> {
     match socket.read() {
         Ok(Message::Text(text)) => serde_json::from_str(&text).map(Some).map_err(|_| "Invalid message from Home Assistant".into()),
+        Ok(Message::Ping(payload)) => {
+            let _ = socket.send(Message::Pong(payload));
+            Ok(None)
+        }
         Ok(Message::Close(_)) => Err("Home Assistant closed the connection".into()),
         Ok(_) => Ok(None),
         Err(tungstenite::Error::Io(error)) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted) => Ok(None),
@@ -354,7 +494,27 @@ fn state_change(message: &Value) -> Option<(String, Option<Entity>)> {
     Some((id, entity))
 }
 
-fn session(cfg: &Connection, settings: &mpsc::Receiver<Option<Connection>>, engine: &mpsc::Sender<EngineMsg>) -> Result<Option<Connection>, String> {
+fn service_call_payload(id: u64, call: &ServiceCall) -> Value {
+    let mut service_data = serde_json::Map::new();
+    service_data.insert("entity_id".into(), json!(call.entity_id));
+    if let Some(code) = call.code.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+        service_data.insert("code".into(), json!(code));
+    }
+    json!({
+        "id": id,
+        "type": "call_service",
+        "domain": "alarm_control_panel",
+        "service": call.action.service(),
+        "service_data": service_data,
+    })
+}
+
+fn session(
+    cfg: &Connection,
+    settings: &mpsc::Receiver<Option<Connection>>,
+    calls: &mpsc::Receiver<ServiceCall>,
+    engine: &mpsc::Sender<EngineMsg>,
+) -> Result<Option<Connection>, String> {
     let mut socket = open(cfg)?;
     wait_for(&mut socket, |message| message["type"] == "auth_required")?;
     send(&mut socket, json!({"type":"auth","access_token":cfg.token}))?;
@@ -374,10 +534,11 @@ fn session(cfg: &Connection, settings: &mpsc::Receiver<Option<Connection>>, engi
 
     let deadline = Instant::now() + Duration::from_secs(12);
     let mut buffered: BTreeMap<String, Option<Entity>> = BTreeMap::new();
+    let mut pending_calls: HashMap<u64, AlarmAction> = HashMap::new();
     let mut online = false;
-    let mut ping_id = 2u64;
-    let mut next_ping = Instant::now() + Duration::from_secs(15);
-    let mut awaiting_pong = false;
+    let mut next_id = 2u64;
+    let mut active_ping: Option<(u64, Instant)> = None;
+    let mut next_ping = Instant::now() + Duration::from_secs(6);
     loop {
         match settings.try_recv() {
             Ok(next) => return Ok(next),
@@ -388,36 +549,69 @@ fn session(cfg: &Connection, settings: &mpsc::Receiver<Option<Connection>>, engi
         if !online && now >= deadline {
             return Err("Home Assistant did not return entity states".into());
         }
-        if now >= next_ping {
-            if awaiting_pong {
+        // Send any outbound two-way alarm panel service calls once online.
+        if online {
+            while let Ok(call) = calls.try_recv() {
+                if call.epoch != cfg.epoch {
+                    continue;
+                }
+                next_id += 1;
+                let payload = service_call_payload(next_id, &call);
+                send(&mut socket, payload)?;
+                pending_calls.insert(next_id, call.action);
+            }
+        }
+        if let Some((_, sent_at)) = active_ping {
+            if now.saturating_duration_since(sent_at) >= Duration::from_secs(5) {
                 return Err("Home Assistant stopped responding".into());
             }
-            ping_id += 1;
-            send(&mut socket, json!({"id":ping_id,"type":"ping"}))?;
-            next_ping = now + Duration::from_secs(15);
-            awaiting_pong = true;
+        } else if now >= next_ping {
+            next_id += 1;
+            send(&mut socket, json!({"id":next_id,"type":"ping"}))?;
+            active_ping = Some((next_id, now));
         }
         let Some(message) = read(&mut socket)? else { continue };
-        if message["type"] == "pong" && message["id"] == ping_id {
-            awaiting_pong = false;
+        // Any valid frame proves the connection is alive; schedule next ping cleanly.
+        if message["type"] == "pong" && active_ping.is_some_and(|(pid, _)| message["id"] == pid) {
+            active_ping = None;
+            next_ping = Instant::now() + Duration::from_secs(6);
         } else if !online && message["type"] == "result" && message["id"] == 2 {
             if message["success"] != true {
                 return Err("Home Assistant denied access to entity states".into());
             }
             let states = message["result"].as_array().ok_or("Invalid entity list from Home Assistant")?;
-            let mut entities: Entities = states.iter().filter_map(|state| serde_json::from_value::<Entity>(state.clone()).ok())
-                .map(|entity| (entity.entity_id.clone(), entity)).collect();
+            let mut entities: Entities = states
+                .iter()
+                .filter_map(|state| serde_json::from_value::<Entity>(state.clone()).ok())
+                .map(|entity| (entity.entity_id.clone(), entity))
+                .collect();
             for (id, entity) in std::mem::take(&mut buffered) {
                 match entity {
                     Some(entity) if entities.get(&id).map_or(true, |baseline| baseline.last_updated <= entity.last_updated) => {
                         entities.insert(id, entity);
                     }
-                    None => { entities.remove(&id); }
+                    None => {
+                        entities.remove(&id);
+                    }
                     _ => {}
                 }
             }
             emit(engine, cfg.epoch, Update::Snapshot(entities));
             online = true;
+        } else if message["type"] == "result" {
+            if let Some(id) = message["id"].as_u64() {
+                if let Some(action) = pending_calls.remove(&id) {
+                    let result = if message["success"] == true {
+                        Ok(())
+                    } else {
+                        let detail = message["error"]["message"]
+                            .as_str()
+                            .unwrap_or("Home Assistant rejected the panel command");
+                        Err(detail.to_owned())
+                    };
+                    emit(engine, cfg.epoch, Update::ServiceResult { action, result });
+                }
+            }
         } else if let Some((id, entity)) = state_change(&message) {
             if online {
                 emit(engine, cfg.epoch, Update::State { id, entity });
@@ -460,8 +654,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sensor_rules_handle_binary_numeric_and_unavailable_states() {
+    fn sensor_rules_handle_binary_numeric_case_and_unavailable_states() {
         assert_eq!(Rule::Equals.active("on", "on"), Some(true));
+        assert_eq!(Rule::Equals.active("ON", "on"), Some(true));
         assert_eq!(Rule::Equals.active("off", "on"), Some(false));
         assert_eq!(Rule::Above.active("20.1", "20"), Some(true));
         assert_eq!(Rule::Below.active("19.9", "20"), Some(true));
@@ -484,9 +679,55 @@ mod tests {
         removed["event"]["data"]["new_state"] = Value::Null;
         assert!(state_change(&removed).unwrap().1.is_none());
     }
+
+    #[test]
+    fn service_call_payload_includes_code_only_when_provided() {
+        let with_code = service_call_payload(
+            7,
+            &ServiceCall {
+                epoch: 1,
+                entity_id: "alarm_control_panel.roomguard_test_panel".into(),
+                action: AlarmAction::Disarm,
+                code: Some("1234".into()),
+            },
+        );
+        assert_eq!(with_code["type"], "call_service");
+        assert_eq!(with_code["domain"], "alarm_control_panel");
+        assert_eq!(with_code["service"], "alarm_disarm");
+        assert_eq!(with_code["service_data"]["code"], "1234");
+
+        let without_code = service_call_payload(
+            8,
+            &ServiceCall {
+                epoch: 1,
+                entity_id: "alarm_control_panel.roomguard_test_panel".into(),
+                action: AlarmAction::ArmAway,
+                code: Some("   ".into()),
+            },
+        );
+        assert_eq!(without_code["service"], "alarm_arm_away");
+        assert!(without_code["service_data"].get("code").is_none());
+    }
+
+    #[test]
+    fn entity_smart_defaults_cover_common_wireless_sensor_domains() {
+        let mk = |entity_id: &str, state: &str| Entity {
+            entity_id: entity_id.into(),
+            state: state.into(),
+            attributes: Attributes::default(),
+            last_updated: String::new(),
+        };
+        assert_eq!(mk("binary_sensor.front_door", "off").default_rule_and_operand(), (Rule::Equals, "on".into()));
+        assert_eq!(mk("input_boolean.roomguard_lab_door", "off").default_rule_and_operand(), (Rule::Equals, "on".into()));
+        assert_eq!(mk("cover.garage", "closed").default_rule_and_operand(), (Rule::Equals, "open".into()));
+        assert_eq!(mk("lock.front_door", "locked").default_rule_and_operand(), (Rule::Equals, "unlocked".into()));
+        assert_eq!(mk("sensor.temp", "22.5").default_rule_and_operand(), (Rule::Above, "22.5".into()));
+        assert_eq!(mk("event.doorbell", "unknown").default_rule_and_operand(), (Rule::Changes, String::new()));
+    }
+
     #[test]
     #[ignore = "requires local loopback sockets"]
-    fn websocket_merges_initial_state_then_delivers_live_updates() {
+    fn websocket_merges_initial_state_delivers_live_updates_and_calls_services() {
         use std::net::TcpListener;
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let address = listener.local_addr().unwrap();
@@ -517,13 +758,18 @@ mod tests {
             send(&mut socket, json!({"id":2,"type":"result","success":true,"result":[state("off", "10"),alarm("disarmed")]}));
             send(&mut socket, event(state("off", "12")));
             send(&mut socket, event(alarm("armed_home")));
+            let call = read(&mut socket);
+            assert_eq!(call["type"], "call_service");
+            assert_eq!(call["service"], "alarm_disarm");
+            send(&mut socket, json!({"id":call["id"],"type":"result","success":true,"result":null}));
             socket.close(None).unwrap();
         });
         let (settings, config) = mpsc::channel();
+        let (call_tx, call_rx) = mpsc::channel();
         let (engine, events) = mpsc::channel();
         let client = std::thread::spawn(move || {
             let cfg = Connection { epoch: 4, url: format!("http://{address}"), token: "fixture".into() };
-            assert!(session(&cfg, &config, &engine).is_err());
+            assert!(session(&cfg, &config, &call_rx, &engine).is_err());
         });
         match events.recv_timeout(Duration::from_secs(8)).unwrap() {
             EngineMsg::HomeAssistant { epoch: 4, update: Update::Snapshot(states) } => {
@@ -546,9 +792,20 @@ mod tests {
             }
             _ => panic!("expected physical panel update"),
         }
+        call_tx
+            .send(ServiceCall {
+                epoch: 4,
+                entity_id: "alarm_control_panel.house".into(),
+                action: AlarmAction::Disarm,
+                code: Some("1234".into()),
+            })
+            .unwrap();
+        match events.recv_timeout(Duration::from_secs(8)).unwrap() {
+            EngineMsg::HomeAssistant { epoch: 4, update: Update::ServiceResult { action: AlarmAction::Disarm, result: Ok(()) } } => {}
+            _ => panic!("expected service call ack"),
+        }
         client.join().unwrap();
         server.join().unwrap();
         drop(settings);
     }
-
 }

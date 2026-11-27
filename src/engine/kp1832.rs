@@ -37,7 +37,7 @@ const STAR_MENU_ARMED: [(u8, &str); 6] = [
     (0, "Quick Exit"),
 ];
 
-const FN_MENU: [(u8, &str); 11] = [
+const FN_MENU: [(u8, &str); 13] = [
     (1, "Time and Date"),
     (2, "Auto Arm/Disarm"),
     (3, "Auto Arm Time"),
@@ -49,6 +49,8 @@ const FN_MENU: [(u8, &str); 11] = [
     (102, "Contrast Control"),
     (103, "Buzzer Control"),
     (104, "View Event Buf"),
+    (105, "Display Blank"),
+    (106, "Zone Chime"),
 ];
 
 pub fn pad(s: &str) -> String {
@@ -88,6 +90,7 @@ impl Panel {
             KpMode::Program(p) => self.k_program(p, key, now),
             KpMode::Events { idx, detail } => self.k32_events(idx, detail, key),
             KpMode::Level { which } => self.k32_level(which, key),
+            KpMode::ZoneChime { zone } => self.k32_zone_chime(zone, key),
             KpMode::CmdOut { idx } => self.k32_cmdout(idx, key, now),
         };
         self.kp = self.pending_kp.take().unwrap_or(next);
@@ -711,6 +714,22 @@ impl Panel {
             102 => KpMode::Level { which: 2 },
             103 => KpMode::Level { which: 3 },
             104 => KpMode::Events { idx: 0, detail: false },
+            105 => {
+                let mut opts = self.ee.toggles(Model::Pc1832, "016");
+                opts[2] = !opts[2];
+                let on = opts[2];
+                self.ee.set_toggles("016", &opts);
+                if on {
+                    self.beeps(3);
+                } else {
+                    self.long_beep();
+                }
+                self.temp_at("Display Blank", if on { "Enabled" } else { "Disabled" }, 2000, now);
+                self.log(EvKind::Program, if on { "Keypad display blanking enabled" } else { "Keypad display blanking disabled" });
+                self.out.push(Out::Save);
+                back
+            }
+            106 => KpMode::ZoneChime { zone: 1 },
             _ => back,
         }
     }
@@ -740,6 +759,71 @@ impl Panel {
         }
         self.key_beep();
         KpMode::Level { which }
+    }
+
+    fn set_zone_chime(&mut self, zone: usize, mode: u8) {
+        let attr_key = format!("{:03}", 100 + zone);
+        let chime_key = format!("kp{:03}", 200 + zone);
+        let mut attrs = self.ee.toggles(Model::Pc1832, &attr_key);
+        if mode == 0 {
+            attrs[2] = false;
+            self.ee.set_toggles(&attr_key, &attrs);
+            self.long_beep();
+            self.log(EvKind::Program, format!("Zone {:02} door chime disabled", zone));
+        } else {
+            let tone = mode.clamp(1, 4);
+            attrs[2] = true;
+            self.ee.set_toggles(&attr_key, &attrs);
+            self.ee.sections.insert(chime_key, tone.to_string());
+            let kind = match tone {
+                2 => crate::audio::ChimeKind::BingBing,
+                3 => crate::audio::ChimeKind::DingDong,
+                4 => crate::audio::ChimeKind::AlarmTone,
+                _ => crate::audio::ChimeKind::Beeps(6),
+            };
+            self.audio(crate::audio::AudioCmd::Chime(kind));
+            self.log(EvKind::Program, format!("Zone {:02} door chime set to tone {}", zone, tone));
+        }
+        self.out.push(Out::Save);
+    }
+
+    fn zone_chime_mode(&self, zone: usize) -> u8 {
+        if !self.cfg(zone).chime {
+            0
+        } else {
+            self.ee.chime_sound(zone).clamp(1, 4)
+        }
+    }
+
+    fn k32_zone_chime(&mut self, zone: usize, key: Key) -> KpMode {
+        let n = self.n().max(1);
+        let z = zone.clamp(1, n);
+        match key {
+            Key::Left => {
+                self.key_beep();
+                KpMode::ZoneChime { zone: if z <= 1 { n } else { z - 1 } }
+            }
+            Key::Right => {
+                self.key_beep();
+                KpMode::ZoneChime { zone: if z >= n { 1 } else { z + 1 } }
+            }
+            Key::Star => {
+                let next = (self.zone_chime_mode(z) + 1) % 5;
+                self.set_zone_chime(z, next);
+                KpMode::ZoneChime { zone: z }
+            }
+            Key::Digit(d) if d <= 4 => {
+                self.set_zone_chime(z, d);
+                KpMode::ZoneChime { zone: z }
+            }
+            Key::Hash => {
+                self.key_beep();
+                self.out.push(Out::Save);
+                let pos = FN_MENU.iter().position(|f| f.0 == 106).unwrap_or(0);
+                KpMode::UserFn { item: None, buf: String::new(), idx: pos }
+            }
+            _ => KpMode::ZoneChime { zone: z },
+        }
     }
 
     fn k32_events(&mut self, idx: usize, detail: bool, key: Key) -> KpMode {
@@ -918,7 +1002,7 @@ impl Panel {
                     return plain("No Alarms in", "Memory");
                 }
                 let z = list[*idx % list.len()] as usize;
-                LcdOut { lines: [arrows("View Memory"), pad(&self.label(z))], cursor: None }
+                LcdOut { lines: [arrows("View Memory"), pad(&format!("{:02} {}", z, self.label(z)))], cursor: None }
             }
             KpMode::UserCodes { slot, buf, idx, attrs } => self.lcd_usercodes(slot, buf, *idx, *attrs),
             KpMode::UserFn { item, buf, idx } => match item {
@@ -956,6 +1040,20 @@ impl Panel {
                 let filled = (v as usize * 12 + max as usize / 2) / max.max(1) as usize;
                 let bar: String = (0..12).map(|i| if i < filled { '\u{2588}' } else { '-' }).collect();
                 LcdOut { lines: [arrows(title), pad(&format!("{:02} {}", v, bar))], cursor: None }
+            }
+            KpMode::ZoneChime { zone } => {
+                let z = (*zone).clamp(1, self.n().max(1));
+                let tone = match self.zone_chime_mode(z) {
+                    0 => "Off",
+                    1 => "6 Beeps",
+                    2 => "Bing-Bing",
+                    3 => "Ding-Dong",
+                    _ => "Alarm Tone",
+                };
+                LcdOut {
+                    lines: [arrows(&format!("{:02} {}", z, self.label(z))), pad(&format!("Chime: {}", tone))],
+                    cursor: None,
+                }
             }
             KpMode::CmdOut { idx } => {
                 let label = if *idx == 2 { "Sensor Reset".to_string() } else { format!("Command O/P {}", idx) };

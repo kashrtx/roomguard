@@ -2766,3 +2766,202 @@ fn optional_alerts_follow_settings_and_delivery_failures_do_not_loop() {
     report.cid = 380;
     assert_eq!(crate::notify::for_report(&report, &cfg).unwrap().0.title, "RoomGuard needs attention");
 }
+
+#[test]
+fn two_way_home_assistant_panel_sync_controls_both_sides_without_loops() {
+    use crate::engine::panel::HaPanelCmd;
+    use crate::home_assistant::{AlarmState::*, PanelLink};
+
+    for model in [Model::Pc1550, Model::Pc1832, Model::Vista20p] {
+        let t0 = Instant::now();
+        let mut p = panel(model);
+        p.set_panel_link(PanelLink::TwoWay, t0);
+        p.sync_physical_panel(Some(Disarmed), false, t0);
+        p.out.clear();
+
+        // 1. Arming from RoomGuard's keypad emits an outbound HA Arm command carrying the code.
+        if model == Model::Vista20p {
+            keys(&mut p, "12342", t0 + secs(1));
+        } else {
+            keys(&mut p, "1234", t0 + secs(1));
+        }
+        assert!(p.is_on(), "{model:?} should arm in TwoWay mode");
+        assert!(
+            p.out.iter().any(|o| matches!(
+                o,
+                Out::HaPanelCmd(HaPanelCmd::Arm { mode: ArmMode::Away, night: false, code: Some(c) }) if c == "1234"
+            )),
+            "{model:?} must send outbound Arm Away command to HA"
+        );
+
+        // Stale HA Disarmed within the 4s outbound grace window must NOT cancel our local arming!
+        p.sync_physical_panel(Some(Disarmed), true, t0 + secs(2));
+        assert!(p.is_on(), "{model:?} must ignore stale HA Disarmed right after local arm");
+
+        // HA acknowledges arming -> armed_away: RoomGuard syncs cleanly with ZERO echoed HA commands.
+        p.out.clear();
+        p.sync_physical_panel(Some(Arming), true, t0 + secs(3));
+        p.sync_physical_panel(Some(Away), true, t0 + secs(11));
+        assert_eq!(p.armed.map(|a| a.mode), Some(ArmMode::Away));
+        assert!(
+            !p.out.iter().any(|o| matches!(o, Out::HaPanelCmd(_))),
+            "{model:?} must never echo inbound HA state changes back to HA"
+        );
+
+        // 2. Disarming from HA disarms RoomGuard WITHOUT echoing Disarm back to HA!
+        p.out.clear();
+        p.sync_physical_panel(Some(Disarmed), true, t0 + secs(15));
+        assert!(!p.is_on());
+        assert!(!p.out.iter().any(|o| matches!(o, Out::HaPanelCmd(_))));
+
+        // 3. Arming from HA (including Pending/Triggered) can be disarmed right on RoomGuard's keypad!
+        p.sync_physical_panel(Some(Stay), true, t0 + secs(20));
+        assert_eq!(p.armed.map(|a| a.mode), Some(ArmMode::Stay));
+        p.sync_physical_panel(Some(Pending), true, t0 + secs(22));
+        p.out.clear();
+        if model == Model::Vista20p {
+            keys(&mut p, "12341", t0 + secs(23));
+        } else {
+            keys(&mut p, "1234", t0 + secs(23));
+        }
+        assert!(!p.is_on(), "{model:?} keypad must disarm linked HA panel");
+        assert!(
+            p.out.iter().any(|o| matches!(
+                o,
+                Out::HaPanelCmd(HaPanelCmd::Disarm { code: Some(c) }) if c == "1234"
+            )),
+            "{model:?} must send outbound Disarm command with code to HA"
+        );
+    }
+
+    // 4. Vista NIGHT-STAY sends night=true outbound to HA!
+    let t0 = Instant::now();
+    let mut v = panel(Model::Vista20p);
+    v.set_panel_link(PanelLink::TwoWay, t0);
+    v.sync_physical_panel(Some(Disarmed), false, t0);
+    v.out.clear();
+    keys(&mut v, "123433", t0 + secs(1));
+    assert!(
+        v.out.iter().any(|o| matches!(o, Out::HaPanelCmd(HaPanelCmd::Arm { mode: ArmMode::Stay, night: true, .. }))),
+        "Vista NIGHT-STAY must send ArmNight to HA"
+    );
+}
+
+#[test]
+fn vista_one_time_maid_code_arms_disarms_once_then_deletes_itself() {
+    let t0 = Instant::now();
+    let mut p = panel(Model::Vista20p);
+    // Program user 07 with code 7777 and Authority 5 (One-Time Maid/Guest).
+    keys(&mut p, "12348077777", t0);
+    keys(&mut p, "1234807#15", t0 + secs(2));
+    assert!(p.ee.code_matches("07", "7777"));
+    assert_eq!(p.ee.attrs("07") & 0x07, 5);
+
+    // Master arms -> One-Time Maid CANNOT disarm another user's arming.
+    keys(&mut p, "12343", t0 + secs(4));
+    assert!(p.is_on());
+    keys(&mut p, "77771", t0 + secs(6));
+    assert!(p.is_on(), "one-time maid must not disarm a system armed by master");
+    assert!(p.ee.has_code("07"), "code must remain intact when rejected");
+    keys(&mut p, "12341", t0 + secs(8));
+    assert!(!p.is_on());
+
+    // One-Time Maid arms STAY, then disarms its own arming -> code auto-deletes!
+    keys(&mut p, "77773", t0 + secs(10));
+    assert!(p.is_on(), "one-time maid can arm");
+    keys(&mut p, "77771", t0 + secs(12));
+    assert!(!p.is_on(), "one-time maid can disarm its own arming");
+    assert!(!p.ee.has_code("07"), "one-time maid code must delete itself after arm + disarm");
+}
+
+#[test]
+fn pc1832_display_blank_zone_chime_hold_zero_and_numbered_alarm_memory() {
+    use crate::audio::ChimeKind;
+    let t0 = Instant::now();
+    let mut p = panel(Model::Pc1832);
+    p.ee.sections.insert("015".into(), "12347".into()); // enable Quick Exit (opt 3) + Quick Arm (opt 4)
+
+    // 1. [*][6][Master] -> scroll right 11 times to "Display Blank", press * to enable [016] opt 3!
+    keys(&mut p, "*61234", t0);
+    for step in 0..11 {
+        p.key(Key::Right, true, t0 + secs(1 + step));
+        p.key(Key::Right, false, t0 + secs(1 + step));
+    }
+    assert_eq!(p.lcd_1832(t0 + secs(12), 0).lines[1].trim(), "Display Blank");
+    keys(&mut p, "*", t0 + secs(13));
+    assert!(p.ee.toggle(Model::Pc1832, "016", 3), "Display Blank in *6 must enable [016] opt 3");
+    assert_eq!(p.lcd_1832(t0 + secs(13), 0).lines[1].trim(), "Enabled");
+
+    // 2. Scroll right once more to "Zone Chime", press *, pick tone 3 (Ding-Dong) on Zone 01, then disable with 0!
+    p.key(Key::Right, true, t0 + secs(16));
+    p.key(Key::Right, false, t0 + secs(16));
+    assert_eq!(p.lcd_1832(t0 + secs(16), 0).lines[1].trim(), "Zone Chime");
+    keys(&mut p, "*", t0 + secs(17));
+    assert!(p.lcd_1832(t0 + secs(17), 0).lines[0].starts_with("01 Room"));
+    p.out.clear();
+    keys(&mut p, "3", t0 + secs(18));
+    assert_eq!(p.ee.chime_sound(1), 3);
+    assert!(p.cfg(1).chime);
+    assert_eq!(p.lcd_1832(t0 + secs(18), 0).lines[1].trim(), "Chime: Ding-Dong");
+    assert!(p.out.iter().any(|o| matches!(o, Out::Audio(AudioCmd::Chime(ChimeKind::DingDong)))));
+    keys(&mut p, "0", t0 + secs(19));
+    assert!(!p.cfg(1).chime, "pressing 0 in Zone Chime must disable chime on that zone");
+    assert_eq!(p.lcd_1832(t0 + secs(19), 0).lines[1].trim(), "Chime: Off");
+    keys(&mut p, "##", t0 + secs(20));
+
+    // 3. Hold [0] for 2 seconds: Quick Arm when disarmed, Quick Exit when armed!
+    // (Display Blank was enabled in step 1, so after 173s idle the keypad blanks and wakes on first key!)
+    p.key(Key::Digit(0), true, t0 + secs(25));
+    p.tick(t0 + secs(27) + Duration::from_millis(100), 0);
+    p.key(Key::Digit(0), false, t0 + secs(27) + Duration::from_millis(200));
+    assert!(p.exit.is_some(), "holding 0 for 2s while disarmed must Quick Arm");
+    p.tick(t0 + secs(200), 0); // finish exit delay (>30s idle -> Display Blank activates!)
+    assert!(p.armed.is_some());
+    assert!(p.is_blanked_1832(t0 + secs(200)), "Display Blank must blank keypad after 30s idle");
+    keys(&mut p, "#", t0 + secs(204)); // wake the blanked keypad first
+    assert!(!p.is_blanked_1832(t0 + secs(204)), "keypress wakes the blanked keypad");
+    p.key(Key::Digit(0), true, t0 + secs(205));
+    p.tick(t0 + secs(207) + Duration::from_millis(100), 0);
+    p.key(Key::Digit(0), false, t0 + secs(207) + Duration::from_millis(200));
+    assert!(p.armed.unwrap().quick_exit.is_some(), "holding 0 for 2s while armed must start Quick Exit");
+
+    // 4. [*][3] Alarm Memory displays exact zone number + label ("03 Window").
+    p.set_zone(3, true, false, false, t0 + secs(210));
+    p.set_zone(3, false, false, false, t0 + secs(212));
+    keys(&mut p, "1234", t0 + secs(215));
+    keys(&mut p, "#*3", t0 + secs(220));
+    assert_eq!(p.lcd_1832(t0 + secs(220), 0).lines[1].trim(), "03 Window");
+}
+
+#[test]
+fn pc1550_hex_mode_0_to_5_and_distinct_zone_led_flash_cadences() {
+    let t0 = Instant::now();
+    let mut p = panel(Model::Pc1550);
+
+    // 1. Hex mode in *8 programming maps * + 0..=5 -> A..=F!
+    keys(&mut p, "*8150002*0123*#", t0);
+    assert_eq!(p.ee.raw(Model::Pc1550, "02"), "ABCD", "PC1550 * + 0..=5 must encode hex A..=F");
+    keys(&mut p, "#", t0 + secs(1));
+
+    // 2. Distinct zone LED flash cadences:
+    //    - Open zone while disarmed -> slow flash (Led::Flash)
+    //    - Bypassed zone in [*][1] -> steady on (Led::On)
+    //    - Alarm memory in [*][3] -> fast flash (Led::Fast)
+    p.set_zone(3, true, false, false, t0 + secs(2));
+    assert_eq!(p.leds_1550(t0 + secs(2))[5 + 2], Led::Flash, "open zone must slow-flash");
+    p.set_zone(3, false, false, false, t0 + secs(3));
+
+    keys(&mut p, "*13", t0 + secs(4));
+    assert_eq!(p.leds_1550(t0 + secs(4))[5 + 2], Led::On, "bypassed zone in *1 must be steady ON");
+    keys(&mut p, "3#", t0 + secs(5)); // unbypass & exit
+
+    // Arm, trip instant zone 3, disarm -> [*][3] alarm memory fast-flashes zone 3!
+    keys(&mut p, "1234", t0 + secs(10));
+    p.tick(t0 + secs(140), 0);
+    p.set_zone(3, true, false, false, t0 + secs(145));
+    p.set_zone(3, false, false, false, t0 + secs(146));
+    keys(&mut p, "1234", t0 + secs(148));
+    assert_eq!(p.leds_1550(t0 + secs(148))[5 + 2], Led::Fast, "post-disarm alarm memory zone must fast-flash");
+    keys(&mut p, "*3", t0 + secs(150));
+    assert_eq!(p.leds_1550(t0 + secs(150))[5 + 2], Led::Fast, "*3 alarm memory zone must fast-flash");
+}
