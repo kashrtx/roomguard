@@ -65,6 +65,7 @@ pub fn draw(
         xf.p(BX, BY + KP_H + 2.0),
     ];
     paint::poly_shadow(&p, &outer_pts, Vec2::new(xf.s(6.0), xf.s(9.0)), xf.s(18.0), Color32::from_black_alpha(150));
+    paint::housing_depth(&p, &outer_pts, Vec2::new(xf.s(1.8), xf.s(3.3)), Color32::from_rgb(0xD5, 0xD1, 0xC5), l);
 
     // Left keypad recessed chassis base
     let kp_body = xf.r(BX, BY + 2.0, KP_W + 4.0, KP_H);
@@ -318,9 +319,9 @@ fn draw_round_key(p: &Painter, xf: &Xf, center: Pos2, r: f32, label: &str, held:
 
     let c = center + Vec2::new(0.0, if held { xf.s(1.3) } else { 0.0 });
     let (top, bot) = if held {
-        (Color32::from_rgb(0x6C, 0x6B, 0x64), Color32::from_rgb(0x52, 0x51, 0x4B))
+        (Color32::from_rgb(0x89, 0x91, 0x96), Color32::from_rgb(0x68, 0x72, 0x78))
     } else {
-        (Color32::from_rgb(0x88, 0x86, 0x7E), Color32::from_rgb(0x63, 0x62, 0x5B))
+        (Color32::from_rgb(0xAD, 0xB6, 0xBC), Color32::from_rgb(0x7B, 0x86, 0x8B))
     };
     paint::grad_circle(
         p,
@@ -335,7 +336,7 @@ fn draw_round_key(p: &Painter, xf: &Xf, center: Pos2, r: f32, label: &str, held:
         p,
         c - Vec2::new(0.0, r * 0.24),
         r * 0.62,
-        alpha(Color32::WHITE, if held { 0.08 * l } else { 0.18 * l + 0.02 }),
+        alpha(Color32::WHITE, if held { 0.04 * l } else { 0.11 * l }),
         alpha(Color32::WHITE, 0.0),
         Some(Stroke::NONE),
     );
@@ -363,9 +364,9 @@ fn draw_pill_emergency_key(p: &Painter, xf: &Xf, rect: Rect, label: &str, held: 
     }
     let k = rect.translate(Vec2::new(0.0, if held { xf.s(1.3) } else { 0.0 }));
     let (top, bot) = if held {
-        (Color32::from_rgb(0x6E, 0x6D, 0x66), Color32::from_rgb(0x54, 0x53, 0x4D))
+        (Color32::from_rgb(0x8B, 0x93, 0x98), Color32::from_rgb(0x6A, 0x74, 0x7A))
     } else {
-        (Color32::from_rgb(0x8A, 0x88, 0x80), Color32::from_rgb(0x65, 0x64, 0x5D))
+        (Color32::from_rgb(0xAD, 0xB6, 0xBC), Color32::from_rgb(0x7B, 0x86, 0x8B))
     };
     paint::grad_rrect(
         p,
@@ -375,7 +376,7 @@ fn draw_pill_emergency_key(p: &Painter, xf: &Xf, rect: Rect, label: &str, held: 
         dim(bot, l),
         Some(Stroke::new(xf.s(0.9), dim(Color32::from_rgb(0x3E, 0x3D, 0x38), l))),
     );
-    paint::gloss_band(p, k, r, if held { 0.08 * l } else { 0.18 * l + 0.02 });
+    paint::gloss_band(p, k, r, if held { 0.04 * l } else { 0.10 * l });
 
     let ink = mix(dim(Color32::from_rgb(0x16, 0x15, 0x13), l.max(0.55)), Color32::from_rgb(0xFF, 0xBE, 0x58), back * 0.9);
     p.text(k.center(), Align2::CENTER_CENTER, label, theme::semi(xf.s(14.5)), ink);

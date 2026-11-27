@@ -133,6 +133,7 @@ pub fn draw(
     // 1. Multi-layered soft wall shadow beneath the glossy shell
     let outer = shell_polygon(&xf, 0.0);
     paint::poly_shadow(&p, &outer, Vec2::new(xf.s(6.0), xf.s(11.0)), xf.s(20.0), Color32::from_black_alpha(150));
+    paint::housing_depth(&p, &outer, Vec2::new(xf.s(1.8), xf.s(3.4)), Color32::from_rgb(0xD8, 0xDA, 0xD6), l);
 
     // Outer molded glossy pearl-white ABS shell
     paint::grad_poly_v(
@@ -203,9 +204,9 @@ pub fn draw(
         &visor,
         xf.p(0.0, BY + 6.0).y,
         xf.p(0.0, SEAM_Y).y,
-        dim(Color32::from_rgb(0xFA, 0xFB, 0xFA), l),
-        dim(Color32::from_rgb(0xE6, 0xE9, 0xE7), l),
-        Some(Stroke::new(xf.s(0.9), dim(Color32::from_rgb(0xC0, 0xC4, 0xC1), l))),
+        dim(Color32::from_rgb(0xEB, 0xF0, 0xF4), l),
+        dim(Color32::from_rgb(0xCD, 0xD8, 0xE0), l),
+        Some(Stroke::new(xf.s(0.9), dim(Color32::from_rgb(0xA6, 0xB4, 0xBE), l))),
     );
     // Glossy specular sheen band across upper visor curve
     let visor_gloss = visor_polygon(&xf, 10.0);
@@ -215,7 +216,7 @@ pub fn draw(
         &visor_gloss,
         xf.p(0.0, BY + 8.0).y,
         xf.p(0.0, BY + 42.0).y,
-        alpha(Color32::WHITE, 0.58 * l + 0.06),
+        alpha(Color32::WHITE, 0.26 * l),
         alpha(Color32::WHITE, 0.0),
         Some(Stroke::NONE),
     );
@@ -300,22 +301,7 @@ pub fn draw(
     );
     // Draw the 2x16 dot-matrix pixels with optical polarizer shadow
     draw_lcd(&p, &xf, glass, &view.lcd, view.lcd_cursor, view.contrast, bl, l, t);
-    // Subtle glossy glass diagonal reflection across LCD lens
-    let diag_sheen = vec![
-        glass.left_top(),
-        Pos2::new(glass.left() + glass.width() * 0.62, glass.top()),
-        Pos2::new(glass.left() + glass.width() * 0.36, glass.bottom()),
-        glass.left_bottom(),
-    ];
-    paint::grad_poly_v(
-        &p.with_clip_rect(glass),
-        &diag_sheen,
-        glass.top(),
-        glass.bottom(),
-        alpha(Color32::WHITE, 0.12 * l + 0.03),
-        alpha(Color32::WHITE, 0.0),
-        Some(Stroke::NONE),
-    );
+    paint::lcd_reflection(&p, glass, l);
 
     // 5. Four Right-Side Translucent Backlit Status Icons (no overflowing text, matching photos 3 and 4)
     let status_colors = [
@@ -464,7 +450,7 @@ fn draw_pill_key(p: &Painter, xf: &Xf, rect: Rect, face: Face, held: bool, l: f3
         Some(Stroke::new(xf.s(0.8), dim(Color32::from_rgb(0x74, 0x82, 0x87), l))),
     );
     // Glossy convex upper sheen on silicone pill
-    paint::gloss_band(p, k, r, if held { 0.12 * l } else { 0.30 * l + 0.04 });
+    paint::gloss_band(p, k, r, if held { 0.06 * l } else { 0.17 * l });
 
     let glow_ink = Color32::from_rgb(0xD8, 0xFF, 0xD6);
     let ink = mix(dim(Color32::from_rgb(0x1E, 0x25, 0x29), l.max(0.55)), glow_ink, back * 0.92);

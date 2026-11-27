@@ -53,17 +53,18 @@ pub fn draw(
 
     // 1. Multi-layer wall drop shadow behind the wide rectangular ABS body
     let body = xf.r(BX, BY, BW, BH);
-    let body_pts = [body.left_top(), body.right_top(), body.right_bottom(), body.left_bottom()];
+    let body_pts = paint::rounded_points(body, xf.s(6.0), 5);
     paint::poly_shadow(&p, &body_pts, Vec2::new(xf.s(3.0), xf.s(7.0)), xf.s(14.0), Color32::BLACK);
+    paint::housing_depth(&p, &body_pts, Vec2::new(xf.s(1.5), xf.s(3.0)), Color32::from_rgb(0xDE, 0xDB, 0xD3), l);
 
     // 2. Main glossy pearl-white rectangular housing
     paint::grad_rrect(
         &p,
         body,
         xf.s(6.0),
-        dim(Color32::from_rgb(0xFB, 0xFA, 0xF7), l),
-        dim(Color32::from_rgb(0xE1, 0xDF, 0xD9), l),
-        Some(Stroke::new(1.2_f32, dim(Color32::from_rgb(0xC2, 0xBF, 0xB8), l))),
+        dim(Color32::from_rgb(0xFC, 0xFC, 0xFB), l),
+        dim(Color32::from_rgb(0xE3, 0xE3, 0xE0), l),
+        Some(Stroke::new(1.2_f32, dim(Color32::from_rgb(0xCB, 0xCB, 0xC6), l))),
     );
     // Subtle glossy top specular rim
     p.line_segment(
@@ -82,14 +83,18 @@ pub fn draw(
     );
 
     // 4. Upper-left 6160V voice speaker grille: 4 horizontal tapered vents
-    for (i, half_w) in [24.0f32, 29.0, 29.0, 24.0].iter().enumerate() {
+    for (i, half_w) in [25.0f32, 28.0, 28.0, 25.0].iter().enumerate() {
         let vy = BY + 36.0 + i as f32 * 11.5;
         let cx = BX + 54.0;
-        let slot = Rect::from_center_size(xf.p(cx, vy), Vec2::new(xf.s(*half_w * 2.0), xf.s(4.2)));
-        p.rect_filled(slot, xf.s(2.1), dim(Color32::from_rgb(0x28, 0x2B, 0x2E), l.max(0.25)));
+        let slot = [
+            xf.p(cx - half_w, vy + 0.6), xf.p(cx - half_w * 0.64, vy - 0.8),
+            xf.p(cx, vy - 1.4), xf.p(cx + half_w * 0.64, vy - 0.8),
+            xf.p(cx + half_w, vy + 0.6), xf.p(cx, vy + 1.2),
+        ];
+        p.add(Shape::convex_polygon(slot.to_vec(), dim(Color32::from_rgb(0x28, 0x2B, 0x2E), l.max(0.25)), Stroke::NONE));
         p.line_segment(
-            [Pos2::new(slot.left() + xf.s(3.0), slot.bottom() + xf.s(0.6)), Pos2::new(slot.right() - xf.s(3.0), slot.bottom() + xf.s(0.6))],
-            Stroke::new(xf.s(0.9), alpha(Color32::WHITE, 0.65 * l)),
+            [xf.p(cx - half_w * 0.7, vy + 1.5), xf.p(cx + half_w * 0.7, vy + 1.5)],
+            Stroke::new(xf.s(0.65), alpha(Color32::WHITE, 0.40 * l)),
         );
     }
 
@@ -117,11 +122,12 @@ pub fn draw(
         xf.p(BX + BW - 4.0, SEAM_Y),
         xf.p(SPLIT_X + 2.0, SEAM_Y),
     ];
-    p.add(Shape::convex_polygon(
-        visor_pts.clone(),
-        dim(Color32::from_rgb(0xF5, 0xF4, 0xF0), l),
-        Stroke::new(1.0_f32, dim(Color32::from_rgb(0xCC, 0xC9, 0xC2), l)),
-    ));
+    paint::poly_shadow(&p, &visor_pts, Vec2::new(xf.s(0.9), xf.s(2.5)), xf.s(3.8), Color32::from_black_alpha(92));
+    paint::grad_poly_v(
+        &p, &visor_pts, xf.p(0.0, BY + 4.0).y, xf.p(0.0, SEAM_Y).y,
+        dim(Color32::from_rgb(0xFD, 0xFD, 0xFC), l), dim(Color32::from_rgb(0xE8, 0xE9, 0xE8), l),
+        Some(Stroke::new(xf.s(0.55), dim(Color32::from_rgb(0xCF, 0xCF, 0xCB), l))),
+    );
     p.line_segment(
         [xf.p(SPLIT_X + 3.0, SEAM_Y), xf.p(BX + BW - 4.0, SEAM_Y)],
         Stroke::new(xf.s(1.6), dim(Color32::from_rgb(0xB8, 0xB5, 0xAE), l)),
@@ -133,12 +139,13 @@ pub fn draw(
         &p,
         bezel,
         xf.s(4.0),
-        dim(Color32::from_rgb(0xCF, 0xCC, 0xC4), l),
-        dim(Color32::from_rgb(0xF6, 0xF5, 0xF1), l),
-        Some(Stroke::new(0.9_f32, dim(Color32::from_rgb(0xB2, 0xAF, 0xA8), l))),
+        dim(Color32::from_rgb(0xD8, 0xDA, 0xD7), l),
+        dim(Color32::from_rgb(0xF8, 0xF8, 0xF6), l),
+        Some(Stroke::new(xf.s(0.6), dim(Color32::from_rgb(0xC5, 0xC8, 0xC3), l))),
     );
     let lcd = bezel.shrink2(Vec2::new(xf.s(5.0), xf.s(5.0)));
     draw_lcd(&p, &xf, lcd, &view.lcd, view.lcd_cursor, bl, view.contrast, l, t, view.all_on);
+    paint::lcd_reflection(&p, lcd, l);
 
     // 8. Lower-right keypad bay (always draw keys underneath; closed cover masks numeric keys)
     let keys_interactive = open > 0.45;
@@ -338,14 +345,14 @@ fn draw_vista_key(
         );
     }
     let top_col = if is_fn {
-        dim(Color32::from_rgb(0xE8, 0xEA, 0xE6), l.max(0.35))
+        dim(Color32::from_rgb(0xEB, 0xED, 0xEC), l.max(0.35))
     } else {
-        dim(Color32::from_rgb(0xDC, 0xDF, 0xDA), l.max(0.35))
+        dim(Color32::from_rgb(0xD9, 0xE1, 0xE4), l.max(0.35))
     };
     let bot_col = if down {
-        dim(Color32::from_rgb(0xB8, 0xBC, 0xB5), l.max(0.35))
+        dim(Color32::from_rgb(0xA9, 0xB5, 0xBA), l.max(0.35))
     } else {
-        dim(Color32::from_rgb(0xC6, 0xCA, 0xC3), l.max(0.35))
+        dim(Color32::from_rgb(0xBD, 0xC8, 0xCD), l.max(0.35))
     };
     paint::grad_rrect(
         p,

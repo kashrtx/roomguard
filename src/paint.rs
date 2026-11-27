@@ -124,7 +124,7 @@ pub fn grad_poly_h(p: &Painter, pts: &[Pos2], x0: f32, x1: f32, left: Color32, r
     }
 }
 
-/// Soft multi-pass drop shadow for a custom convex polygon (wall shadow).
+/// Soft wall shadow with continuously interpolated opacity between rings.
 pub fn poly_shadow(p: &Painter, pts: &[Pos2], offset: Vec2, spread: f32, color: Color32) {
     if pts.len() < 3 {
         return;
@@ -136,23 +136,49 @@ pub fn poly_shadow(p: &Painter, pts: &[Pos2], offset: Vec2, spread: f32, color: 
         cy += q.y;
     }
     let center = Pos2::new(cx / pts.len() as f32, cy / pts.len() as f32);
-    let layers = 7usize;
-    for layer in (0..layers).rev() {
-        let frac = (layer as f32 + 1.0) / layers as f32;
-        let ex = spread * frac;
-        let falloff = (1.0 - frac * 0.90).max(0.0);
-        let a = falloff * falloff * 0.24;
-        let off = offset * (0.25 + 0.75 * frac);
-        let shifted: Vec<Pos2> = pts
-            .iter()
-            .map(|q| {
-                let d = *q - center;
-                let len = d.length().max(1.0);
-                *q + off + d / len * ex
-            })
-            .collect();
-        p.add(Shape::convex_polygon(shifted, alpha(color, a), Stroke::NONE));
+    let mut mesh = Mesh::default();
+    mesh.colored_vertex(center + offset, alpha(color, 0.62));
+    let n = pts.len() as u32;
+    const RINGS: u32 = 6;
+    for ring in 0..=RINGS {
+        let fraction = ring as f32 / RINGS as f32;
+        let shade = alpha(color, 0.62 * (1.0 - fraction).powi(3));
+        for &point in pts {
+            let outward = point - center;
+            let shift = outward / outward.length().max(1.0) * spread * fraction;
+            mesh.colored_vertex(point + offset + shift, shade);
+        }
+        for edge in 0..n {
+            let current = 1 + ring * n + edge;
+            let next = 1 + ring * n + (edge + 1) % n;
+            if ring == 0 {
+                mesh.add_triangle(0, current, next);
+            } else {
+                mesh.add_triangle(current - n, current, next);
+                mesh.add_triangle(current - n, next, next - n);
+            }
+        }
     }
+    p.add(Shape::mesh(mesh));
+}
+
+/// Draw the side of a molded housing behind its front face.
+pub fn housing_depth(p: &Painter, pts: &[Pos2], depth: Vec2, plastic: Color32, light: f32) {
+    let side: Vec<_> = pts.iter().map(|&point| point + depth).collect();
+    let bounds = Rect::from_points(&side);
+    let top = dim(mix(plastic, Color32::BLACK, 0.08), light);
+    let bottom = dim(mix(plastic, Color32::BLACK, 0.24), light);
+    grad_poly_v(p, &side, bounds.top(), bounds.bottom(), top, bottom, Some(Stroke::NONE));
+}
+
+/// Faint reflection near the top of a recessed LCD lens.
+pub fn lcd_reflection(p: &Painter, glass: Rect, light: f32) {
+    let inner = glass.shrink(1.0);
+    let reflected = Rect::from_min_max(
+        inner.left_top(),
+        Pos2::new(inner.right(), inner.top() + inner.height() * 0.40),
+    );
+    grad_rrect(p, reflected, 2.0, alpha(Color32::WHITE, 0.10 * light), Color32::TRANSPARENT, Some(Stroke::NONE));
 }
 
 /// Tiny crisp vector triangle arrow (avoids missing Unicode glyphs in Inter).
