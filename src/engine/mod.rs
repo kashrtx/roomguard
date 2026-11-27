@@ -61,7 +61,8 @@ pub enum EngineMsg {
     Config(Box<AppConfig>),
     Op(OpInput),
     NotifyResult { ok: bool, test: bool, err: String },
-    MemoResult { id: Instant, result: crate::audio::memo::Result },
+    Memo(crate::audio::memo::Event),
+    TestMicrophone(Option<String>),
     NetStatus(bool),
     SetMasterCode(String),
     EditPanel(PanelEdit),
@@ -109,6 +110,8 @@ pub struct View {
     pub armed: bool,
     pub programming: bool,
     pub notify_status: String,
+    pub mic_test_status: String,
+    pub mic_test_running: bool,
     pub notify_test_status: String,
     pub sim: [bool; MAX_PANEL_ZONES],
     pub home: HomeView,
@@ -230,6 +233,8 @@ impl Default for View {
             armed: false,
             programming: false,
             notify_status: String::new(),
+            mic_test_status: String::new(),
+            mic_test_running: false,
             notify_test_status: String::new(),
             sim: [false; MAX_PANEL_ZONES],
             home: HomeView::default(),
@@ -282,8 +287,8 @@ pub fn start(
     let v2 = view.clone();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let memo_events = tx.clone();
-    let memo = crate::audio::memo::start(move |id, result| {
-        let _ = memo_events.send(EngineMsg::MemoResult { id, result });
+    let memo = crate::audio::memo::start(move |event| {
+        let _ = memo_events.send(EngineMsg::Memo(event));
     });
     let hub = ha::start(tx.clone());
     let spawned = std::thread::Builder::new().name("engine".into()).spawn(move || {
@@ -350,6 +355,8 @@ struct Engine {
     events_cache: (u64, Arc<Vec<EventRow>>),
     chat_cache: (u64, Arc<Vec<ChatMsg>>),
     notify_status: String,
+    mic_test_status: String,
+    mic_test_running: bool,
     notify_test_status: String,
     pending_photos: Vec<(String, NotifyJob, Instant)>,
     alert_sequence: u64,
@@ -405,6 +412,8 @@ impl Engine {
             events_cache: (0, Arc::new(Vec::new())),
             chat_cache: (0, Arc::new(Vec::new())),
             notify_status: String::new(),
+            mic_test_status: String::new(),
+            mic_test_running: false,
             notify_test_status: String::new(),
             pending_photos: Vec::new(),
             alert_sequence: 0,
@@ -446,6 +455,7 @@ impl Engine {
 
     fn push_settings(&mut self) {
         self.audio.configure(self.cfg.sound.keypad_output.clone(), self.cfg.sound.siren_output.clone());
+        let _ = self.memo.send(crate::audio::memo::Command::Device(self.cfg.sound.microphone.clone()));
         self.push_volumes();
         self.audio.send(AudioCmd::Siren { model: self.cfg.sound.siren_model, warble: self.cfg.sound.wave2_warble });
         self.audio.send(AudioCmd::Voice(voice_for(self.panel.model)));
@@ -567,7 +577,37 @@ impl Engine {
                 }
             }
             EngineMsg::Vision(ev) => self.vision(ev, now),
-            EngineMsg::MemoResult { id, result } => self.panel.vista_memo_result(id, result, now),
+            EngineMsg::Memo(event) => {
+                use crate::audio::memo::Event;
+                match event {
+                    Event::Memo { id, result } => self.panel.vista_memo_result(id, result, now),
+                    Event::Testing(status) => self.mic_test_status = status,
+                    Event::Test(result) => {
+                        self.mic_test_running = false;
+                        match result {
+                            Ok(clip) => {
+                                self.audio.send(AudioCmd::PlayMicTest(clip));
+                                self.mic_test_status = if self.cfg.sound.master == 0.0 || self.cfg.sound.keypad == 0.0 {
+                                    "Microphone captured audio. Turn up Keypad and Everything to hear playback."
+                                } else if self.audio.keypad_ok() {
+                                    "Microphone captured audio. Listen for playback through Keypad & voice."
+                                } else {
+                                    "Microphone captured audio. Check the Keypad & voice output to hear playback."
+                                }.into();
+                            }
+                            Err(error) => self.mic_test_status = error,
+                        }
+                    }
+                }
+                self.panel.dirty = true;
+            }
+            EngineMsg::TestMicrophone(device) => {
+                if !self.mic_test_running {
+                    self.mic_test_running = self.memo.send(crate::audio::memo::Command::Test(device)).is_ok();
+                    self.mic_test_status = if self.mic_test_running { "Opening microphone…" } else { "Microphone worker unavailable" }.into();
+                    self.panel.dirty = true;
+                }
+            }
             EngineMsg::Config(c) => self.apply_config(*c, now),
             EngineMsg::Op(inp) => {
                 let outs = self.op.input(inp, now, &self.cfg.operator);
@@ -1101,6 +1141,7 @@ impl Engine {
         let model_changed = new.model != self.panel.model;
         let cam_changed = new.camera != self.cfg.camera;
         let sound_changed = new.sound != self.cfg.sound;
+        let microphone_changed = new.sound.microphone != self.cfg.sound.microphone;
         let outputs_changed = new.sound.keypad_output != self.cfg.sound.keypad_output || new.sound.siren_output != self.cfg.sound.siren_output;
         let op_changed = new.operator != self.cfg.operator;
         let old_phone = NtfyCfg::from(&self.cfg.operator);
@@ -1123,6 +1164,10 @@ impl Engine {
             self.entry_evidence = None;
             self.grace_until = now + Duration::from_secs(10);
             self.cam.send(CamCmd::Config(Box::new(self.cfg.camera.clone())));
+        }
+        if microphone_changed {
+            let _ = self.memo.send(crate::audio::memo::Command::Device(self.cfg.sound.microphone.clone()));
+            self.mic_test_status.clear();
         }
         if outputs_changed {
             self.audio.configure(self.cfg.sound.keypad_output.clone(), self.cfg.sound.siren_output.clone());
@@ -1437,6 +1482,8 @@ impl Engine {
             armed: p.armed.is_some() || p.exit.is_some(),
             programming: p.is_programming(),
             notify_status: self.notify_status.clone(),
+            mic_test_status: self.mic_test_status.clone(),
+            mic_test_running: self.mic_test_running,
             notify_test_status: self.notify_test_status.clone(),
             sim: self.sim,
             home: self.home.clone(),

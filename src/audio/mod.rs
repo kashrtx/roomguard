@@ -4,6 +4,28 @@
 //! rebuild the output stream if the device changes or disappears, which also
 //! tells the panel when the "bell circuit" is broken.
 
+// Dispatch to CPAL's typed PCM callbacks. Device mix formats can differ
+// between endpoints on the same computer.
+macro_rules! pcm {
+    ($format:expr, $open:ident) => {
+        match $format {
+            cpal::SampleFormat::F32 => $open!(f32),
+            cpal::SampleFormat::F64 => $open!(f64),
+            cpal::SampleFormat::I8 => $open!(i8),
+            cpal::SampleFormat::I16 => $open!(i16),
+            cpal::SampleFormat::I24 => $open!(cpal::I24),
+            cpal::SampleFormat::I32 => $open!(i32),
+            cpal::SampleFormat::I64 => $open!(i64),
+            cpal::SampleFormat::U8 => $open!(u8),
+            cpal::SampleFormat::U16 => $open!(u16),
+            cpal::SampleFormat::U24 => $open!(cpal::U24),
+            cpal::SampleFormat::U32 => $open!(u32),
+            cpal::SampleFormat::U64 => $open!(u64),
+            other => return Err(format!("Unsupported audio format: {other}")),
+        }
+    };
+}
+
 pub mod memo;
 pub mod synth;
 pub mod voice;
@@ -12,6 +34,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::{FromSample, SizedSample};
 
 use crate::engine::types::SirenModel;
 use crate::util;
@@ -68,6 +93,7 @@ pub enum AudioCmd {
     VoiceLevel(u8),
     Speak(Vec<String>),
     PlayMemo(memo::Clip),
+    PlayMicTest(memo::Clip),
     Sounder(Pattern),
     KeyBeep,
     Beeps { count: u8, on_ms: u16, off_ms: u16 },
@@ -119,16 +145,37 @@ enum WorkerCmd {
 }
 
 #[derive(Clone)]
+pub struct Endpoint {
+    pub id: String,
+    pub label: String,
+    // The previous build stored the Windows friendly name.
+    legacy: String,
+}
+
+#[derive(Clone, Default)]
+pub struct Endpoints {
+    pub outputs: Vec<Endpoint>,
+    pub inputs: Vec<Endpoint>,
+}
+
+impl Endpoint {
+    pub fn matches(&self, selection: Option<&str>) -> bool {
+        selection.is_some_and(|value| value == self.id || value == self.legacy)
+    }
+}
+
+#[derive(Clone)]
 struct OutputWorker {
     tx: Sender<WorkerCmd>,
     ok: Arc<AtomicBool>,
+    status: Arc<Mutex<String>>,
 }
 
 #[derive(Clone)]
 pub struct AudioHandle {
     keypad: OutputWorker,
     siren: OutputWorker,
-    devices: Arc<Mutex<Vec<String>>>,
+    devices: Arc<Mutex<Endpoints>>,
     split: Arc<AtomicBool>,
 }
 
@@ -148,8 +195,13 @@ impl AudioHandle {
         let _ = self.siren.tx.send(WorkerCmd::Output(siren_output));
     }
 
-    pub fn devices(&self) -> Vec<String> {
+    pub fn devices(&self) -> Endpoints {
         self.devices.lock().map(|devices| devices.clone()).unwrap_or_default()
+    }
+
+    pub fn output_status(&self, siren: bool) -> String {
+        let worker = if siren && self.split.load(Ordering::Relaxed) { &self.siren } else { &self.keypad };
+        worker.status.lock().map(|status| status.clone()).unwrap_or_default()
     }
 
     pub fn keypad_ok(&self) -> bool {
@@ -167,7 +219,7 @@ impl AudioHandle {
 }
 
 pub fn start() -> AudioHandle {
-    let devices = Arc::new(Mutex::new(Vec::new()));
+    let devices = Arc::new(Mutex::new(Endpoints::default()));
     AudioHandle {
         keypad: start_output("audio-keypad", Some(devices.clone())),
         siren: start_output("audio-siren", None),
@@ -176,15 +228,17 @@ pub fn start() -> AudioHandle {
     }
 }
 
-fn start_output(name: &'static str, devices: Option<Arc<Mutex<Vec<String>>>>) -> OutputWorker {
+fn start_output(name: &'static str, devices: Option<Arc<Mutex<Endpoints>>>) -> OutputWorker {
     let (tx, rx) = mpsc::channel();
     let ok = Arc::new(AtomicBool::new(false));
     let running = ok.clone();
-    let spawned = std::thread::Builder::new().name(name.into()).spawn(move || run(rx, running, devices));
+    let status = Arc::new(Mutex::new(String::new()));
+    let status_rx = status.clone();
+    let spawned = std::thread::Builder::new().name(name.into()).spawn(move || run(rx, running, status_rx, devices));
     if let Err(e) = spawned {
         util::log(&format!("could not start {}: {}", name, e));
     }
-    OutputWorker { tx, ok }
+    OutputWorker { tx, ok, status }
 }
 
 /// The lasting state, replayed into each new output stream.
@@ -225,7 +279,7 @@ impl State {
 
     /// Sounds that matter if they're missed while the output reconnects.
     fn worth_replaying(c: &AudioCmd) -> bool {
-        matches!(c, AudioCmd::KeyBeep | AudioCmd::Beeps { .. } | AudioCmd::Chime(_) | AudioCmd::Tone { .. } | AudioCmd::ToneSeq { .. } | AudioCmd::Speak(_))
+        matches!(c, AudioCmd::KeyBeep | AudioCmd::Beeps { .. } | AudioCmd::Chime(_) | AudioCmd::Tone { .. } | AudioCmd::ToneSeq { .. } | AudioCmd::Speak(_) | AudioCmd::Preview { .. } | AudioCmd::PlayMemo(_) | AudioCmd::PlayMicTest(_))
     }
 
     fn replay(&self) -> Vec<AudioCmd> {
@@ -236,7 +290,7 @@ impl State {
     }
 }
 
-fn run(rx: Receiver<WorkerCmd>, ok: Arc<AtomicBool>, devices: Option<Arc<Mutex<Vec<String>>>>) {
+fn run(rx: Receiver<WorkerCmd>, ok: Arc<AtomicBool>, status: Arc<Mutex<String>>, devices: Option<Arc<Mutex<Endpoints>>>) {
     util::set_thread_priority(util::prio::PANEL);
 
     // Endpoint enumeration can block on WASAPI. Keep it off the command path.
@@ -250,13 +304,17 @@ fn run(rx: Receiver<WorkerCmd>, ok: Arc<AtomicBool>, devices: Option<Arc<Mutex<V
         let _ = std::thread::Builder::new().name("audio-watch".into()).spawn(move || {
             util::set_thread_priority(util::prio::BACKGROUND);
             while !stop.load(Ordering::Relaxed) {
-                let names = output_names();
+                let host = cpal::default_host();
+                let names = Endpoints {
+                    outputs: list_endpoints(&host, false).into_iter().map(|(endpoint, _)| endpoint).collect(),
+                    inputs: list_endpoints(&host, true).into_iter().map(|(endpoint, _)| endpoint).collect(),
+                };
                 if let Ok(mut list) = devices.lock() {
                     *list = names;
                 }
                 let current = active.lock().ok().and_then(|name| name.clone());
                 if let Some(current) = current {
-                    if default_output_name().is_some_and(|name| name != current) {
+                    if default_output_id().is_some_and(|name| name != current) {
                         switched.store(true, Ordering::Release);
                     }
                 }
@@ -288,14 +346,19 @@ fn run(rx: Receiver<WorkerCmd>, ok: Arc<AtomicBool>, devices: Option<Arc<Mutex<V
         for cmd in state.replay().into_iter().filter(|cmd| current.route.accepts(cmd)) {
             let _ = tx.send(cmd);
         }
-        let built = build_stream(input, failed.clone(), current.device.as_deref());
-        if let Ok(mut name) = active_default.lock() {
-            *name = if current.device.is_none() { built.as_ref().ok().and_then(|(_, name)| name.clone()) } else { None };
+        let built = build_stream(input, failed.clone(), ok.clone(), current.device.as_deref());
+        if let Ok(mut status) = status.lock() {
+            *status = match &built {
+                Ok((_, _, label)) => label.clone(),
+                Err(error) => error.clone(),
+            };
         }
-        let stream = built.map(|(stream, _)| stream);
+        if let Ok(mut name) = active_default.lock() {
+            *name = if current.device.is_none() { built.as_ref().ok().and_then(|(_, id, _)| id.clone()) } else { None };
+        }
+        let stream = built.map(|(stream, _, _)| stream);
         match &stream {
             Ok(_) => {
-                ok.store(true, Ordering::Relaxed);
                 if logged {
                     util::log(&format!("{:?} audio output is back", current.route));
                 }
@@ -316,8 +379,15 @@ fn run(rx: Receiver<WorkerCmd>, ok: Arc<AtomicBool>, devices: Option<Arc<Mutex<V
         }
 
         let deadline = Instant::now() + backoff;
+        let started = Instant::now();
         let retry = loop {
             let alive = stream.is_ok() && !failed.load(Ordering::Relaxed);
+            if alive && !ok.load(Ordering::Relaxed) && started.elapsed() > Duration::from_secs(3) {
+                if let Ok(mut status) = status.lock() {
+                    *status = "Selected device opened but did not request audio".into();
+                }
+                break true;
+            }
             if switch_flag.swap(false, Ordering::Acquire) || (stream.is_ok() && !alive) {
                 break true;
             }
@@ -358,8 +428,8 @@ fn run(rx: Receiver<WorkerCmd>, ok: Arc<AtomicBool>, devices: Option<Arc<Mutex<V
         if let Ok(mut name) = active_default.lock() {
             *name = None;
         }
-        ok.store(false, Ordering::Relaxed);
         drop(stream);
+        ok.store(false, Ordering::Relaxed);
         if !retry {
             break;
         }
@@ -367,143 +437,117 @@ fn run(rx: Receiver<WorkerCmd>, ok: Arc<AtomicBool>, devices: Option<Arc<Mutex<V
     stop_watch.store(true, Ordering::Relaxed);
 }
 
-fn output_names() -> Vec<String> {
-    use cpal::traits::{DeviceTrait, HostTrait};
-    let mut names: Vec<_> = cpal::default_host()
-        .output_devices()
-        .into_iter()
-        .flatten()
-        .filter_map(|device| device.name().ok())
-        .collect();
-    names.sort_unstable();
-    names.dedup();
-    names
-}
-
-/// The output the system is set to use right now.
-fn default_output_name() -> Option<String> {
-    use cpal::traits::{DeviceTrait, HostTrait};
-    cpal::default_host().default_output_device().and_then(|d| d.name().ok())
-}
-
-/// Fills one buffer from the synth. A bug in the synth must never take the
-/// audio thread down with it, so a panic just gives a buffer of silence.
-fn render<T: Copy>(synth: &mut synth::Synth, data: &mut [T], channels: usize, silence: T, conv: impl Fn(f32) -> T) {
-    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        for frame in data.chunks_mut(channels) {
-            let s = conv(synth.next());
-            for o in frame.iter_mut() {
-                *o = s;
+fn list_endpoints(host: &cpal::Host, input: bool) -> Vec<(Endpoint, cpal::Device)> {
+    let devices: Vec<_> = if input {
+        host.input_devices().map(|devices| devices.collect()).unwrap_or_default()
+    } else {
+        host.output_devices().map(|devices| devices.collect()).unwrap_or_default()
+    };
+    let mut result: Vec<_> = devices.into_iter().filter_map(|device| {
+        let id = device.id().ok()?.to_string();
+        let label = device_label(&device);
+        Some((Endpoint { id, label: label.clone(), legacy: label }, device))
+    }).collect();
+    result.sort_unstable_by(|a, b| (&a.0.legacy, &a.0.id).cmp(&(&b.0.legacy, &b.0.id)));
+    let mut first = 0;
+    while first < result.len() {
+        let end = first + result[first..].iter().take_while(|(endpoint, _)| endpoint.legacy == result[first].0.legacy).count();
+        if end - first > 1 {
+            for (index, (endpoint, _)) in result[first..end].iter_mut().enumerate() {
+                endpoint.label = format!("{} ({})", endpoint.legacy, index + 1);
             }
         }
-    }));
-    if res.is_err() {
-        for o in data.iter_mut() {
-            *o = silence;
-        }
+        first = end;
     }
+    result
 }
 
-/// Opens the selected output, or the system default when none is selected.
-fn build_stream(rx: Receiver<AudioCmd>, failed: Arc<AtomicBool>, selected: Option<&str>) -> Result<(cpal::Stream, Option<String>), String> {
-    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+fn device_label(device: &cpal::Device) -> String {
+    let description = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| device.description())).ok().and_then(Result::ok);
+    description.map(|description| {
+        // WASAPI exposes the Windows Sound settings name in the first
+        // extended field when it differs from the short device name.
+        if cfg!(windows) {
+            description.extended().first().cloned().unwrap_or_else(|| description.name().to_string())
+        } else {
+            description.name().into()
+        }
+    }).unwrap_or_else(|| "Audio device".into())
+}
+
+fn choose_device(input: bool, selected: Option<&str>) -> Result<cpal::Device, String> {
     let host = cpal::default_host();
-    let device = match selected {
-        Some(name) => host
-            .output_devices()
-            .map_err(|e| e.to_string())?
-            .find(|device| device.name().ok().as_deref() == Some(name))
-            .ok_or_else(|| format!("{} is disconnected", name))?,
-        None => host.default_output_device().ok_or_else(|| "no audio output device".to_string())?,
+    let Some(selected) = selected else {
+        return if input { host.default_input_device() } else { host.default_output_device() }
+            .ok_or_else(|| if input { "No microphone is available" } else { "No speaker is available" }.into());
     };
-    let name = device.name().ok();
-    let supported = device.default_output_config().map_err(|e| e.to_string())?;
-    let format = supported.sample_format();
-    let config: cpal::StreamConfig = supported.into();
-    let channels = config.channels.max(1) as usize;
-    let rate = config.sample_rate.0 as f32;
-    let mut synth = synth::Synth::new(rate);
-    // The sound thread gets a high priority the first time it runs, so heavy
-    // background work can never make the keypad stutter or beep late.
-    let mut boosted = false;
-    util::log(&format!(
-        "audio output: {}, {} Hz, {} channels, {:?}",
-        name.as_deref().unwrap_or("unnamed device"),
-        config.sample_rate.0,
-        channels,
-        format
-    ));
-    let flag = failed.clone();
-    let on_error = move |e: cpal::StreamError| {
-        util::log(&format!("audio stream error: {}", e));
-        flag.store(true, Ordering::Relaxed);
-    };
-    let stream = match format {
-        cpal::SampleFormat::F32 => device.build_output_stream(
-            &config,
-            move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                if !boosted {
-                    boosted = true;
-                    util::set_thread_priority(util::prio::AUDIO);
-                }
-                while let Ok(c) = rx.try_recv() {
-                    synth.apply(c);
-                }
-                render(&mut synth, data, channels, 0.0f32, |s| s);
-            },
-            on_error,
-            None,
-        ),
-        cpal::SampleFormat::I16 => device.build_output_stream(
-            &config,
-            move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
-                if !boosted {
-                    boosted = true;
-                    util::set_thread_priority(util::prio::AUDIO);
-                }
-                while let Ok(c) = rx.try_recv() {
-                    synth.apply(c);
-                }
-                render(&mut synth, data, channels, 0i16, |s| (s.clamp(-1.0, 1.0) * 32767.0) as i16);
-            },
-            on_error,
-            None,
-        ),
-        cpal::SampleFormat::I32 => device.build_output_stream(
-            &config,
-            move |data: &mut [i32], _: &cpal::OutputCallbackInfo| {
-                if !boosted {
-                    boosted = true;
-                    util::set_thread_priority(util::prio::AUDIO);
-                }
-                while let Ok(c) = rx.try_recv() {
-                    synth.apply(c);
-                }
-                render(&mut synth, data, channels, 0i32, |s| (s.clamp(-1.0, 1.0) as f64 * 2_147_483_647.0) as i32);
-            },
-            on_error,
-            None,
-        ),
-        cpal::SampleFormat::U16 => device.build_output_stream(
-            &config,
-            move |data: &mut [u16], _: &cpal::OutputCallbackInfo| {
-                if !boosted {
-                    boosted = true;
-                    util::set_thread_priority(util::prio::AUDIO);
-                }
-                while let Ok(c) = rx.try_recv() {
-                    synth.apply(c);
-                }
-                render(&mut synth, data, channels, 32768u16, |s| ((s.clamp(-1.0, 1.0) * 0.5 + 0.5) * 65535.0) as u16);
-            },
-            on_error,
-            None,
-        ),
-        other => return Err(format!("unsupported sample format {:?}", other)),
+    let mut matching = list_endpoints(&host, input).into_iter()
+        .filter(|(endpoint, _)| endpoint.matches(Some(selected)));
+    let (_, device) = matching.next().ok_or("Selected audio device is unavailable")?;
+    if matching.next().is_some() {
+        return Err("Several devices share this name. Select the numbered device again.".into());
     }
-    .map_err(|e| e.to_string())?;
-    stream.play().map_err(|e| e.to_string())?;
-    Ok((stream, name))
+    Ok(device)
+}
+
+fn default_output_id() -> Option<String> {
+    cpal::default_host().default_output_device()?.id().ok().map(|id| id.to_string())
+}
+
+fn output_stream<T: SizedSample + FromSample<f32>>(
+    device: &cpal::Device, config: &cpal::StreamConfig, rx: Receiver<AudioCmd>,
+    failed: Arc<AtomicBool>, ready: Arc<AtomicBool>,
+) -> Result<cpal::Stream, cpal::BuildStreamError> {
+    let channels = usize::from(config.channels.max(1));
+    let mut synth = synth::Synth::new(config.sample_rate as f32);
+    let mut boosted = false;
+    let stream_error = failed.clone();
+    device.build_output_stream(
+        config,
+        move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
+            if !boosted {
+                boosted = true;
+                util::set_thread_priority(util::prio::AUDIO);
+            }
+            while let Ok(cmd) = rx.try_recv() {
+                synth.apply(cmd);
+            }
+            let render = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                for frame in data.chunks_mut(channels) {
+                    frame.fill(T::from_sample(synth.next().clamp(-0.99999, 0.99999)));
+                }
+            }));
+            if render.is_err() {
+                data.fill(T::EQUILIBRIUM);
+                failed.store(true, Ordering::Relaxed);
+            } else {
+                ready.store(true, Ordering::Relaxed);
+            }
+        },
+        move |error| {
+            stream_error.store(true, Ordering::Relaxed);
+            util::log(&format!("audio stream error: {error}"));
+        },
+        None,
+    )
+}
+
+fn build_stream(
+    rx: Receiver<AudioCmd>, failed: Arc<AtomicBool>, ready: Arc<AtomicBool>, selected: Option<&str>,
+) -> Result<(cpal::Stream, Option<String>, String), String> {
+    let device = choose_device(false, selected)?;
+    let id = device.id().ok().map(|id| id.to_string());
+    let label = device_label(&device);
+    let supported = device.default_output_config().map_err(|e| format!("{label}: {e}"))?;
+    let format = supported.sample_format();
+    let config = supported.config();
+    macro_rules! open {
+        ($ty:ty) => { output_stream::<$ty>(&device, &config, rx, failed, ready) };
+    }
+    let stream = pcm!(format, open).map_err(|e| format!("{label}: {e}"))?;
+    stream.play().map_err(|e| format!("{label}: {e}"))?;
+    util::log(&format!("audio output: {label}, {} Hz, {} channels, {format}", config.sample_rate, config.channels));
+    Ok((stream, id, label))
 }
 
 #[cfg(test)]

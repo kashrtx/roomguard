@@ -268,6 +268,7 @@ pub struct SoundCfg {
     pub siren_model: SirenModel,
     /// None follows the operating system's default output.
     pub keypad_output: Option<String>,
+    pub microphone: Option<String>,
     /// None uses the same output as the keypad.
     pub siren_output: Option<String>,
     /// Wire the WAVE-2F to its warble terminal instead of the steady one.
@@ -284,6 +285,7 @@ impl Default for SoundCfg {
             keypad: 0.7,
             siren_model: SirenModel::Wave2F,
             keypad_output: None,
+            microphone: None,
             siren_output: None,
             wave2_warble: true,
             line_audio: false,
@@ -361,6 +363,10 @@ pub struct UiCfg {
     pub door_open_5500: bool,
     pub door_open_6160: bool,
     pub right_tab: u8,
+    pub show_camera_sidebar: bool,
+    pub show_monitoring_sidebar: bool,
+    pub keypad_only: bool,
+    pub lock_layout_while_armed: bool,
     pub show_motion: bool,
     pub show_tracks: bool,
     /// The hidden installer tab in Settings has been unlocked.
@@ -377,6 +383,10 @@ impl Default for UiCfg {
             door_open_5500: true,
             door_open_6160: true,
             right_tab: 0,
+            show_camera_sidebar: true,
+            show_monitoring_sidebar: true,
+            keypad_only: false,
+            lock_layout_while_armed: false,
             show_motion: true,
             show_tracks: true,
             installer_view: false,

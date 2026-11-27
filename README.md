@@ -92,6 +92,18 @@ Download the latest release from the [Releases page](../../releases):
 
 ---
 
+## Test speakers and microphone
+
+Open **Settings → Sound** and choose a device for **Keypad & voice**, **Siren**, and **Microphone**. Use **Test keypad** and **Test siren** to check the selected outputs. On Windows, use the same output names shown in Sound settings. A speaker and a headphone jack can share a single Windows output, depending on the sound driver.
+
+Select **Test microphone**, speak for three seconds, and listen for playback through **Keypad & voice**. The same microphone records VISTA memos. If Windows blocks recording, allow desktop app microphone access under **Settings → Privacy & security → Microphone**.
+
+## Use RoomGuard as a touchscreen keypad
+
+Open **Layout** in the top bar to show or hide **Camera & zones** and **Monitoring & history** independently. Choose **Keypad only** to give the keypad the whole wall. **Exit keypad view** restores your sidebar choices.
+
+Turn on **Lock keypad view when armed** to switch to the keypad automatically when arming begins. The sidebars and setup controls stay hidden until you disarm by touch or keyboard. Monitoring and notifications keep running in keypad view.
+
 ## Phone alerts and quiet monitoring
 
 1. Open **Settings → Phone alerts** and turn on **Send alerts to my phone**.

@@ -285,7 +285,7 @@ impl RoomGuardApp {
         rx.recv_timeout(Duration::from_millis(800)).unwrap_or(false)
     }
 
-    fn top_bar(&mut self, ctx: &egui::Context, view: &View, changed: &mut bool) {
+    fn top_bar(&mut self, ctx: &egui::Context, view: &View, layout_locked: bool, changed: &mut bool) {
         egui::TopBottomPanel::top("top-bar")
             .exact_height(56.0)
             .frame(egui::Frame::none().fill(theme::BG).inner_margin(egui::Margin::symmetric(16.0, 0.0)))
@@ -294,7 +294,8 @@ impl RoomGuardApp {
                     brand(ui);
                     ui.add_space(14.0);
                     let col = views::status_color(view.status);
-                    let max_w = (ui.available_width() - 360.0).max(160.0);
+                    let controls_width = if layout_locked || self.cfg.ui.keypad_only { 225.0 } else { 490.0 };
+                    let max_w = (ui.available_width() - controls_width).max(160.0);
                     egui::Frame::none()
                         .fill(col.gamma_multiply(0.14))
                         .rounding(16.0)
@@ -314,9 +315,37 @@ impl RoomGuardApp {
                             });
                         });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if layout_locked {
+                            ui.label(RichText::new("Layout locked · Disarm to unlock").color(theme::AMBER));
+                            return;
+                        }
+                        if self.cfg.ui.keypad_only {
+                            if ui.add_sized([140.0, 34.0], egui::Button::new("Exit keypad view")).clicked() {
+                                self.cfg.ui.keypad_only = false;
+                                *changed = true;
+                            }
+                            return;
+                        }
                         if icon_button(ui, Icon::Gear, "Settings").clicked() {
                             self.settings.open = !self.settings.open;
                         }
+                        let layout_menu = ui.scope(|ui| {
+                            ui.spacing_mut().interact_size.y = 34.0;
+                            ui.menu_button("Layout", |ui| {
+                                let prefs = &mut self.cfg.ui;
+                                *changed |= ui.checkbox(&mut prefs.show_camera_sidebar, "Camera & zones").changed();
+                                *changed |= ui.checkbox(&mut prefs.show_monitoring_sidebar, "Monitoring & history").changed();
+                                ui.separator();
+                                *changed |= ui.checkbox(&mut prefs.lock_layout_while_armed, "Lock keypad view when armed").changed();
+                                if ui.button("Keypad only").clicked() {
+                                    prefs.keypad_only = true;
+                                    self.settings.open = false;
+                                    *changed = true;
+                                    ui.close_menu();
+                                }
+                            }).response
+                        }).inner;
+                        layout_menu.on_hover_text("Show or hide the sidebars");
                         let on = self.cfg.ui.lights_on;
                         let tip = if on { "Turn the room lights off" } else { "Turn the room lights on" };
                         if icon_button(ui, if on { Icon::Sun } else { Icon::Moon }, tip).clicked() {
@@ -485,7 +514,7 @@ impl RoomGuardApp {
         56.0
     }
 
-    fn wall(&mut self, ui: &mut egui::Ui, view: &View, t: f64, changed: &mut bool) {
+    fn wall(&mut self, ui: &mut egui::Ui, view: &View, t: f64, keypad_only: bool, changed: &mut bool) {
         let rect = ui.max_rect();
         let p = ui.painter().clone();
         let l = self.lights;
@@ -506,10 +535,11 @@ impl RoomGuardApp {
         paint::grad_rrect(&p, base, 0.0, paint::dim(Color32::from_rgb(0xEA, 0xE7, 0xE0), l), paint::dim(Color32::from_rgb(0xBC, 0xB7, 0xAD), l), Some(Stroke::NONE));
         p.line_segment([base.left_top(), base.right_top()], Stroke::new(1.0f32, paint::dim(Color32::from_rgb(0xAA, 0xA4, 0x99), l)));
 
-        let banner = self.update_banner(ui.ctx(), rect);
+        let banner = if keypad_only { 0.0 } else { self.update_banner(ui.ctx(), rect) };
+        let bottom_margin = if keypad_only { 22.0 } else { 68.0 };
         let area = Rect::from_min_max(
             Pos2::new(rect.left() + 14.0, rect.top() + banner + 10.0),
-            Pos2::new(rect.right() - 14.0, rect.bottom() - 68.0),
+            Pos2::new(rect.right() - 14.0, rect.bottom() - bottom_margin),
         );
         let toggled = match view.model {
             Model::Pc1550 => keypads::classic::draw(ui, area, view, &mut self.input, &self.engine, &self.audio, l, t),
@@ -526,6 +556,16 @@ impl RoomGuardApp {
             *changed = true;
         }
 
+        if !keypad_only {
+            self.wall_hints(&p, rect, view);
+        }
+        if view.bell {
+            let a = ((t * 3.5).sin() * 0.5 + 0.5) as f32;
+            p.rect_stroke(rect.shrink(4.0), 0.0, Stroke::new(8.0f32, paint::alpha(theme::RED, 0.25 + 0.45 * a)));
+        }
+    }
+
+    fn wall_hints(&self, p: &egui::Painter, rect: Rect, view: &View) {
         let caption = match view.model {
             Model::Pc1550 => "RmG Classic LED Keypad  \u{00b7}  PC1550 compatible  \u{00b7}  Click cover to swing open/closed",
             Model::Pc1832 => "GuardSeries LCD Keypad  \u{00b7}  PC1832 compatible  \u{00b7}  Click cover to flip open/closed",
@@ -538,7 +578,7 @@ impl RoomGuardApp {
         };
         // While a menu or delay is running, say what the keypad is waiting for.
         let hint: &str = if view.hint.is_empty() { keys_hint } else { view.hint.as_str() };
-        let ink = paint::dim(Color32::from_rgb(0x5E, 0x58, 0x4E), l.max(0.75));
+        let ink = paint::dim(Color32::from_rgb(0x5E, 0x58, 0x4E), self.lights.max(0.75));
         let max_text_w = (rect.width() - 32.0).max(160.0);
         let cap_galley = p.fonts(|f| f.layout(caption.to_string(), theme::semi(12.0), ink, max_text_w));
         let hint_galley = p.fonts(|f| f.layout(hint.to_string(), theme::regular(11.0), paint::alpha(ink, 0.85), max_text_w));
@@ -546,14 +586,9 @@ impl RoomGuardApp {
         let cap_y = hint_y - 3.0 - cap_galley.size().y;
         p.galley(Pos2::new(rect.center().x - cap_galley.size().x * 0.5, cap_y), cap_galley, ink);
         p.galley(Pos2::new(rect.center().x - hint_galley.size().x * 0.5, hint_y), hint_galley, paint::alpha(ink, 0.85));
-
-        if view.bell {
-            let a = ((t * 3.5).sin() * 0.5 + 0.5) as f32;
-            p.rect_stroke(rect.shrink(4.0), 0.0, Stroke::new(8.0f32, paint::alpha(theme::RED, 0.25 + 0.45 * a)));
-        }
     }
 
-    fn close_prompt(&mut self, ctx: &egui::Context) {
+    fn close_prompt(&mut self, ctx: &egui::Context, layout_locked: bool) {
         if !self.close_dialog {
             return;
         }
@@ -562,7 +597,7 @@ impl RoomGuardApp {
             ui.painter().rect_filled(screen, 0.0, Color32::from_black_alpha(160));
             ui.allocate_rect(screen, Sense::click());
         });
-        let needs_code = self.cfg.close_needs_code;
+        let needs_code = self.cfg.close_needs_code || layout_locked;
         egui::Window::new("close-armed")
             .title_bar(false)
             .collapsible(false)
@@ -793,11 +828,22 @@ impl RoomGuardApp {
         self.input.sync_doors(ctx, self.cfg.ui.door_open_1550, self.cfg.ui.door_open_5500, self.cfg.ui.door_open_6160);
 
         let mut changed = false;
-        self.top_bar(ctx, &view, &mut changed);
-        self.left_panel(ctx, &view, &mut changed);
-        self.right_panel(ctx, &view);
+        let layout_locked = view.armed && self.cfg.ui.lock_layout_while_armed;
+        if layout_locked {
+            self.settings.open = false;
+        }
+        self.top_bar(ctx, &view, layout_locked, &mut changed);
+        let keypad_only = layout_locked || self.cfg.ui.keypad_only;
+        if !keypad_only && self.cfg.ui.show_camera_sidebar {
+            self.left_panel(ctx, &view, &mut changed);
+        } else {
+            self.camera_view.draw = views::camera::Draw::Off;
+        }
+        if !keypad_only && self.cfg.ui.show_monitoring_sidebar {
+            self.right_panel(ctx, &view);
+        }
         egui::CentralPanel::default().frame(egui::Frame::none().fill(theme::BG)).show(ctx, |ui| {
-            self.wall(ui, &view, t, &mut changed);
+            self.wall(ui, &view, t, keypad_only, &mut changed);
         });
 
         // Trigger a fresh empty-room calibration automatically once per app launch
@@ -826,7 +872,15 @@ impl RoomGuardApp {
             self.camera_view.draw = views::camera::Draw::Off;
         }
 
-        let modal = self.setup.is_some() || self.settings.open || self.close_dialog || self.camera_view.draw != views::camera::Draw::Off;
+        let setup_visible = self.setup.is_some() && !layout_locked;
+        let modal = setup_visible || self.settings.open || self.close_dialog || self.camera_view.draw != views::camera::Draw::Off;
+        if layout_locked && !self.close_dialog {
+            ctx.memory_mut(|m| {
+                if let Some(id) = m.focused() {
+                    m.surrender_focus(id);
+                }
+            });
+        }
         if !modal && self.input.keyboard(ctx, &self.engine, &self.audio, view.model) {
             // Auto-open the keypad cover when the user types on their physical keyboard.
             match view.model {
@@ -860,7 +914,7 @@ impl RoomGuardApp {
             return;
         }
         let mut setup_done = false;
-        if let Some(setup) = self.setup.as_mut() {
+        if let Some(setup) = self.setup.as_mut().filter(|_| !layout_locked) {
             setup_done = setup.ui(ctx, &mut self.cfg, &mut changed, &self.engine, &self.cam);
         }
         if setup_done {
@@ -869,7 +923,7 @@ impl RoomGuardApp {
                 self.updater.check(ctx);
             }
         }
-        self.close_prompt(ctx);
+        self.close_prompt(ctx, layout_locked);
         if changed {
             self.push_cfg();
         }

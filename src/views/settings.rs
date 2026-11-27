@@ -12,6 +12,23 @@ use crate::update::{UpdateState, Updater};
 use crate::util;
 use crate::vision::{CamCmd, CameraHandle};
 
+fn audio_device_picker(ui: &mut egui::Ui, label: &str, value: &mut Option<String>, default: &str, devices: &[crate::audio::Endpoint]) -> bool {
+    let display = match value.as_deref() {
+        None => default,
+        Some(selected) => devices.iter().find(|device| device.matches(Some(selected)))
+            .map(|device| device.label.as_str())
+            .unwrap_or_else(|| if selected.parse::<cpal::DeviceId>().is_ok() { "Selected device unavailable" } else { selected }),
+    };
+    let mut changed = false;
+    egui::ComboBox::from_id_salt(("sound-output", label)).selected_text(display).width(230.0).show_ui(ui, |ui| {
+        changed |= ui.selectable_value(value, None, default).changed();
+        for device in devices {
+            changed |= ui.selectable_value(value, Some(device.id.clone()), &device.label).changed();
+        }
+    });
+    changed
+}
+
 const TABS: [&str; 8] = ["General", "Panel", "Camera", "Sound", "Phone alerts", "Updates", "Home Assistant", "About"];
 
 #[derive(Default)]
@@ -106,7 +123,7 @@ impl SettingsView {
                                 0 => self.general(ui, cfg, changed, view),
                                 1 => super::installer::ui(ui, &view.prog, view.armed, engine, &mut self.panel_ui),
                                 2 => self.camera(ui, cfg, changed, cam),
-                                3 => self.sound(ui, cfg, changed, audio),
+                                3 => self.sound(ui, cfg, changed, view, engine, audio),
                                 4 => self.monitoring(ui, cfg, changed, view, engine),
                                 5 => self.updates(ui, cfg, changed, updater),
                                 6 => self.home_ui.ui(ui, cfg, changed, view, engine),
@@ -454,35 +471,52 @@ impl SettingsView {
         }
     }
 
-    fn sound(&mut self, ui: &mut egui::Ui, cfg: &mut AppConfig, changed: &mut bool, audio: &AudioHandle) {
+    fn sound(&mut self, ui: &mut egui::Ui, cfg: &mut AppConfig, changed: &mut bool, view: &View, engine: &EngineHandle, audio: &AudioHandle) {
         let s = &mut cfg.sound;
         section(ui, "Audio outputs");
         let devices = audio.devices();
-        for (label, default, output, online) in [
-            ("Keypad & voice", "System default", &mut s.keypad_output, audio.keypad_ok()),
-            ("Siren", "Same as keypad", &mut s.siren_output, audio.is_ok()),
+        for (label, default, output, siren) in [
+            ("Keypad & voice", "System default", &mut s.keypad_output, false),
+            ("Siren", "Same as keypad", &mut s.siren_output, true),
         ] {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label(label);
-                egui::ComboBox::from_id_salt(("sound-output", label))
-                    .selected_text(output.as_deref().unwrap_or(default))
-                    .width(210.0)
-                    .show_ui(ui, |ui| {
-                        *changed |= ui.selectable_value(output, None, default).changed();
-                        for device in &devices {
-                            *changed |= ui.selectable_value(output, Some(device.clone()), device).changed();
-                        }
-                    });
-                if !online {
-                    ui.label(theme::muted("Output unavailable"));
-                }
-                if label == "Keypad & voice" && ui.small_button("Test keypad").clicked() {
-                    audio.send(AudioCmd::KeyBeep);
+                *changed |= audio_device_picker(ui, label, output, default, &devices.outputs);
+                if ui.small_button(if siren { "Test siren" } else { "Test keypad" }).clicked() {
+                    if siren {
+                        audio.send(AudioCmd::Preview { model: s.siren_model, warble: s.wave2_warble, ms: 3000 });
+                    } else {
+                        audio.send(AudioCmd::KeyBeep);
+                    }
                 }
             });
+            let status = audio.output_status(siren);
+            let online = if siren { audio.is_ok() } else { audio.keypad_ok() };
+            if online {
+                ui.label(theme::muted(status));
+            } else {
+                ui.label(RichText::new(if status.is_empty() { "Opening output…" } else { status.as_str() }).color(theme::AMBER));
+            }
         }
-        ui.label(theme::muted("Choose a separate speaker for the siren. Use Test below to check it."));
+        if s.master == 0.0 || s.siren == 0.0 {
+            ui.label(RichText::new("The siren volume is muted in RoomGuard.").color(theme::AMBER));
+        }
         ui.label(theme::muted("Place a dedicated speaker somewhere stable and ventilated, out of casual reach. Keep it clear of vents, fabrics, and exit paths. Test audibility from the rooms you want to cover."));
+
+        section(ui, "Microphone");
+        ui.horizontal_wrapped(|ui| {
+            ui.add_enabled_ui(!view.mic_test_running, |ui| {
+                *changed |= audio_device_picker(ui, "microphone", &mut s.microphone, "System default", &devices.inputs);
+                if ui.small_button("Test microphone").clicked() {
+                    engine.send(EngineMsg::TestMicrophone(s.microphone.clone()));
+                }
+            });
+        });
+        ui.label(theme::muted("The test records for 3 seconds and plays it through Keypad & voice. The VISTA keypad uses the same input for voice memos."));
+        if !view.mic_test_status.is_empty() {
+            ui.label(theme::muted(&view.mic_test_status));
+        }
+
         section(ui, "Volume");
         egui::Grid::new("settings-volume").num_columns(3).spacing([12.0, 6.0]).show(ui, |ui| {
             for (label, v) in [("Everything", &mut s.master), ("Siren", &mut s.siren), ("Keypad", &mut s.keypad)] {

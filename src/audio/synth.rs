@@ -689,7 +689,7 @@ pub struct Synth {
     buzzer_level: u8,
     piezo: Piezo,
     voice_player: VoicePlayer,
-    memo: Option<(super::memo::Clip, f64)>,
+    memo: Option<(super::memo::Clip, f64, bool)>,
     voice_level: u8,
     sounder: Gate,
     segs: VecDeque<Seg>,
@@ -824,7 +824,11 @@ impl Synth {
             }
             AudioCmd::PlayMemo(clip) => {
                 self.voice_player.stop();
-                self.memo = Some((clip, 0.0));
+                self.memo = Some((clip, 0.0, false));
+            }
+            AudioCmd::PlayMicTest(clip) => {
+                self.voice_player.stop();
+                self.memo = Some((clip, 0.0, true));
             }
             AudioCmd::Sounder(p) => {
                 // Starting a brand-new sounder (e.g. exit delay right after arming)
@@ -1105,7 +1109,7 @@ impl Synth {
     }
 
     fn memo_next(&mut self) -> f32 {
-        let Some((clip, position)) = self.memo.as_mut() else {
+        let Some((clip, position, test)) = self.memo.as_mut() else {
             return 0.0;
         };
         let index = *position as usize;
@@ -1116,7 +1120,7 @@ impl Synth {
         let next = clip.samples.get(index + 1).copied().unwrap_or(sample);
         let interpolated = sample + (next - sample) * position.fract() as f32;
         *position += f64::from(clip.rate) / f64::from(self.sr);
-        let gain = if self.voice_level == 0 { 0.0 } else { 0.28 + 0.72 * f32::from(self.voice_level) / 7.0 };
+        let gain = if *test { 1.0 } else if self.voice_level == 0 { 0.0 } else { 0.28 + 0.72 * f32::from(self.voice_level) / 7.0 };
         interpolated * gain
     }
 
