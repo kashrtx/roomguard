@@ -644,6 +644,15 @@ impl SettingsView {
             } else {
                 ui.label(RichText::new(if status.is_empty() { "Opening output…" } else { status.as_str() }).color(theme::AMBER));
             }
+            // Shows whether RoomGuard is sending sound to this output at all.
+            let level = audio.output_level(siren);
+            ui.horizontal(|ui| {
+                ui.add(egui::ProgressBar::new((level * 2.0).min(1.0)).desired_width(140.0));
+                ui.label(theme::muted(if level > 0.01 { "Sound is going to this output" } else { "Quiet" }));
+            });
+            if level > 0.001 {
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(80));
+            }
         }
         if s.master == 0.0 || s.siren == 0.0 {
             ui.label(RichText::new("The siren volume is muted in RoomGuard.").color(theme::AMBER));
@@ -657,6 +666,7 @@ impl SettingsView {
             ui.label(RichText::new("Both selections are playing to the same device. Choose a specific speaker for Keypad & voice.").color(theme::AMBER));
         }
         ui.label(theme::muted("Place a dedicated speaker somewhere stable and ventilated, out of casual reach. Keep it clear of vents, fabrics, and exit paths. Test audibility from the rooms you want to cover."));
+        ui.label(theme::muted("Test siren plays for 3 seconds. If its meter moves but you hear nothing, RoomGuard is sending sound: turn up that speaker in Windows Sound settings and RoomGuard's slider for it in the Volume Mixer."));
 
         section(ui, "Microphone");
         ui.horizontal_wrapped(|ui| {

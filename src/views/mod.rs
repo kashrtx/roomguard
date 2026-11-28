@@ -23,7 +23,7 @@ pub(super) fn zone_page(ui: &mut egui::Ui, id: egui::Id, count: usize) -> std::o
             for index in 0..pages {
                 let first = index * 8 + 1;
                 let last = (first + 7).min(count);
-                ui.selectable_value(&mut page, index, format!("{:02}–{:02}", first, last));
+                ui.selectable_value(&mut page, index, format!("{:02}-{:02}", first, last));
             }
         });
         ui.data_mut(|data| data.insert_temp(id, page));

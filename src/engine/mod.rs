@@ -341,6 +341,36 @@ fn master_slot(model: Model) -> &'static str {
     }
 }
 
+
+/// RoomGuard's state in Home Assistant's alarm panel words.
+pub(crate) fn ha_alarm_state(alarm: bool, entry: bool, exit: bool, armed: Option<types::ArmMode>, night: bool) -> &'static str {
+    if alarm {
+        "triggered"
+    } else if entry {
+        "pending"
+    } else if exit {
+        "arming"
+    } else {
+        match armed {
+            None => "disarmed",
+            Some(types::ArmMode::Away) => "armed_away",
+            Some(_) if night => "armed_night",
+            Some(_) => "armed_home",
+        }
+    }
+}
+
+/// `notify.mobile_app_x` (or just `mobile_app_x`) as (domain, service).
+pub(crate) fn notify_target(raw: &str) -> Option<(String, String)> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let (domain, service) = s.split_once('.').unwrap_or(("notify", s));
+    let valid = |p: &str| !p.is_empty() && p.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    (valid(domain) && valid(service)).then(|| (domain.to_string(), service.to_string()))
+}
+
 fn voice_for(model: Model) -> KeypadVoice {
     match model {
         Model::Pc1550 => KeypadVoice::Classic,
@@ -360,6 +390,22 @@ fn load_panel(model: Model, cfg: &AppConfig, now: Instant) -> Panel {
     p.ha_learned_exit_stay = cfg.home_assistant.learned_exit_stay;
     p.ha_learned_entry = cfg.home_assistant.learned_entry;
     p
+}
+
+/// Tracks one Home Assistant sensor's reporting outage. Returns whether the
+/// outage has outlasted the grace period (a supervision fault), and if not,
+/// when it will.
+pub(crate) fn sensor_outage(since: &mut Option<Instant>, reporting: bool, now: Instant) -> (bool, Option<Instant>) {
+    if reporting {
+        *since = None;
+        return (false, None);
+    }
+    let due = *since.get_or_insert(now) + panel::HA_SUPERVISION_GRACE;
+    if now >= due {
+        (true, None)
+    } else {
+        (false, Some(due))
+    }
 }
 
 struct Engine {
@@ -413,6 +459,21 @@ struct Engine {
     hub_epoch: u64,
     home_pulses: std::collections::BTreeMap<String, Instant>,
     ha_bell_active: bool,
+    /// What RoomGuard last told Home Assistant: its state and its alarm.
+    ha_state_sent: Option<&'static str>,
+    ha_alarm_sent: Option<(types::AlarmKind, u8)>,
+    /// When each Home Assistant zone's sensor stopped reporting.
+    home_unavail_since: [Option<Instant>; MAX_PANEL_ZONES],
+    /// When the earliest sensor outage outlasts its grace period.
+    home_grace_due: Option<Instant>,
+    /// The first alarm while Home Assistant was offline (kind, zone, zone
+    /// name, time, silent), reported when it reconnects.
+    ha_missed_alarm: Option<(types::AlarmKind, u8, String, String, bool)>,
+    /// The troubles last reported to Home Assistant.
+    ha_troubles_sent: Option<u32>,
+    /// The last refused announcement shown, so it's logged once, not per retry.
+    ha_announce_err: Option<String>,
+    ha_announced_online: bool,
     ha_bell_cmd_until: Option<Instant>,
     ha_bell_cmd_target: Option<bool>,
     ha_output_tests: std::collections::BTreeMap<String, Instant>,
@@ -481,6 +542,14 @@ impl Engine {
             hub_epoch: 0,
             home_pulses: Default::default(),
             ha_bell_active: false,
+            ha_state_sent: None,
+            home_unavail_since: [None; MAX_PANEL_ZONES],
+            home_grace_due: None,
+            ha_missed_alarm: None,
+            ha_troubles_sent: None,
+            ha_announce_err: None,
+            ha_alarm_sent: None,
+            ha_announced_online: false,
             ha_bell_cmd_until: None,
             ha_bell_cmd_target: None,
             ha_output_tests: Default::default(),
@@ -1228,6 +1297,21 @@ impl Engine {
                 self.panel.dirty = true;
                 return;
             }
+            ha::Update::AnnounceFailed { what, error } => {
+                let lower = error.to_ascii_lowercase();
+                let msg = if lower.contains("unauthorized") || lower.contains("admin") {
+                    format!("Home Assistant refused {what}: alarm announcements need a token from an administrator account")
+                } else {
+                    format!("Home Assistant refused {what}: {error}")
+                };
+                if self.ha_announce_err.as_deref() != Some(msg.as_str()) {
+                    self.panel.log(EvKind::Trouble, msg.clone());
+                    self.ha_announce_err = Some(msg.clone());
+                }
+                self.home.service_notice = Some((false, msg));
+                self.panel.dirty = true;
+                return;
+            }
             ha::Update::OutputResult { entity_id, on, result } => {
                 let name = self
                     .home
@@ -1583,17 +1667,29 @@ impl Engine {
             self.panel.home_zone.resize(n, false);
         }
         self.panel.home_sensor_unavailable = false;
+        let mut grace_due: Option<Instant> = None;
         for i in 0..n {
+            if self.cfg.home_assistant.binding(self.panel.model, (i + 1) as u8).is_none() {
+                self.home_unavail_since[i] = None;
+            }
             self.zone_want[i] = if let Some(binding) = self.cfg.home_assistant.binding(self.panel.model, (i + 1) as u8) {
                 self.panel.home_zone[i] = true;
                 let active = self.home_active(binding);
-                let available = active.is_some();
                 if let Some(camera) = self.panel.camera_zone.get_mut(i) {
                     *camera = false;
                 }
-                self.panel.home_sensor_unavailable |= !available;
+                // A sensor that stops reporting (Home Assistant restarting, a
+                // dropped link, an entity briefly unavailable) keeps its last
+                // known state, and only an outage that outlasts the grace
+                // period becomes a supervision fault. Faulting at once turned
+                // every Home Assistant restart into a burst of troubles.
+                let (lost, due) = sensor_outage(&mut self.home_unavail_since[i], active.is_some(), now);
+                if let Some(due) = due {
+                    grace_due = Some(grace_due.map_or(due, |d| d.min(due)));
+                }
+                self.panel.home_sensor_unavailable |= lost;
                 // Transport failure is a supervision fault, never a motion edge.
-                (active.unwrap_or(self.panel.zones[i].open), false, !available)
+                (active.unwrap_or(self.panel.zones[i].open), false, lost)
             } else if !mask.get(i).copied().unwrap_or(false) {
                 self.panel.home_zone[i] = false;
                 (self.sim[i], false, false)
@@ -1606,6 +1702,7 @@ impl Engine {
                 }
             };
         }
+        self.home_grace_due = grace_due;
         self.settle_zones(now);
     }
 
@@ -2186,9 +2283,203 @@ impl Engine {
         }
     }
 
+    /// Keeps Home Assistant told what RoomGuard itself is doing, the way an
+    /// ESPHome alarm panel reports to it: a `roomguard_state` event on every
+    /// change, using Home Assistant's own alarm panel state names, and on an
+    /// alarm a `roomguard_alarm` event plus a notification in Home Assistant
+    /// (and a phone push if a notify service is set). Duress and other silent
+    /// alarms send the event only. Everything is sent again after a
+    /// reconnect, so an alarm that began while Home Assistant was offline still
+    /// reaches it, and one that ended meanwhile is cleared.
+    fn announce_to_ha(&mut self) {
+        if !self.cfg.home_assistant.enabled || !self.cfg.home_assistant.announce_alarms {
+            self.ha_announced_online = false;
+            self.ha_missed_alarm = None;
+            return;
+        }
+        let online = self.home.online;
+        let reconnected = online && !self.ha_announced_online;
+        self.ha_announced_online = online;
+        if !online {
+            // Remember the first alarm while Home Assistant is away, so it
+            // still hears about it on reconnect even if it's over by then.
+            if self.ha_missed_alarm.is_none() {
+                let found = self.panel.alarms.iter().find(|a| !a.silenced).map(|a| {
+                    let silent = a.kind == types::AlarmKind::Duress || (!a.audible && !a.buzzer);
+                    (a.kind, a.zone, silent)
+                });
+                if let Some((kind, zone, silent)) = found {
+                    let name = if zone > 0 && zone < 90 { self.panel.label(zone as usize) } else { String::new() };
+                    let at = chrono::Local::now().format("%-I:%M %p").to_string();
+                    self.ha_missed_alarm = Some((kind, zone, name, at, silent));
+                }
+            }
+            return;
+        }
+        let alarm = self.panel.alarms.iter().find(|a| !a.silenced).map(|a| {
+            let silent = a.kind == types::AlarmKind::Duress || (!a.audible && !a.buzzer);
+            (a.kind, a.zone, silent)
+        });
+        let night = self.panel.model == types::Model::Vista20p && self.panel.vista_night;
+        let state = ha_alarm_state(
+            alarm.is_some(),
+            self.panel.entry.is_some(),
+            self.panel.exit.is_some(),
+            self.panel.armed.map(|a| a.mode),
+            night,
+        );
+        let panel = format!("{:?}", self.panel.model);
+        let epoch = self.hub_epoch;
+        if reconnected || self.ha_state_sent != Some(state) {
+            let previous = self.ha_state_sent.unwrap_or("unknown");
+            self.hub.fire_event(epoch, "roomguard_state", serde_json::json!({ "state": state, "previous": previous, "panel": panel }));
+            self.ha_state_sent = Some(state);
+        }
+        let current = alarm.map(|(kind, zone, _)| (kind, zone));
+        // Troubles: what a real panel's communicator would report too.
+        let troubles = self.panel.troubles;
+        if self.ha_troubles_sent != Some(troubles) || (reconnected && troubles != 0) {
+            if troubles != 0 || self.ha_troubles_sent.is_some_and(|t| t != 0) {
+                let names: Vec<&'static str> = crate::engine::panel::trouble_names(self.panel.model)
+                    .into_iter()
+                    .filter(|(bit, _)| troubles & *bit != 0)
+                    .map(|(_, name)| name)
+                    .collect();
+                self.hub.fire_event(epoch, "roomguard_trouble", serde_json::json!({ "trouble": troubles != 0, "troubles": names, "panel": panel }));
+            }
+            self.ha_troubles_sent = Some(troubles);
+        }
+        // An alarm that came and went while Home Assistant was offline. One
+        // that's still going is announced below as usual.
+        if reconnected {
+            if let Some((kind, zone, name, at, silent)) = self.ha_missed_alarm.take() {
+                if current != Some((kind, zone)) {
+                    let place = match (zone, name.is_empty()) {
+                        (0, _) => String::new(),
+                        (z, true) => format!(" on zone {}", z),
+                        (z, false) => format!(" on zone {} ({})", z, name),
+                    };
+                    let message = format!("{} alarm{} at {}, while Home Assistant was offline.", kind.label(), place, at);
+                    self.hub.fire_event(
+                        epoch,
+                        "roomguard_alarm",
+                        serde_json::json!({
+                            "state": "cleared",
+                            "kind": kind.label().to_lowercase(),
+                            "zone": zone,
+                            "zone_name": name,
+                            "panel": panel,
+                            "silent": silent,
+                            "while_offline": true,
+                            "at": at,
+                            "message": message,
+                        }),
+                    );
+                    if !silent {
+                        self.hub.call_service(
+                            epoch,
+                            "persistent_notification",
+                            "create",
+                            serde_json::json!({ "notification_id": "roomguard_missed_alarm", "title": "RoomGuard alarm while offline", "message": message }),
+                        );
+                        if let Some((domain, service)) = &notify_target(&self.cfg.home_assistant.notify_service) {
+                            self.hub.call_service(
+                                epoch,
+                                domain,
+                                service,
+                                serde_json::json!({ "title": "RoomGuard alarm while offline", "message": message, "data": { "tag": "roomguard_missed_alarm" } }),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        if !reconnected && current == self.ha_alarm_sent {
+            return;
+        }
+        let phone = notify_target(&self.cfg.home_assistant.notify_service);
+        match alarm {
+            Some((kind, zone, silent)) => {
+                let name = if zone > 0 && zone < 90 { self.panel.label(zone as usize) } else { String::new() };
+                let place = match (zone, name.is_empty()) {
+                    (0, _) => String::new(),
+                    (z, true) => format!(" on zone {}", z),
+                    (z, false) => format!(" on zone {} ({})", z, name),
+                };
+                let message = format!("{} alarm{}.", kind.label(), place);
+                self.hub.fire_event(
+                    epoch,
+                    "roomguard_alarm",
+                    serde_json::json!({
+                        "state": "triggered",
+                        "kind": kind.label().to_lowercase(),
+                        "zone": zone,
+                        "zone_name": name,
+                        "panel": panel,
+                        "silent": silent,
+                        "message": message,
+                    }),
+                );
+                if !silent {
+                    self.hub.call_service(
+                        epoch,
+                        "persistent_notification",
+                        "create",
+                        serde_json::json!({ "notification_id": "roomguard_alarm", "title": "RoomGuard alarm", "message": message }),
+                    );
+                    if let Some((domain, service)) = &phone {
+                        // Urgent on both companion apps: Android's alarm channel
+                        // and iOS critical alerts.
+                        self.hub.call_service(
+                            epoch,
+                            domain,
+                            service,
+                            serde_json::json!({
+                                "title": "RoomGuard alarm",
+                                "message": message,
+                                "data": {
+                                    "tag": "roomguard_alarm",
+                                    "priority": "high",
+                                    "ttl": 0,
+                                    "channel": "alarm_stream",
+                                    "push": { "sound": { "name": "default", "critical": 1, "volume": 1.0 } },
+                                },
+                            }),
+                        );
+                    }
+                }
+            }
+            None => {
+                if let Some((kind, zone)) = self.ha_alarm_sent {
+                    self.hub.fire_event(
+                        epoch,
+                        "roomguard_alarm",
+                        serde_json::json!({ "state": "cleared", "kind": kind.label().to_lowercase(), "zone": zone, "panel": panel }),
+                    );
+                    self.hub.call_service(epoch, "persistent_notification", "dismiss", serde_json::json!({ "notification_id": "roomguard_alarm" }));
+                    if let Some((domain, service)) = &phone {
+                        self.hub.call_service(
+                            epoch,
+                            domain,
+                            service,
+                            serde_json::json!({ "message": "clear_notification", "data": { "tag": "roomguard_alarm" } }),
+                        );
+                    }
+                }
+            }
+        }
+        self.ha_alarm_sent = current;
+    }
+
     fn tick(&mut self) {
+        self.announce_to_ha();
         let now = Instant::now();
         let wall = util::now_ms();
+        // A Home Assistant sensor outage just outlasted its grace period.
+        if self.home_grace_due.is_some_and(|due| now >= due) {
+            self.home_grace_due = None;
+            self.sync_zones(now);
+        }
         let pulses = self.home_pulses.len();
         self.home_pulses.retain(|_, until| now < *until);
         if self.home_pulses.len() != pulses {

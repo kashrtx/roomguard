@@ -44,6 +44,25 @@ RoomGuard 2.2.0 brings wire-level panel accuracy across all three emulated keypa
 - **Fixed Stay / Away arming & false "Zone Bypassed" display:** Stay automatic interior bypasses are kept separate from manual user bypasses so VistaGuard 20P shows `** ALL SECURE **` unless you manually bypassed a zone, and Away arming behavior matches each panel's rules reliably.
 - **Fixed unexpected instant alarms & camera races:** Tightened limb checks against lighting shifts, added Delay-first zone settling to prevent Interior zones racing ahead of doorways, separated camera fault troubles from tamper alarms, and shortened camera zone release hold to 1.0 s.
 
+### Home Assistant alarm notifications and audio output fixes
+
+- **Home Assistant now always knows RoomGuard's state.** RoomGuard fires a `roomguard_state` event on every change, using Home Assistant's own alarm panel words (`disarmed`, `arming`, `armed_away`, `armed_home`, `armed_night`, `pending`, `triggered`), and a `roomguard_alarm` event when an alarm starts or clears, even with no panel linked.
+- **Alarm notifications.** Each alarm shows a notification in Home Assistant, removed when RoomGuard is disarmed, and can also send an urgent phone alert through any notify service (Settings, Home Assistant, Alarm notifications). Duress and silent alarms send the event only.
+- **Nothing is lost during an outage.** After a reconnect, RoomGuard sends its state again, announces an alarm that began while Home Assistant was offline, and clears one that ended.
+- **A Home Assistant URL typed without `http://` works.** It used to crash the Home Assistant connection silently, so RoomGuard never connected or retried.
+- **A separate siren speaker gets every command it needs.** Clearing the siren and the wake-up nudge now reach every output, not only the keypad's.
+- **An output can no longer go permanently silent.** If an internal error hits while a sound command is applied, that output's synth restarts in place. Before, the stream was rebuilt and the same command replayed into it, failing again every time.
+- **A live level meter for each output** in Settings, Sound shows whether RoomGuard is sending sound to that speaker, which tells a RoomGuard problem apart from a Windows volume one.
+
+
+### Home Assistant reliability
+
+- A Home Assistant restart no longer sets off trouble beeping. Each sensor keeps its last known state for up to 2 minutes (the linked panel used to fault after 8 seconds), and only an outage that outlasts that becomes a supervision trouble, which clears by itself once the sensor reports again.
+- Alarms that start and end while Home Assistant is offline are reported when it reconnects, as a `roomguard_alarm` event with `while_offline: true`, a notification and a phone alert.
+- New `roomguard_trouble` event whenever RoomGuard's troubles change.
+- When Home Assistant refuses an announcement (events need an administrator's token, or a notify service is misspelled), RoomGuard now says so in Settings and logs it once, instead of failing silently.
+- The test lab package has no alarm code anymore. A code there made Home Assistant refuse disarming from RoomGuard whenever the codes differed, and Two-Way sync then re-armed RoomGuard.
+
 ## [2.1.0] - 2026-11-25
 
 RoomGuard 2.1.0 introduces the **VistaGuard 20P** voice keypad, guided empty-room calibration with lighting-invariant closed-door detection, limb-aware person tracking with an **Ignore desk** workflow, studio-matched sirens and keypad acoustics, zero-delay keystroke audio, and line-by-line manual accuracy across all three panels.

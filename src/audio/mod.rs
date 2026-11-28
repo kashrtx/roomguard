@@ -30,7 +30,7 @@ pub mod memo;
 pub mod synth;
 pub mod voice;
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -127,7 +127,9 @@ enum Route {
 impl Route {
     fn accepts(self, cmd: &AudioCmd) -> bool {
         match cmd {
-            AudioCmd::Volumes { .. } | AudioCmd::Silence => true,
+            // Settings, silencing, clearing the siren and the wake-up nudge
+            // belong to every output, or a separate siren speaker misses them.
+            AudioCmd::Volumes { .. } | AudioCmd::Silence | AudioCmd::ClearSiren | AudioCmd::Wake => true,
             AudioCmd::Bell(_) | AudioCmd::Squawk(_) | AudioCmd::Siren { .. } | AudioCmd::Preview { .. } => self != Self::Keypad,
             _ => self != Self::Siren,
         }
@@ -171,6 +173,8 @@ struct OutputWorker {
     ok: Arc<AtomicBool>,
     status: Arc<Mutex<String>>,
     device_id: Arc<Mutex<Option<String>>>,
+    /// Recent peak level of what this output plays (f32 bits), for the meter.
+    level: Arc<AtomicU32>,
 }
 
 #[derive(Clone)]
@@ -226,6 +230,14 @@ impl AudioHandle {
         worker.status.lock().map(|status| status.clone()).unwrap_or_default()
     }
 
+    /// How loud this output is right now (0 to 1), for the meter beside each
+    /// output in Settings. It shows whether RoomGuard is sending sound to that
+    /// speaker at all, which separates a RoomGuard problem from a Windows one.
+    pub fn output_level(&self, siren: bool) -> f32 {
+        let worker = if siren && self.split.load(Ordering::Relaxed) { &self.siren } else { &self.keypad };
+        f32::from_bits(worker.level.load(Ordering::Relaxed))
+    }
+
     pub fn keypad_ok(&self) -> bool {
         self.keypad.ok.load(Ordering::Relaxed)
     }
@@ -258,11 +270,13 @@ fn start_output(name: &'static str, devices: Option<Arc<Mutex<Endpoints>>>) -> O
     let status_rx = status.clone();
     let device_id = Arc::new(Mutex::new(None));
     let active_id = device_id.clone();
-    let spawned = std::thread::Builder::new().name(name.into()).spawn(move || run(rx, running, status_rx, active_id, devices));
+    let level = Arc::new(AtomicU32::new(0));
+    let level_rx = level.clone();
+    let spawned = std::thread::Builder::new().name(name.into()).spawn(move || run(rx, running, status_rx, active_id, devices, level_rx));
     if let Err(e) = spawned {
         util::log(&format!("could not start {}: {}", name, e));
     }
-    OutputWorker { tx, ok, status, device_id }
+    OutputWorker { tx, ok, status, device_id, level }
 }
 
 /// The lasting state, replayed into each new output stream.
@@ -314,7 +328,14 @@ impl State {
     }
 }
 
-fn run(rx: Receiver<WorkerCmd>, ok: Arc<AtomicBool>, status: Arc<Mutex<String>>, device_id: Arc<Mutex<Option<String>>>, devices: Option<Arc<Mutex<Endpoints>>>) {
+fn run(
+    rx: Receiver<WorkerCmd>,
+    ok: Arc<AtomicBool>,
+    status: Arc<Mutex<String>>,
+    device_id: Arc<Mutex<Option<String>>>,
+    devices: Option<Arc<Mutex<Endpoints>>>,
+    level: Arc<AtomicU32>,
+) {
     util::set_thread_priority(util::prio::PANEL);
 
     // Endpoint enumeration can block on WASAPI. Keep it off the command path.
@@ -371,7 +392,7 @@ fn run(rx: Receiver<WorkerCmd>, ok: Arc<AtomicBool>, status: Arc<Mutex<String>>,
         for cmd in state.replay().into_iter().filter(|cmd| current.route.accepts(cmd)) {
             let _ = tx.send(cmd);
         }
-        let built = build_stream(input, failed.clone(), ok.clone(), callbacks.clone(), current.device.as_deref());
+        let built = build_stream(input, failed.clone(), ok.clone(), callbacks.clone(), level.clone(), current.device.as_deref());
         if let Ok(mut id) = device_id.lock() {
             *id = built.as_ref().ok().and_then(|(_, id, _)| id.clone());
         }
@@ -477,6 +498,7 @@ fn run(rx: Receiver<WorkerCmd>, ok: Arc<AtomicBool>, status: Arc<Mutex<String>>,
         }
         drop(stream);
         ok.store(false, Ordering::Relaxed);
+        level.store(0, Ordering::Relaxed);
         if !retry {
             break;
         }
@@ -543,11 +565,13 @@ fn default_output_id() -> Option<String> {
 
 fn output_stream<T: SizedSample + FromSample<f32>>(
     device: &cpal::Device, config: &cpal::StreamConfig, rx: Receiver<AudioCmd>,
-    failed: Arc<AtomicBool>, ready: Arc<AtomicBool>, callbacks: Arc<AtomicU64>,
+    failed: Arc<AtomicBool>, ready: Arc<AtomicBool>, callbacks: Arc<AtomicU64>, level: Arc<AtomicU32>,
 ) -> Result<cpal::Stream, cpal::BuildStreamError> {
     let channels = usize::from(config.channels.max(1));
-    let mut synth = synth::Synth::new(config.sample_rate as f32);
+    let rate = config.sample_rate as f32;
+    let mut synth = synth::Synth::new(rate);
     let mut boosted = false;
+    let mut recovered = false;
     let stream_error = failed.clone();
     device.build_output_stream(
         config,
@@ -556,20 +580,40 @@ fn output_stream<T: SizedSample + FromSample<f32>>(
                 boosted = true;
                 util::set_thread_priority(util::prio::AUDIO);
             }
-            while let Ok(cmd) = rx.try_recv() {
-                synth.apply(cmd);
-            }
+            // Commands are applied inside the guard too. A command that made
+            // the synth panic used to take this output down for good: the
+            // stream was rebuilt, the same lasting state replayed, and it
+            // panicked again, so a separate siren speaker went silent forever.
             let render = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                for frame in data.chunks_mut(channels) {
-                    frame.fill(T::from_sample(synth.next().clamp(-0.99999, 0.99999)));
+                while let Ok(cmd) = rx.try_recv() {
+                    synth.apply(cmd);
                 }
+                let mut peak = 0.0f32;
+                for frame in data.chunks_mut(channels) {
+                    let sample = synth.next().clamp(-0.99999, 0.99999);
+                    peak = peak.max(sample.abs());
+                    frame.fill(T::from_sample(sample));
+                }
+                peak
             }));
-            if render.is_err() {
-                data.fill(T::EQUILIBRIUM);
-                failed.store(true, Ordering::Relaxed);
-            } else {
-                callbacks.fetch_add(1, Ordering::Relaxed);
-                ready.store(true, Ordering::Relaxed);
+            match render {
+                Ok(peak) => {
+                    // A peak meter that falls back over about a third of a second.
+                    let held = f32::from_bits(level.load(Ordering::Relaxed)) * 0.92;
+                    level.store(peak.max(held).to_bits(), Ordering::Relaxed);
+                    callbacks.fetch_add(1, Ordering::Relaxed);
+                    ready.store(true, Ordering::Relaxed);
+                }
+                Err(_) => {
+                    // Start this output's synth over and keep the stream going.
+                    data.fill(T::EQUILIBRIUM);
+                    synth = synth::Synth::new(rate);
+                    if !recovered {
+                        recovered = true;
+                        util::log("an audio output recovered from an internal error and was reset");
+                    }
+                    callbacks.fetch_add(1, Ordering::Relaxed);
+                }
             }
         },
         move |error| {
@@ -581,7 +625,8 @@ fn output_stream<T: SizedSample + FromSample<f32>>(
 }
 
 fn build_stream(
-    rx: Receiver<AudioCmd>, failed: Arc<AtomicBool>, ready: Arc<AtomicBool>, callbacks: Arc<AtomicU64>, selected: Option<&str>,
+    rx: Receiver<AudioCmd>, failed: Arc<AtomicBool>, ready: Arc<AtomicBool>, callbacks: Arc<AtomicU64>, level: Arc<AtomicU32>,
+    selected: Option<&str>,
 ) -> Result<(cpal::Stream, Option<String>, String), String> {
     let device = choose_device(false, selected)?;
     let id = device.id().ok().map(|id| id.to_string());
@@ -590,7 +635,7 @@ fn build_stream(
     let format = supported.sample_format();
     let config = supported.config();
     macro_rules! open {
-        ($ty:ty) => { output_stream::<$ty>(&device, &config, rx, failed, ready, callbacks) };
+        ($ty:ty) => { output_stream::<$ty>(&device, &config, rx, failed, ready, callbacks, level) };
     }
     let stream = pcm!(format, open).map_err(|e| format!("{label}: {e}"))?;
     stream.play().map_err(|e| format!("{label}: {e}"))?;
@@ -601,6 +646,14 @@ fn build_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clearing_and_waking_reach_every_output() {
+        for route in [Route::Keypad, Route::Siren, Route::Both] {
+            assert!(route.accepts(&AudioCmd::ClearSiren), "{:?} gets ClearSiren", route);
+            assert!(route.accepts(&AudioCmd::Wake), "{:?} gets Wake", route);
+        }
+    }
 
     #[test]
     fn separate_outputs_keep_keypad_and_siren_commands_apart() {

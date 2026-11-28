@@ -141,7 +141,7 @@ To add the test lab sensors and virtual test alarm panel, you need a quick way t
 4. Pick **`Two-way sync (arm & disarm both)`**.
 5. **HA panel PIN:**
    - **Recommended for real panels:** Leave **HA panel PIN** **blank**. RoomGuard forwards whatever code you type on its keypad straight to Home Assistant / ESPHome without storing your real code in plaintext config or YAML.
-   - **For this local Test Lab:** Leave it blank if your RoomGuard keypad code matches the test code in `roomguard_lab.yaml` (`1234`), or enter the test lab's PIN here if you use a different code on RoomGuard's keypad. You can also move the lab PIN into Home Assistant's `secrets.yaml` (`code: !secret roomguard_test_code`) or delete the `code:` line in `roomguard_lab.yaml` completely (RoomGuard's own keypad still checks your real salted/hashed Master Code before disarming).
+   - **For this local Test Lab:** Leave it blank. The test panel in `roomguard_lab.yaml` has no code on purpose, because RoomGuard's own keypad already checks your real (salted and hashed) code before disarming. A second code in Home Assistant would only refuse RoomGuard's disarm whenever the two codes differ.
    - **Lockstep exit & entry timers:** Home Assistant's `manual` panel does not read your RoomGuard EEPROM delay settings, so RoomGuard automatically measures your linked panel's exact `arming_time` and `delay_time` on its first cycle and locks both countdowns together second-for-second (no skipping the last seconds!).
    - **Open doors block arming:** Just like a real wall panel, if an assigned door or window zone is open, RoomGuard blocks arming from both RoomGuard's keypad and Home Assistant until the zone is closed or bypassed.
 
@@ -150,7 +150,7 @@ To add the test lab sensors and virtual test alarm panel, you need a quick way t
 2. Click directly on **`RoomGuard Test Panel`** (a popup keypad card opens right there, no dashboard setup required!).
 3. Click **Arm away** (or **Arm home** / **Arm night**).
    - Watch RoomGuard immediately enter **Exit delay** (the lab panel counts for 8 seconds), then switch to **Armed away** (or **Armed stay** / **Armed night-stay** on VistaGuard 20P)!
-4. To disarm from Home Assistant: type **`1234`** in the Home Assistant popup and click **Disarm**.
+4. To disarm from Home Assistant: click **Disarm**. The test panel asks for no code, because RoomGuard's keypad is the one that checks it.
    - Watch RoomGuard disarm immediately!
 
 ### Test B: Arm and Disarm from RoomGuard -> Watch Home Assistant Follow
@@ -168,7 +168,7 @@ To add the test lab sensors and virtual test alarm panel, you need a quick way t
    - Clear or edit **`Lab bypassed zones`** in Home Assistant (for example, type `BY:1,BY:3` or clear it to blank) and watch RoomGuard immediately mirror the bypassed zones on its keypad.
 2. **Entry delay & alarm:** Arm the panel from either side and wait 8 seconds until both RoomGuard and Home Assistant switch to **Armed** in lockstep (even if RoomGuard's local exit timer is longer or shorter than Home Assistant's).
 3. Flip **Lab door open** ON in Home Assistant Helpers (to trigger Zone 1's entry delay and alarm, which also flips `RoomGuard Test Panel` to **Triggered**), **OR** open **Developer tools -> Actions**, run `alarm_control_panel.alarm_trigger` against `alarm_control_panel.roomguard_test_panel` to test a physical-panel entry delay and alarm.
-4. Disarm from **either** RoomGuard's keypad (`1234` / `12341`) **or** Home Assistant (`1234` -> **Disarm**).
+4. Disarm from **either** RoomGuard's keypad (`1234` / `12341`) **or** Home Assistant (just click **Disarm**).
 
 ### Test D: Test Automatic Disconnect Detection
 1. In VirtualBox, pause the Home Assistant VM (or click **Disconnect** in RoomGuard).
@@ -190,3 +190,64 @@ Once the lab works, connecting real hardware works the exact same way:
   - **Automatic ESPHome Keybus / ECP integration:** When an ESPHome bridge exposes `sensor.*_zone_status` (`zs`), `fa_1`/`fire_1`, `armi_1`, and `esphome.<node>_alarm_keypress` / `set_alarm_state` services, RoomGuard auto-detects them to mirror real-panel bypasses, alarmed zones, Instant/Night/Away modes, and fire alarms (Temporal-3) two-way with zero extra YAML.
   - **Preventing double alarms:** When linked to a real panel whose sensors are also mapped into RoomGuard zones, check **Real panel handles alarms for Home Assistant zones (prevent double alarms)**. RoomGuard will still show live open/closed zone status, bypasses, and play Door Chime / voice chimes, while letting your real panel handle entry delays and alarms without duplicate sirens.
   - **Match your real zone list:** Open the flip-down door on your real wall keypad and copy the zone numbers, names, and types written by your installer directly into **Settings -> Panel -> Zone programming** or **Settings -> Home Assistant -> Wireless sensors -> Zones**.
+
+---
+
+## Step 10: Get RoomGuard's Alarms in Home Assistant and on Your Phone
+
+RoomGuard tells Home Assistant what it is doing even when no panel is linked, so Home Assistant always knows when an alarm goes off.
+
+1. In RoomGuard, open **Settings -> Home Assistant -> Alarm notifications** and make sure **Tell Home Assistant about RoomGuard's alarms and arming** is checked (it is on by default).
+2. *(Optional)* Type your phone's notify service into **Phone alert**, for example `notify.mobile_app_pixel_8`. To find it, open **Developer tools -> Actions** in Home Assistant and search for `notify.mobile_app`. The Home Assistant Companion app must be installed and signed in on the phone.
+3. Trigger a test alarm in RoomGuard. You will see:
+   - A **notification in Home Assistant** (the bell icon in the sidebar) saying which alarm and zone, removed automatically when RoomGuard is disarmed.
+   - An **urgent phone alert** with an alarm sound (Android alarm channel, iOS critical alert) if you set a phone service, cleared automatically on disarm.
+4. Duress and silent alarms are never shown as notifications. They only send the `roomguard_alarm` event, so a silent alarm stays silent.
+
+### What RoomGuard sends
+
+- **`roomguard_state`** on every change, with `state` set to Home Assistant's own alarm panel words: `disarmed`, `arming`, `armed_away`, `armed_home`, `armed_night`, `pending` (entry delay) or `triggered`. It also carries `previous` and `panel`.
+- **`roomguard_alarm`** when an alarm starts (`state: triggered`) or clears (`state: cleared`), with `kind` (for example `burglary` or `fire`), `zone`, `zone_name`, `panel`, `silent` and `message`.
+
+- **`roomguard_trouble`** whenever RoomGuard's troubles change, with `trouble` (true or false), `troubles` (the list of trouble names) and `panel`.
+
+When RoomGuard reconnects, it sends its current state, its troubles and any alarm still going. An alarm that started **and** ended while Home Assistant was offline is reported too: a `roomguard_alarm` event with `while_offline: true` and the time it happened (`at`), plus a notification, so no alarm goes unnoticed.
+
+Events need a token from an **administrator** account. If Home Assistant refuses an event or your phone's notify service, RoomGuard shows why in **Settings -> Home Assistant** and logs it once in its event history.
+
+### When Home Assistant restarts
+
+A Home Assistant restart (an update or a reboot) doesn't upset RoomGuard. Each sensor keeps its last known state for up to **2 minutes**, and only a sensor or linked panel that stays silent longer becomes a supervision trouble, the way real panels wait out a supervision window. The trouble clears by itself as soon as it reports again, and RoomGuard takes the fresh states quietly when Home Assistant comes back, so a restart never sets off an alarm.
+
+### Make RoomGuard an entity in Home Assistant
+
+Add this to a package file (for example `/homeassistant/packages/roomguard.yaml`). It creates `sensor.roomguard_state`, which shows RoomGuard's state on dashboards, survives restarts, and works in any automation:
+
+```yaml
+template:
+  - triggers:
+      - trigger: event
+        event_type: roomguard_state
+    sensor:
+      - name: RoomGuard state
+        unique_id: roomguard_state
+        state: "{{ trigger.event.data.state }}"
+        attributes:
+          panel: "{{ trigger.event.data.panel }}"
+```
+
+### Example: turn on every light when an alarm goes off
+
+```yaml
+automation:
+  - alias: RoomGuard alarm lights
+    triggers:
+      - trigger: event
+        event_type: roomguard_alarm
+        event_data:
+          state: triggered
+    actions:
+      - action: light.turn_on
+        target:
+          entity_id: all
+```

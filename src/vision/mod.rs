@@ -1363,7 +1363,7 @@ impl Worker {
                     phase: CalibPhase::WaitingClear,
                     progress: 0.0,
                     prompt: if person_seen {
-                        "Person detected — step completely out of view so new objects calibrate accurately".to_string()
+                        "Person detected. Step completely out of view so new objects calibrate accurately".to_string()
                     } else {
                         "Waiting for room to settle...".to_string()
                     },
