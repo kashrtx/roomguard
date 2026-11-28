@@ -12,6 +12,8 @@ pub mod pose;
 pub mod ptz;
 pub mod track;
 
+mod clip;
+
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -57,6 +59,10 @@ pub enum CamCmd {
     Forget(String),
     LearnOwner,
     Snapshot(String),
+    AlertSnapshot { reason: String, deadline: Instant },
+    AlertClipsEnabled(bool),
+    MarkEntryForClip(Instant),
+    AlertClip { reason: String, event_at: Instant, deadline: Instant },
     MapRoom,
     CalibrateRoom,
     CancelCalibrate,
@@ -262,6 +268,18 @@ struct CalibState {
     sum_sq: Vec<f64>,
 }
 
+struct EntryClip {
+    event_at: Instant,
+    evidence: Option<Vec<u8>>,
+    captured: bool,
+}
+
+struct AlertClip {
+    reason: String,
+    event_at: Instant,
+    deadline: Instant,
+}
+
 struct Worker {
     cfg: CameraCfg,
     engine: Sender<EngineMsg>,
@@ -310,7 +328,11 @@ struct Worker {
     last_faces_at: Option<Instant>,
     last_frame_at: Option<Instant>,
     last_repaint_at: Option<Instant>,
-    snap_queue: Vec<String>,
+    snap_queue: Vec<(String, Option<Instant>)>,
+    alert_clips_enabled: bool,
+    alert_clips: Vec<AlertClip>,
+    clip_buffer: clip::Buffer,
+    entry_clip: Option<EntryClip>,
     demo_t: f32,
     pose: Option<pose::PoseWorker>,
     people: Vec<pose::Person>,
@@ -330,6 +352,7 @@ impl Worker {
         let db = faces::FaceDb::load();
         let gallery = db.gallery();
         let ptz = ptz::Ptz::new(&cfg.ptz, cfg.lens.hfov());
+        let pose = if cfg.enabled { pose::PoseWorker::start() } else { None };
         let now = Instant::now();
         let w = Worker {
             cfg,
@@ -380,8 +403,12 @@ impl Worker {
             last_frame_at: None,
             last_repaint_at: None,
             snap_queue: Vec::new(),
+            alert_clips_enabled: false,
+            alert_clips: Vec::new(),
+            clip_buffer: clip::Buffer::default(),
+            entry_clip: None,
             demo_t: 0.0,
-            pose: pose::PoseWorker::start(),
+            pose,
             people: Vec::new(),
             people_at: None,
             pose_sent_at: None,
@@ -507,13 +534,49 @@ impl Worker {
         match cmd {
             CamCmd::Config(c) => {
                 let c = *c;
-                let reopen = c.device != self.cfg.device || (c.enabled && !self.cfg.enabled);
+                let enabled_changed = c.enabled != self.cfg.enabled;
+                let reopen = c.device != self.cfg.device || enabled_changed;
                 let ptz_changed = c.ptz != self.cfg.ptz || c.lens != self.cfg.lens;
                 let old_cfg = self.cfg.clone();
                 self.cfg = c;
                 if reopen {
                     self.close();
                     self.retry_at = Instant::now();
+                }
+                if enabled_changed {
+                    if self.cfg.enabled {
+                        self.pose = pose::PoseWorker::start();
+                        if self.cfg.device == DEMO_DEVICE {
+                            self.set_status(CamStatus::Running);
+                            self.report_camera(true, false);
+                        }
+                    } else {
+                        self.pose = None;
+                        self.people.clear();
+                        self.people_at = None;
+                        self.calib = None;
+                        self.enroll = None;
+                        self.recent_face = None;
+                        self.sweep = None;
+                        self.snap_queue.clear();
+                        self.covered = false;
+                        self.cover_since = None;
+                        self.sent_camera = None;
+                        self.motion.reset();
+                        self.tracker.clear();
+                        if let Ok(mut shared) = self.shared.lock() {
+                            shared.preview = None;
+                            shared.enroll = None;
+                            shared.calib = None;
+                            shared.mapping_progress = None;
+                            shared.last_frame_ms = 0;
+                        }
+                    }
+                }
+                if reopen || !self.cfg.enabled || old_cfg.mirror != self.cfg.mirror {
+                    self.alert_clips.clear();
+                    self.clip_buffer.clear();
+                    self.entry_clip = None;
                 }
                 if ptz_changed {
                     self.ptz = ptz::Ptz::new(&self.cfg.ptz, self.cfg.lens.hfov());
@@ -545,7 +608,13 @@ impl Worker {
                     }
                 }
             }
-            CamCmd::Armed(a) => self.armed = a,
+            CamCmd::Armed(a) => {
+                self.armed = a;
+                if !a && self.alert_clips.is_empty() {
+                    self.clip_buffer.clear();
+                    self.entry_clip = None;
+                }
+            }
             CamCmd::Enroll(name) => {
                 let err = if !self.cfg.enabled {
                     Some("Turn on the camera above before learning a face.")
@@ -617,7 +686,35 @@ impl Worker {
                     self.publish_people();
                 }
             }
-            CamCmd::Snapshot(reason) => self.snap_queue.push(reason),
+            CamCmd::Snapshot(reason) => self.snap_queue.push((reason, None)),
+            CamCmd::AlertSnapshot { reason, deadline } => {
+                self.snap_queue.retain(|(_, until)| until.map_or(true, |until| until > Instant::now()));
+                if deadline > Instant::now() {
+                    self.snap_queue.push((reason, Some(deadline)));
+                }
+            }
+            CamCmd::AlertClipsEnabled(enabled) => {
+                self.alert_clips_enabled = enabled;
+                if !enabled {
+                    self.alert_clips.clear();
+                    self.clip_buffer.clear();
+                    self.entry_clip = None;
+                }
+            }
+            CamCmd::MarkEntryForClip(event_at) => {
+                if self.alert_clips_enabled {
+                    self.entry_clip = Some(EntryClip { event_at, evidence: None, captured: false });
+                }
+            }
+            CamCmd::AlertClip { reason, event_at, deadline } => {
+                if deadline > Instant::now() {
+                    if self.alert_clips_enabled && self.alert_clips.len() < 8 {
+                        self.alert_clips.push(AlertClip { reason, event_at, deadline });
+                    } else {
+                        self.snap_queue.push((reason, Some(deadline)));
+                    }
+                }
+            }
             CamCmd::MapRoom => {
                 if self.ptz.active() {
                     self.sweep = Some(ptz::Sweep::new(&mut self.ptz));
@@ -1151,10 +1248,13 @@ impl Worker {
         self.enroll_step(now);
         self.drive_ptz(&rgb, &small, mh, now);
         self.auto_frame(&xf, now);
+        self.collect_alert_clips(&rgb, now);
         if !self.snap_queue.is_empty() {
             let reasons = std::mem::take(&mut self.snap_queue);
-            for r in reasons {
-                self.save_snapshot(&rgb, &r);
+            for (reason, deadline) in reasons {
+                if deadline.map_or(true, |deadline| now < deadline) {
+                    self.save_snapshot(&rgb, &reason);
+                }
             }
         }
         if self.map_dirty_at.map_or(false, |t| now.saturating_duration_since(t).as_secs_f32() > 60.0) {
@@ -1221,7 +1321,7 @@ impl Worker {
             if !self.covered && now.saturating_duration_since(t).as_secs_f32() > 3.0 {
                 self.covered = true;
                 self.report_camera(true, true);
-                self.snap_queue.push("camera-covered".to_string());
+                self.snap_queue.push(("camera-covered".to_string(), None));
             }
         }
         if !self.covered && self.sent_camera != Some((true, false)) {
@@ -1783,19 +1883,61 @@ impl Worker {
         self.focus = if next.w > 0.995 { None } else { Some(next) };
     }
 
+    fn collect_alert_clips(&mut self, rgb: &frame::Rgb, now: Instant) {
+        if !self.alert_clips_enabled || (!self.armed && self.alert_clips.is_empty()) {
+            return;
+        }
+        if !self.covered {
+            self.clip_buffer.sample(now, rgb);
+        }
+        if let Some(entry) = &mut self.entry_clip {
+            if !entry.captured && now >= entry.event_at + clip::POST_ROLL {
+                entry.evidence = self.clip_buffer.encode(entry.event_at);
+                entry.captured = true;
+            }
+        }
+        for request in std::mem::take(&mut self.alert_clips) {
+            if now >= request.deadline {
+                continue;
+            }
+            if now < request.event_at + clip::POST_ROLL {
+                self.alert_clips.push(request);
+                continue;
+            }
+            let entry_evidence = self.entry_clip.as_ref()
+                .filter(|entry| entry.event_at == request.event_at)
+                .and_then(|entry| entry.evidence.as_deref());
+            if let Some(bytes) = entry_evidence {
+                self.save_capture(bytes, &request.reason, "gif");
+            } else if let Some(bytes) = self.clip_buffer.encode(request.event_at) {
+                self.save_capture(&bytes, &request.reason, "gif");
+            } else if !self.covered {
+                self.save_snapshot(rgb, &request.reason);
+            }
+        }
+        if !self.armed && self.alert_clips.is_empty() {
+            self.clip_buffer.clear();
+            self.entry_clip = None;
+        }
+    }
+
     fn save_snapshot(&self, rgb: &frame::Rgb, reason: &str) {
+        match frame::encode_jpeg(rgb, 88) {
+            Some(bytes) => self.save_capture(&bytes, reason, "jpg"),
+            None => util::log("could not encode a snapshot"),
+        }
+    }
+
+    fn save_capture(&self, bytes: &[u8], reason: &str, extension: &str) {
         let dir = util::data_dir().join("snapshots");
         let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join(format!("{}_{}.jpg", util::file_stamp(util::now_ms()), util::slug(reason)));
-        match frame::encode_jpeg(rgb, 88) {
-            Some(bytes) => match std::fs::write(&path, bytes) {
-                Ok(()) => {
-                    self.send_event(VisionEvent::Snapshot { path, reason: reason.to_string() });
-                    prune_snapshots(&dir, 300);
-                }
-                Err(e) => util::log(&format!("could not save a snapshot: {}", e)),
-            },
-            None => util::log("could not encode a snapshot"),
+        let path = dir.join(format!("{}_{}.{}", util::file_stamp(util::now_ms()), util::slug(reason), extension));
+        match std::fs::write(&path, bytes) {
+            Ok(()) => {
+                self.send_event(VisionEvent::Snapshot { path, reason: reason.to_string() });
+                prune_snapshots(&dir, 300);
+            }
+            Err(e) => util::log(&format!("could not save camera evidence: {}", e)),
         }
     }
 
@@ -1949,7 +2091,7 @@ fn prune_snapshots(dir: &std::path::Path, keep: usize) {
     };
     let mut files: Vec<PathBuf> = entries
         .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().map_or(false, |x| x == "jpg"))
+        .filter(|p| p.extension().map_or(false, |x| x == "jpg" || x == "gif"))
         .collect();
     if files.len() <= keep {
         return;

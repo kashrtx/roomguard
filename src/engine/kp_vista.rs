@@ -7,7 +7,7 @@
 //!   - [Code] + 3 (STAY): Arm Stay (press 3 again within 5 s for NIGHT-STAY)
 //!   - [Code] + 4 (MAX): Arm Away with NO Entry Delay
 //!   - [Code] + 5 (TEST) + 0 / 1: Walk Test / Dialer Test (PHONE OKAY)
-//!   - [Code] + 6 (BYPASS) + [01-08] or [#]: Manual or Quick Bypass (*23)
+//!   - [Code] + 6 (BYPASS) + [01-48] or [#]: Manual or Quick Bypass (*23)
 //!   - [Code] + 7 (INSTANT): Arm Stay with NO Entry Delay
 //!   - [Master] + 8 + [02-49]: User codes & attributes (#0 delete, #1 authority 0-4, #2 group, #3 part, #5 pager)
 //!   - [Code] + 9 (CHIME): Toggle Chime Mode (*26 Chime by Zone supported)
@@ -28,6 +28,8 @@
 
 use std::time::{Duration, Instant};
 
+use chrono::Datelike;
+
 use super::eeprom::{self, Kind};
 use super::kp1832::{pad, LcdOut};
 use super::panel::*;
@@ -44,6 +46,23 @@ pub enum SchedStep {
     StartTime,
     Days,
     Repeat,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub enum ZoneListStep {
+    #[default]
+    Select,
+    Add,
+    DeleteList,
+    DeleteZones,
+    Remove,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ZoneListMenu {
+    step: ZoneListStep,
+    list: u8,
+    digits: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -65,6 +84,7 @@ pub enum VistaKp {
     UserCode { slot: String, buf: String, first: String, by_inst: bool, caller_is_master02: bool },
     /// Installer programming: [Installer] + 8 + 0 + 0.
     Program { field: Option<String>, buf: String, review: bool },
+    ZoneList(ZoneListMenu),
     /// [#] + 0 + 2: voice volume (3 up, 6 down, 4 voice on or off, # done).
     Volume,
     /// Just armed STAY: pressing STAY again makes it NIGHT-STAY.
@@ -135,6 +155,9 @@ impl Panel {
 
     /// Speaks an alarm announcement using the 6160V ROM whitelist.
     pub fn vista_speak_alarm(&mut self, kind: AlarmKind, zone: u8) {
+        if self.mute_alarm_kind(kind) {
+            return;
+        }
         if self.model != Model::Vista20p {
             return;
         }
@@ -168,10 +191,15 @@ impl Panel {
             _ => {
                 toks.push("alarm".into());
                 if zone > 0 && (zone as usize) <= self.n() {
-                    // Authentic 6160V behavior: only pronounce words in the ROM!
-                    // Words like "PANEL" or "TAMPER" are skipped completely.
+                    // Authentic 6160V behavior: pronounce words in the ROM, and if a custom
+                    // label has no ROM words, fall back to speaking "zone <number>".
                     let words = voice::filter_zone_words(&self.label(zone as usize));
-                    toks.extend(words);
+                    if words.is_empty() {
+                        toks.push("zone".into());
+                        toks.extend(voice::number_tokens(zone));
+                    } else {
+                        toks.extend(words);
+                    }
                 }
             }
         }
@@ -428,11 +456,10 @@ impl Panel {
         // VISTA-20P Installation Manual p.70: "Pressing any key will silence the
         // keypad sounder for 10 seconds. Disarming the system will silence both
         // keypad and external sounders."
-        if self.alarms.iter().any(|a| !a.silenced && !a.kind.pulsed() && (a.audible || a.buzzer)) {
-            let ten_s = now + Duration::from_secs(10);
-            if self.vista_sounder_mute_until.map_or(true, |t| t < ten_s) {
-                self.vista_sounder_mute_until = Some(ten_s);
-            }
+        if self.vista_sounder_mute_until.map_or(true, |until| now >= until)
+            && self.live_alarms(now).any(|a| matches!(a.kind, AlarmKind::Burglary | AlarmKind::Tamper) && (a.audible || a.buzzer))
+        {
+            self.vista_sounder_mute_until = Some(now + Duration::from_secs(10));
         }
 
         let mode = std::mem::replace(&mut self.vista_mode, VistaKp::Normal);
@@ -446,6 +473,7 @@ impl Panel {
                 self.kv_user_code(slot, buf, first, by_inst, caller_is_master02, key)
             }
             VistaKp::Program { field, buf, review } => self.kv_program(field, buf, review, key, now),
+            VistaKp::ZoneList(menu) => self.kv_zone_list(menu, key),
             VistaKp::Volume => self.kv_volume(key),
             VistaKp::NightWait { at } => {
                 let fresh = now.saturating_duration_since(at).as_secs_f32() <= 5.0;
@@ -453,7 +481,7 @@ impl Panel {
                 if fresh && stay && key == Key::Digit(3) && !self.vista_night {
                     // [Code] + STAY + STAY: NIGHT-STAY.
                     self.key_beep();
-                    self.vista_set_night();
+                    self.vista_set_night(now);
                     VistaKp::Normal
                 } else {
                     self.kv_normal(key, now)
@@ -482,11 +510,7 @@ impl Panel {
                 self.key_beep();
                 // 6160V Voice Message Center: pressing [1] while recording stops & saves memo.
                 if d == 1 && self.buf.is_empty() && self.vista_msg_recording.is_some() {
-                    self.vista_msg_recording = None;
-                    self.vista_msg_waiting = true;
-                    self.beeps(2);
-                    self.vista_temp("MESSAGE SAVED", "#03 to play", 3000, now);
-                    self.log(EvKind::Info, "6160V voice message recorded");
+                    self.vista_stop_memo();
                     return VistaKp::Normal;
                 }
                 // Fire and CO alarms are silenced by OFF alone: "the security code
@@ -507,15 +531,24 @@ impl Panel {
                 // # + 0 + 1: 6160V Voice Message Center — Record memo (up to 2.5 min, 1 stops).
                 if self.buf == "#0" && d == 1 {
                     self.buf.clear();
+                    if self.exit.is_some() || self.vista_msg_recording.is_some() || self.vista_msg_saving.is_some()
+                        || self.vista_msg_play_until.is_some_and(|until| now < until)
+                    {
+                        self.error_tone();
+                        return VistaKp::Normal;
+                    }
                     self.vista_msg_recording = Some(now);
+                    self.out.push(Out::Memo(crate::audio::memo::Command::Record(now)));
                     self.vista_confirm_beep();
                     self.vista_temp("RECORDING MSG", "Press 1 to stop", 3000, now);
-                    self.log(EvKind::Info, "6160V voice message recording started");
                     return VistaKp::Normal;
                 }
                 // # + 0 + 2: 6160V voice volume.
                 if self.buf == "#0" && d == 2 {
                     self.buf.clear();
+                    if self.vista_msg_play_until.is_some_and(|until| now < until) {
+                        return VistaKp::Normal;
+                    }
                     self.vista_confirm_beep();
                     self.vista_speak(vec!["system".into()]);
                     return VistaKp::Volume;
@@ -524,10 +557,12 @@ impl Panel {
                 if self.buf == "#0" && d == 3 {
                     self.buf.clear();
                     self.vista_confirm_beep();
-                    if self.vista_msg_waiting {
+                    if let Some(clip) = self.vista_memo.clone() {
                         self.vista_msg_waiting = false;
+                        let duration = Duration::from_secs_f64(clip.samples.len() as f64 / f64::from(clip.rate));
+                        self.vista_msg_play_until = Some(now + duration);
                         self.vista_temp("PLAYING MESSAGE", "", 3000, now);
-                        self.vista_speak(vec!["system".into()]);
+                        self.audio(AudioCmd::PlayMemo(clip));
                         self.log(EvKind::Info, "6160V voice message played");
                     } else {
                         self.vista_temp("NO MESSAGES", "", 2500, now);
@@ -545,12 +580,13 @@ impl Panel {
                 if self.buf.len() >= 4 {
                     let code = std::mem::take(&mut self.buf);
                     let urgent = self.entry.is_some() || self.alarms.iter().any(|a| !a.silenced);
-                    if urgent {
-                        self.vista_sounder_mute_until = Some(now + Duration::from_secs(15));
+                    if self.entry.is_some() && self.vista_entry_mute_until.map_or(true, |until| now >= until) {
+                        self.vista_entry_mute_until = Some(now + Duration::from_secs(15));
                     }
                     if let Some(slot) = self.ee.find_code(&code) {
                         self.bad_codes = 0;
                         let user = eeprom::slot_user(&slot);
+                        self.last_entered_code = Some(code);
                         if urgent {
                             self.vista_code_disarm = Some((now + Duration::from_secs(15), user, slot.clone()));
                         }
@@ -822,7 +858,23 @@ impl Panel {
                     return VistaKp::Normal;
                 }
             };
-            self.vista_periodic_test_days = days;
+            let first_ms = self.vista_wall_ms + self.clock_offset_ms + 12 * 60 * 60 * 1000;
+            let first = util::parts(first_ms);
+            let weekday = util::weekday_idx(first_ms);
+            let first_day = util::local(first_ms).num_days_from_ce();
+            self.vista_schedules.retain(|schedule| schedule.num != 32);
+            self.vista_schedules.push(VistaSched {
+                num: 32,
+                event: 11,
+                hour: first.hour as u8,
+                minute: first.minute as u8,
+                days: if days == 1 { 0x7f } else { 1 << weekday },
+                repeat: if days == 28 { 4 } else { 1 },
+                start_day: Some(first_day),
+                first_run_week: Some(first_day - i32::from(weekday)),
+                ..Default::default()
+            });
+            self.out.push(Out::Save);
             self.vista_confirm_beep();
             let lbl = if days == 1 { "24 HOUR" } else if days == 7 { "WEEKLY" } else { "28 DAY" };
             self.vista_temp("PERIODIC TEST", lbl, 3000, now);
@@ -972,6 +1024,8 @@ impl Panel {
                     self.vista_show_bypassed(&list, now);
                     let first = list[0] as u16;
                     self.log_cid(EvKind::Info, format!("Quick bypassed {} open zone(s)", list.len()), 570, 'E', first, false);
+                    let code = self.last_entered_code.take();
+                    self.emit_ha_bypass(HaBypassCmd::QuickBypass { zones: list, code }, now);
                 }
                 VistaKp::Normal
             }
@@ -989,11 +1043,14 @@ impl Panel {
                         zr.bypassed = false;
                         zr.auto_bypass = false;
                     }
+                    self.ha_synced_bypasses.fill(false);
                     self.vista_confirm_beep();
                     if had {
                         self.vista_temp("BYPASS CLEARED", "", 2500, now);
                         self.log_cid(EvKind::Info, "All bypasses cleared ([Code]+6+00)", 570, 'R', 0, false);
                     }
+                    let code = self.last_entered_code.take();
+                    self.emit_ha_bypass(HaBypassCmd::ClearAll { code }, now);
                 } else if (1..=self.n()).contains(&z) && self.cfg(z).bypassable {
                     let was = self.zones[z - 1].bypassed;
                     self.zones[z - 1].bypassed = true;
@@ -1002,7 +1059,10 @@ impl Panel {
                     if !was {
                         self.log_cid(EvKind::Info, format!("Zone {:02} bypassed", z), 570, 'E', z as u16, false);
                     }
+                    let code = self.last_entered_code.take();
+                    self.emit_ha_bypass(HaBypassCmd::SetZone { zone: z as u8, bypassed: true, code }, now);
                 } else {
+                    self.last_entered_code = None;
                     self.error_tone();
                 }
                 VistaKp::Normal
@@ -1095,7 +1155,7 @@ impl Panel {
                         return VistaKp::Normal;
                     }
                     match buf.as_str() {
-                        "#1" if d <= 4 => {
+                        "#1" if d <= 5 => {
                             let attrs = (self.ee.attrs(&slot) & !0x07) | d;
                             self.ee.set_attrs(&slot, attrs);
                             let name = match d {
@@ -1103,6 +1163,7 @@ impl Panel {
                                 2 => "Guest",
                                 3 => "Duress",
                                 4 => "Partition Master",
+                                5 => "One-Time Maid/Guest",
                                 _ => "Standard",
                             };
                             self.vista_confirm_beep();
@@ -1496,8 +1557,9 @@ impl Panel {
                         minute,
                         days,
                         repeat: d,
-                        last_fired_ordinal: None,
-                        last_fired_min: None,
+                        start_day: None,
+                        first_run_week: None,
+                        last_run_day: None,
                     });
                     self.vista_schedules.sort_by_key(|s| s.num);
                     self.vista_confirm_beep();
@@ -1809,6 +1871,7 @@ impl Panel {
                     if digits.len() >= 2 && (digits != "19" || digits.len() == 3) {
                         if prefix == '*' {
                             match digits {
+                                "81" => return VistaKp::ZoneList(ZoneListMenu::default()),
                                 "99" => {
                                     self.beeps(3);
                                     self.log_cid(EvKind::Program, "Exited Vista installer programming (*99)", 628, 'E', 0, true);
@@ -1884,6 +1947,102 @@ impl Panel {
         }
     }
 
+    fn kv_zone_list(&mut self, mut menu: ZoneListMenu, key: Key) -> VistaKp {
+        use ZoneListStep::*;
+        self.key_beep();
+        match (menu.step, key) {
+            (DeleteList, Key::Digit(0)) => menu.step = DeleteZones,
+            (DeleteList, Key::Digit(1)) => {
+                self.save_vista_zone_list(menu.list, 0);
+                menu = ZoneListMenu::default();
+            }
+            (DeleteZones, Key::Digit(0)) => menu = ZoneListMenu::default(),
+            (DeleteZones, Key::Digit(1)) => menu.step = Remove,
+            (Select | Add | Remove, Key::Digit(d)) if menu.digits.len() < 2 => {
+                menu.digits.push(char::from(b'0' + d));
+            }
+            (Select | Add | Remove, Key::Hash) => {
+                menu.digits.pop();
+            }
+            (Select | Add | Remove, Key::Star) if menu.digits.len() == 2 => {
+                let number = std::mem::take(&mut menu.digits).parse::<u8>().unwrap_or(0);
+                match (menu.step, number) {
+                    (Select, 0) => return VistaKp::Program { field: None, buf: String::new(), review: false },
+                    (Select, 1..=12) => {
+                        menu.list = number;
+                        menu.step = Add;
+                    }
+                    (Add, 0) => menu.step = DeleteList,
+                    (Remove, 0) => menu = ZoneListMenu::default(),
+                    (Add | Remove, 1..=64) => {
+                        let bit = 1u64 << (number - 1);
+                        let current = self.vista_zone_list(menu.list);
+                        let updated = if matches!(menu.step, Add) { current | bit } else { current & !bit };
+                        self.save_vista_zone_list(menu.list, updated);
+                    }
+                    _ => self.error_tone(),
+                }
+            }
+            _ => self.error_tone(),
+        }
+        VistaKp::ZoneList(menu)
+    }
+
+    pub(crate) fn vista_zone_list(&self, list: u8) -> u64 {
+        match list {
+            3 | 5 => {
+                let field = if list == 3 { "chime_list" } else { "81" };
+                self.ee.raw(self.model, field).bytes().take(8).enumerate().fold(0, |mask, (i, value)| {
+                    mask | (u64::from(value == b'1') << i)
+                }) | self.ee.sections.get(&format!("zone_list_{:02}", list))
+                    .and_then(|value| value.parse::<u64>().ok()).unwrap_or(0) & !0xff
+            }
+            _ => self.ee.sections.get(&format!("zone_list_{:02}", list)).and_then(|value| value.parse().ok()).unwrap_or(0),
+        }
+    }
+
+    fn save_vista_zone_list(&mut self, list: u8, zones: u64) {
+        if matches!(list, 3 | 5) {
+            let field = if list == 3 { "chime_list" } else { "81" };
+            let value = (0..8).map(|zone| if zones & (1 << zone) == 0 { '0' } else { '1' }).collect();
+            self.ee.sections.insert(field.into(), value);
+        }
+        self.ee.sections.insert(format!("zone_list_{:02}", list), zones.to_string());
+        self.out.push(Out::Save);
+    }
+
+    fn vista_stop_memo(&mut self) {
+        if let Some(id) = self.vista_msg_recording.take() {
+            self.vista_msg_saving = Some(id);
+            self.out.push(Out::Memo(crate::audio::memo::Command::Stop(id)));
+            self.dirty = true;
+        }
+    }
+
+    pub(crate) fn vista_memo_result(&mut self, id: Instant, result: crate::audio::memo::Result, now: Instant) {
+        if self.vista_msg_recording != Some(id) && self.vista_msg_saving != Some(id) {
+            return;
+        }
+        self.vista_msg_recording = None;
+        self.vista_msg_saving = None;
+        match result {
+            Ok(clip) => {
+                self.vista_memo = Some(clip);
+                self.vista_msg_waiting = true;
+                self.beeps(2);
+                self.vista_temp("MESSAGE SAVED", "#03 to play", 3000, now);
+                self.log(EvKind::Info, "6160V voice message recorded");
+            }
+            Err(error) => {
+                self.out.push(Out::Memo(crate::audio::memo::Command::Cancel));
+                self.error_tone();
+                self.vista_temp("MICROPHONE ERROR", "Review event log", 3000, now);
+                self.log(EvKind::Info, format!("Could not record keypad message: {}", error));
+            }
+        }
+        self.dirty = true;
+    }
+
     /// Periodic Vista-specific timers (voice during exit delay, periodic voice
     /// during burglary alarm, 30 s mode timeouts, voice message center auto-stop,
     /// `#64` schedules, and GoTo Partition auto-revert).
@@ -1911,12 +2070,8 @@ impl Panel {
             self.dirty = true;
         }
         // Voice Message Center (# + 0 + 1) auto-stops after 2.5 minutes (150 s)
-        if self.vista_msg_recording.map_or(false, |t| now.saturating_duration_since(t).as_secs() >= 150) {
-            self.vista_msg_recording = None;
-            self.vista_msg_waiting = true;
-            self.beeps(2);
-            self.log(EvKind::Info, "6160V voice message recording finished (2.5 min limit)");
-            self.dirty = true;
+        if self.vista_msg_recording.is_some_and(|t| now.saturating_duration_since(t).as_secs() >= crate::audio::memo::MAX_SECONDS) {
+            self.vista_stop_memo();
         }
         // Clear expired reminder display
         if self.vista_reminder_until.map_or(false, |t| now >= t) {
@@ -2001,20 +2156,28 @@ impl Panel {
             return;
         }
         let panel_ms = wall_ms + self.clock_offset_ms;
-        let lp = util::parts(panel_ms);
-        let wd_bit = 1u8 << util::weekday_idx(panel_ms);
-        let cur_min = (lp.hour * 60 + lp.minute) as u16;
+        let clock = util::parts(panel_ms);
+        let weekday = util::weekday_idx(panel_ms);
+        let day = util::local(panel_ms).num_days_from_ce();
+        let week = day - i32::from(weekday);
         let mut to_fire = Vec::new();
-        for s in self.vista_schedules.iter_mut() {
-            if s.hour as u32 == lp.hour
-                && s.minute as u32 == lp.minute
-                && (s.days & wd_bit) != 0
-                && !(s.last_fired_ordinal == Some(lp.ordinal) && s.last_fired_min == Some(cur_min))
+        for schedule in &mut self.vista_schedules {
+            if (self.following_panel && (4..=6).contains(&schedule.event))
+                || u32::from(schedule.hour) != clock.hour
+                || u32::from(schedule.minute) != clock.minute
+                || schedule.days & (1 << weekday) == 0
+                || schedule.start_day.is_some_and(|start| day < start)
+                || schedule.last_run_day == Some(day)
             {
-                s.last_fired_ordinal = Some(lp.ordinal);
-                s.last_fired_min = Some(cur_min);
-                to_fire.push((s.num, s.event, s.device, s.repeat));
+                continue;
             }
+            let first_week = *schedule.first_run_week.get_or_insert(week);
+            let weeks_elapsed = (week - first_week) / 7;
+            if weeks_elapsed < 0 || weeks_elapsed % i32::from(schedule.repeat.max(1)) != 0 {
+                continue;
+            }
+            schedule.last_run_day = Some(day);
+            to_fire.push((schedule.num, schedule.event, schedule.device, schedule.repeat));
         }
         for (num, event, device, repeat) in to_fire {
             match event {
@@ -2067,8 +2230,8 @@ impl Panel {
             }
             if repeat == 0 {
                 self.vista_schedules.retain(|s| s.num != num);
-                self.out.push(Out::Save);
             }
+            self.out.push(Out::Save);
             self.dirty = true;
         }
     }
@@ -2117,13 +2280,24 @@ impl Panel {
                     }
                 };
             }
+            VistaKp::ZoneList(menu) => {
+                use ZoneListStep::*;
+                let (title, line) = match menu.step {
+                    Select => ("Zone List No.", format!("00=Quit       {}", menu.digits)),
+                    Add => ("Enter Zn Num.", format!("{:02} List     {}", menu.list, menu.digits)),
+                    DeleteList => ("Del Zn List?", "0=No 1=Yes".into()),
+                    DeleteZones => ("Delete Zone?", "0=No 1=Yes".into()),
+                    Remove => ("Zn to Delete?", format!("00=Quit       {}", menu.digits)),
+                };
+                return with_cursor(title, &line, 1, line.len());
+            }
             VistaKp::UserCode { slot, buf, first, .. } => {
                 let (s, col) = if slot.len() < 2 {
                     (format!("USER: {}_", slot), 6 + slot.len())
                 } else if buf == "#" {
                     (format!("U{} ATTR: #0/1/2/5", slot), 15)
                 } else if buf == "#1" {
-                    (format!("U{} AUTH (0-4):_", slot), 15)
+                    (format!("U{} AUTH (0-5):_", slot), 15)
                 } else if buf == "#2" {
                     (format!("U{} GROUP (0-8):_", slot), 15)
                 } else if buf.starts_with("#3") {
@@ -2153,7 +2327,7 @@ impl Panel {
             }
             VistaKp::Bypass { buf, .. } => {
                 return if buf.is_empty() {
-                    plain("BYPASS ZONE", "Enter Zn (01-08)")
+                    plain("BYPASS ZONE", "Enter Zn (01-48)")
                 } else {
                     with_cursor("BYPASS ZONE", &format!("Zone: {}_", buf), 1, (6 + buf.len()).min(15))
                 };
@@ -2239,8 +2413,16 @@ impl Panel {
             _ => {}
         }
 
-        // Active live alarm
-        if let Some(a) = self.live_alarms(now).next() {
+        // Active live alarm: Fire alarms take priority over Burglary alarms, and multiple
+        // simultaneous zones in alarm cycle every 2.5 s just like real VISTA-20P 0xF7 frames.
+        let cycle = (now.saturating_duration_since(self.last_key_at).as_millis() / 2500) as usize;
+        let mut live: Vec<&AlarmRt> = self.live_alarms(now).filter(|a| a.kind != AlarmKind::Duress).collect();
+        if !live.is_empty() {
+            let fire_live: Vec<&AlarmRt> = live.iter().copied().filter(|a| a.kind.pulsed()).collect();
+            if !fire_live.is_empty() {
+                live = fire_live;
+            }
+            let a = live[cycle % live.len()];
             if a.kind.pulsed() {
                 if a.zone == 95 || a.zone == 0 {
                     let (l1, l2) = split_zone_lines("FIRE", 95, "FIRE PANIC");
@@ -2261,6 +2443,27 @@ impl Panel {
             return plain(&l1, &l2);
         }
 
+        if let Some((top, bottom)) = self.physical_lcd() {
+            // When the linked HA/physical panel is counting down exit delay with a known duration,
+            // display the authentic 6160V exit screen with live countdown if *197 > 0.
+            if self.physical_state == Some(crate::home_assistant::AlarmState::Arming)
+                && self.exit.is_none()
+                && self.armed.is_none()
+            {
+                let head = if self.ha_arming_next_stay { "ARMED ***STAY***" } else { "ARMED ***AWAY***" };
+                let iv = self.ee.entry_or(Model::Vista20p, "197", 0, 0).min(5) as u64;
+                if iv > 0 {
+                    if let Some(((st, _), dur)) = self.ha_arming_started.zip(self.ha_arming_expected) {
+                        let rem = (st + dur).saturating_duration_since(now);
+                        let left = (rem.as_millis().saturating_add(999) / 1000) as u64;
+                        let shown = if iv == 1 { left } else { ((left + iv - 1) / iv) * iv };
+                        return plain(head, &format!("May Exit Now {:02}", shown.min(99)));
+                    }
+                }
+                return plain(head, "You may exit now");
+            }
+            return plain(&top, &bottom);
+        }
         // Entry delay (alternates EXIT ALARM when triggered by an exit-error fault)
         if let Some(e) = &self.entry {
             if e.exit_fault && (now.saturating_duration_since(e.started).as_millis() / 2000) % 2 == 1 {
@@ -2271,7 +2474,8 @@ impl Panel {
 
         // Exit delay
         if let Some(ex) = &self.exit {
-            let left = (ex.started + ex.dur).saturating_duration_since(now).as_secs();
+            let rem = (ex.started + ex.dur).saturating_duration_since(now);
+            let left = (rem.as_millis().saturating_add(999) / 1000) as u64;
             let head = match ex.how {
                 ArmHow::StayKey if self.vista_night => "ARMED NIGHT-STAY",
                 ArmHow::StayKey => "ARMED ***STAY***",
@@ -2323,11 +2527,20 @@ impl Panel {
         }
 
         // Latched Alarm Memory after 1st [Code] + 1 disarm:
-        // Authentic 0xF7 ECP display alternates ALARM XX <ZONE> and DISARMED every 2.5 s
-        // until the 2nd [Code] + 1 clears memory (phase 0 starts on ALARM XX).
-        let cycle = (now.saturating_duration_since(self.last_key_at).as_millis() / 2500) as usize;
-        if let Some((z, k)) = self.vista_alarm_mem_zone {
-            if cycle % 2 == 0 {
+        // Authentic 0xF7 ECP display cycles through all alarmed zones and DISARMED every 2.5 s
+        // until the 2nd [Code] + 1 clears memory (phase 0 starts on ALARM/FIRE XX).
+        if let Some((first_z, first_k)) = self.vista_alarm_mem_zone {
+            let mut mem_zones: Vec<(u8, AlarmKind)> = Vec::new();
+            mem_zones.push((first_z, first_k));
+            for &mz in &self.memory[0] {
+                if mz > 0 && !mem_zones.iter().any(|(z, _)| *z == mz) {
+                    let mk = if self.cfg(mz as usize).kind.is_fire() { AlarmKind::Fire } else { AlarmKind::Burglary };
+                    mem_zones.push((mz, mk));
+                }
+            }
+            let slot_idx = cycle % (mem_zones.len() + 1);
+            if slot_idx < mem_zones.len() {
+                let (z, k) = mem_zones[slot_idx];
                 let prefix = if k.pulsed() { "FIRE" } else { "ALARM" };
                 let lbl = if z == 95 {
                     "FIRE PANIC".to_string()
@@ -2368,11 +2581,22 @@ impl Panel {
         // Collect all active trouble/CHECK conditions so multiple simultaneous troubles
         // cycle cleanly every 2.5 s on the 6160V just like real VISTA-20P 0xF7 packets.
         let mut trouble_screens: Vec<(String, String)> = Vec::new();
-        if (self.troubles & (tb::ZONE_FAULT | tb::ZONE_TAMPER)) != 0 {
+        if (self.troubles & (tb::ZONE_FAULT | tb::ZONE_TAMPER | tb::HOME_SENSOR)) != 0 {
             for z in 1..=self.n() {
-                if self.camera_zone.get(z - 1).copied().unwrap_or(false) && self.violated(z) {
+                let cam_fault = self.camera_zone.get(z - 1).copied().unwrap_or(false) && self.violated(z);
+                if cam_fault || self.zones[z - 1].fault || self.zones[z - 1].tamper {
                     let lbl = self.label(z).to_ascii_uppercase();
                     trouble_screens.push(split_zone_lines("CHECK", z as u8, &lbl));
+                }
+            }
+        }
+        // VISTA-20P Zone Type 05 (Trouble by Day / Alarm by Night) shows CHECK XX while open & disarmed.
+        for z in 1..=self.n() {
+            if self.cfg(z).kind == ZoneKind::DayZone && self.zones[z - 1].open && !self.zones[z - 1].bypassed {
+                let lbl = self.label(z).to_ascii_uppercase();
+                let screen = split_zone_lines("CHECK", z as u8, &lbl);
+                if !trouble_screens.contains(&screen) {
+                    trouble_screens.push(screen);
                 }
             }
         }
@@ -2411,15 +2635,24 @@ impl Panel {
     pub(crate) fn vista_off(&mut self, slot: &str, user: u8, now: Instant) {
         self.vista_code_disarm = None;
         self.vista_sounder_mute_until = None;
-        let is_armed = self.armed.is_some() || self.exit.is_some();
+        self.vista_entry_mute_until = None;
+        let is_armed = self.armed.is_some()
+            || self.exit.is_some()
+            || (self.panel_link == crate::home_assistant::PanelLink::TwoWay
+                && (self.is_on()
+                    || self
+                        .physical_state
+                        .is_some_and(|s| !matches!(s, crate::home_assistant::AlarmState::Disarmed))));
         let has_live_alarm = self.alarms.iter().any(|a| !a.silenced);
 
         // Enforce VISTA-20P authority levels (User Guide p.28):
         //   - Installer code can only disarm if it was used to arm.
         //   - Authority 1 (Arm-Only) cannot disarm or silence.
-        //   - Authority 2 (Guest/Babysitter) can only disarm if used to arm.
+        //   - Authority 2 (Guest/Babysitter) & 5 (One-Time Maid/Guest) can only disarm if used to arm;
+        //     Authority 5 automatically deletes itself after completing one arm+disarm cycle.
         //   - Authority 3 (Duress) acts normally and silently sends CID 121 Duress.
         if slot == "inst" && is_armed && !self.vista_armed_by_inst {
+            self.last_entered_code = None;
             self.error_tone();
             return;
         }
@@ -2429,10 +2662,12 @@ impl Panel {
             self.ee.attrs(slot) & 0x07
         };
         if auth == 1 && (is_armed || has_live_alarm || self.entry.is_some()) {
+            self.last_entered_code = None;
             self.error_tone();
             return;
         }
-        if auth == 2 && is_armed && self.vista_armed_by_slot.as_deref() != Some(slot) {
+        if matches!(auth, 2 | 5) && is_armed && self.vista_armed_by_slot.as_deref() != Some(slot) {
+            self.last_entered_code = None;
             self.error_tone();
             return;
         }
@@ -2442,6 +2677,7 @@ impl Panel {
 
         let status_at = now + Duration::from_millis(2190);
         if self.walk_test {
+            self.last_entered_code = None;
             self.walk_test = false;
             self.vista_test_since = None;
             self.vista_off_beep();
@@ -2456,10 +2692,16 @@ impl Panel {
             } else {
                 self.silence(user);
             }
+            self.last_entered_code = None;
             self.vista_off_beep();
             self.vista_armed_by_inst = false;
             self.vista_armed_by_slot = None;
             self.vista_night = false;
+            if auth == 5 && is_armed && !slot.is_empty() {
+                self.ee.clear_code(slot);
+                self.log(EvKind::Program, format!("One-time code {} used and cleared", slot));
+                self.out.push(Out::Save);
+            }
             if let Some((z, k)) = alarmed_info {
                 self.vista_alarm_mem_zone = Some((z, k));
                 self.vista_pending_status = None;
@@ -2471,6 +2713,7 @@ impl Panel {
             let was_fire = self.vista_alarm_mem_zone.map_or(false, |(_, k)| k.pulsed());
             self.vista_alarm_mem_zone = None;
             self.memory_flag = false;
+            self.alarms.retain(|a| !a.silenced);
             for z in self.zones.iter_mut() {
                 z.alarm = false;
             }
@@ -2490,8 +2733,14 @@ impl Panel {
                 z.bypassed = false;
                 z.auto_bypass = false;
             }
+            self.ha_synced_bypasses.fill(false);
+            let code = self.last_entered_code.take();
             if had {
                 self.log_cid(EvKind::Info, "Bypasses removed", 570, 'R', 0, false);
+                self.emit_ha_bypass(HaBypassCmd::ClearAll { code }, now);
+            }
+            if self.ha_external_siren.is_some() {
+                self.out.push(Out::Disarmed { after_alarm: false });
             }
             self.vista_off_beep();
             self.vista_pending_status = Some(status_at);
@@ -2499,10 +2748,20 @@ impl Panel {
     }
 
     /// NIGHT-STAY arms the perimeter plus the zones in zone list 05 (field *81).
-    pub(crate) fn vista_set_night(&mut self) {
+    pub(crate) fn vista_set_night(&mut self, now: Instant) {
         self.vista_night = true;
         self.vista_unbypass_night_zones();
         self.log(EvKind::Arm, "Armed NIGHT-STAY");
+        if self.panel_link == crate::home_assistant::PanelLink::TwoWay {
+            self.ha_outbound_until = Some(now + Duration::from_millis(3500));
+            self.ha_expect = Some(HaExpect::Night);
+            self.out.push(Out::HaPanelCmd(HaPanelCmd::Arm {
+                mode: ArmMode::Stay,
+                night: true,
+                no_entry: false,
+                code: self.last_entered_code.take(),
+            }));
+        }
         self.out.push(Out::Save);
         self.vista_arm_beeps();
         let toks = self.vista_exit_tokens(ArmHow::StayKey);
@@ -2510,7 +2769,7 @@ impl Panel {
     }
 
     fn vista_night_zone(&self, z: usize) -> bool {
-        self.ee.entry_or(Model::Vista20p, "81", z.saturating_sub(1), 0) != 0
+        self.vista_zone_list(5) & (1u64 << z.saturating_sub(1)) != 0
     }
 
     fn vista_unbypass_night_zones(&mut self) {
@@ -2562,7 +2821,7 @@ impl Panel {
     }
 
     /// Step arming's third press: from NIGHT-STAY up to AWAY.
-    pub(crate) fn vista_step_to_away(&mut self) {
+    pub(crate) fn vista_step_to_away(&mut self, now: Instant) {
         if let Some(a) = self.armed.as_mut() {
             a.mode = ArmMode::Away;
         }
@@ -2582,6 +2841,16 @@ impl Panel {
         }
         self.beeps(2);
         self.log(EvKind::Arm, "Armed AWAY (step arming)");
+        if self.panel_link == crate::home_assistant::PanelLink::TwoWay {
+            self.ha_outbound_until = Some(now + Duration::from_millis(3500));
+            self.ha_expect = Some(HaExpect::Away);
+            self.out.push(Out::HaPanelCmd(HaPanelCmd::Arm {
+                mode: ArmMode::Away,
+                night: false,
+                no_entry: false,
+                code: None,
+            }));
+        }
         self.out.push(Out::Save);
         if exiting {
             self.vista_exit_voice_done = true;
@@ -2608,14 +2877,14 @@ impl Panel {
         self.temp("PAGING", "999-9999", 3000);
     }
 
-    /// 6160V status LEDs: [READY (green), ARMED (red), MESSAGE (amber), AC/MIC].
+    /// 6160V status LEDs: [READY (green), ARMED (red), MESSAGE (red), AC/MIC].
     pub fn leds_vista(&self) -> [Led; 4] {
-        let ready = if self.armed.is_none() && self.exit.is_none() && self.ready() {
+        let ready = if !self.is_on() && self.ready() {
             Led::On
         } else {
             Led::Off
         };
-        let armed = if self.armed.is_some() || self.exit.is_some() {
+        let armed = if self.is_on() {
             Led::On
         } else if self.vista_alarm_mem_zone.is_some() {
             Led::Flash
@@ -2623,10 +2892,10 @@ impl Panel {
             Led::Off
         };
         // 6160V MESSAGE LED: steady while recording (#+0+1), flashing when a voice
-        // memo is waiting (#+0+3 plays & clears) or a system trouble/memory exists.
+        // memo is waiting. Playing it clears only the indicator.
         let msg = if self.vista_msg_recording.is_some() {
             Led::On
-        } else if self.vista_msg_waiting || self.troubles != 0 || self.memory_flag {
+        } else if self.vista_msg_waiting {
             Led::Flash
         } else {
             Led::Off
@@ -2666,7 +2935,7 @@ fn vista_event_cid(ev: &EventRow) -> (u16, char, u16, bool) {
 fn next_field(f: &str) -> Option<String> {
     let mut keys: Vec<&'static str> = eeprom::VISTA20P
         .iter()
-        .filter(|s| !matches!(s.kind, Kind::Action) && s.key != "02" && s.key.chars().all(|c| c.is_ascii_digit()))
+        .filter(|s| !matches!(s.kind, Kind::Action) && !matches!(s.key, "02" | "81") && s.key.chars().all(|c| c.is_ascii_digit()))
         .map(|s| s.key)
         .collect();
     keys.sort_by_key(|k| k.parse::<u32>().unwrap_or(0));

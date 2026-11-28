@@ -13,7 +13,7 @@ static ROM_BYTES: &[u8] = include_bytes!("../../assets/voice/vista6160v.bin");
 const ROM_RATE: f32 = 8000.0;
 
 /// Official 6160V/6150V zone descriptor words supported by the voice ROM.
-const ZONE_VOCAB: &[&str] = &[
+pub const ZONE_VOCAB: &[&str] = &[
     "alarm", "attic", "baby", "back", "basement", "bathroom", "bedroom", "closed", "den",
     "detector", "dining", "door", "emergency", "exit", "fire", "floor", "front", "garage",
     "hall", "inside", "kitchen", "laundry", "library", "living", "main", "master", "medical",
@@ -21,6 +21,32 @@ const ZONE_VOCAB: &[&str] = &[
     "sliding", "smoke", "storage", "supervised", "upstairs", "utility", "window", "zone",
     "1st", "2nd", "3rd",
 ];
+
+/// Returns what the 6160V voice keypad will speak for `label` on `zone`, plus `true` if
+/// at least one word matched the built-in voice ROM (`false` means it falls back to "zone N").
+pub fn spoken_zone_preview(label: &str, zone: u8) -> (String, bool) {
+    let words = filter_zone_words(label);
+    if words.is_empty() {
+        (format!("zone {}", zone), false)
+    } else {
+        (words.join(" "), true)
+    }
+}
+
+/// Comma-separated readable list of all speakable 6160V zone words (sorted nicely for users).
+pub fn vocab_display_list() -> String {
+    ZONE_VOCAB
+        .iter()
+        .map(|w| {
+            let mut chars = w.chars();
+            match chars.next() {
+                Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
 struct WordClip {
     data: Vec<u8>,

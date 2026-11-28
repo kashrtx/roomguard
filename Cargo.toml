@@ -1,8 +1,8 @@
 [package]
 name = "roomguard"
-version = "2.2.0"
+version = "2.3.0"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.82"
 authors = ["Kaushal Bhingaradia"]
 license = "Apache-2.0"
 description = "A camera based room alarm with faithful RmG Classic PC1550, GuardSeries PC1832, and VistaGuard 20P keypad replicas."
@@ -11,7 +11,7 @@ build = "build.rs"
 
 [dependencies]
 eframe = { version = "0.29", features = ["wgpu"] }
-cpal = "0.15"
+cpal = "0.17.3"
 nokhwa = { version = "0.10", default-features = false, features = ["input-native"] }
 jpeg-decoder = { version = "0.3", default-features = false }
 jpeg-encoder = "0.6"
@@ -26,6 +26,8 @@ qrcode = { version = "0.14", default-features = false }
 starship-battery = "0.10"
 self-replace = "1"
 tract-onnx = "0.21"
+gif = "0.13.3"
+tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"

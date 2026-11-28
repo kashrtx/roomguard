@@ -6,9 +6,10 @@
 
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::config::OperatorCfg;
+use crate::engine::types::{AlarmKind, Report, ReportKind};
 use crate::engine::EngineMsg;
 use crate::util;
 
@@ -20,6 +21,61 @@ pub struct NotifyJob {
     pub tags: String,
     pub photo: Option<PathBuf>,
     pub test: bool,
+}
+
+/// Returns the alert and whether it can use a fresh event snapshot.
+pub fn for_report(report: &Report, cfg: &OperatorCfg) -> Option<(NotifyJob, bool)> {
+    if !cfg.phone_alerts {
+        return None;
+    }
+    let zone = report.zone_label.trim();
+    let location = if !zone.is_empty() {
+        zone.to_string()
+    } else if report.zone_or_user != 0 {
+        format!("Zone {:02}", report.zone_or_user)
+    } else {
+        "Keypad".to_string()
+    };
+    let at = util::fmt_clock(report.ts);
+    let (title, message, priority, tag, snapshot) = match report.kind {
+        ReportKind::Alarm(AlarmKind::Duress) => (
+            "Duress code used".into(), format!("The duress code was entered at {at}."), 5, "warning", false,
+        ),
+        ReportKind::Alarm(kind) => (
+            format!("{} alarm: {location}", kind.label()), format!("Alarm triggered at {at}."),
+            5, if kind == AlarmKind::Fire { "fire" } else { "rotating_light" }, true,
+        ),
+        ReportKind::EntryStarted if cfg.heads_up_on_entry => (
+            format!("{location} opened"), format!("Entry countdown started at {at}."), 3, "door", true,
+        ),
+        ReportKind::PhysicalEntry if cfg.heads_up_on_entry => (
+            "Physical panel entry delay".into(), format!("The panel reported an entry delay at {at}."), 3, "door", true,
+        ),
+        ReportKind::PhysicalAlarm => (
+            "Physical panel alarm".into(), format!("The panel reported an alarm at {at}."), 5, "rotating_light", true,
+        ),
+        ReportKind::Stranger if cfg.unknown_person_alerts => (
+            "Person detected while armed".into(), format!("RoomGuard saw someone it could not identify at {at}."), 4, "bust_in_silhouette", true,
+        ),
+        ReportKind::Lockout => (
+            "Keypad locked".into(), format!("Several incorrect codes were entered at {at}."), 4, "lock", true,
+        ),
+        // A phone delivery failure must never queue another phone alert about itself.
+        // Filter non-trouble reports that the simulated panel categorizes as restores.
+        ReportKind::Trouble | ReportKind::Restore if cfg.trouble_reports && matches!(report.cid, 300..=399) && report.cid != 354 => (
+            if report.kind == ReportKind::Trouble { "RoomGuard needs attention".into() } else { "RoomGuard recovered".into() },
+            format!("{} at {at}.", report.text), 3, "warning", false,
+        ),
+        ReportKind::Opening | ReportKind::Closing if cfg.open_close_reports => (
+            if report.kind == ReportKind::Opening { "RoomGuard disarmed".into() } else { "RoomGuard armed".into() },
+            format!("{} at {at}.", report.text), 2, "lock", false,
+        ),
+        ReportKind::PowerUp => (
+            "RoomGuard restarted".into(), format!("RoomGuard came back armed at {at}."), 3, "electric_plug", false,
+        ),
+        _ => return None,
+    };
+    Some((NotifyJob { title, message, priority, tags: tag.into(), photo: None, test: false }, snapshot))
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -85,40 +141,47 @@ pub fn start(engine: Sender<EngineMsg>) -> NotifyHandle {
 
 fn run(rx: Receiver<Cmd>, engine: Sender<EngineMsg>) {
     let mut cfg = NtfyCfg::default();
-    let mut queue: Vec<(NotifyJob, u32)> = Vec::new();
+    let mut queue: Vec<(NotifyJob, u32, Instant)> = Vec::new();
     loop {
-        let wait = if queue.is_empty() { Duration::from_secs(60) } else { Duration::from_secs(6) };
+        let now = Instant::now();
+        let wait = queue.iter().map(|(_, _, due)| due.saturating_duration_since(now))
+            .min().unwrap_or(Duration::from_secs(60));
         match rx.recv_timeout(wait) {
-            Ok(Cmd::Config(c)) => cfg = c,
-            Ok(Cmd::Send(job)) => queue.push((job, 0)),
-            Err(RecvTimeoutError::Timeout) => {
-                if queue.is_empty() && cfg.enabled {
-                    let ok = health(&cfg);
-                    let _ = engine.send(EngineMsg::NetStatus(ok));
+            Ok(Cmd::Config(c)) => {
+                if !c.enabled || (c.server.as_str(), c.topic.as_str(), c.token.as_str()) != (cfg.server.as_str(), cfg.topic.as_str(), cfg.token.as_str()) {
+                    queue.clear();
                 }
+                cfg = c;
             }
+            Ok(Cmd::Send(job)) if cfg.enabled || job.test => queue.push((job, 0, Instant::now())),
+            Ok(Cmd::Send(_)) => {}
+            Err(RecvTimeoutError::Timeout) if queue.is_empty() && cfg.enabled => {
+                let _ = engine.send(EngineMsg::NetStatus(health(&cfg)));
+            }
+            Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return,
         }
-        let mut keep = Vec::new();
-        for (job, tries) in queue.drain(..) {
-            if !cfg.enabled && !job.test {
-                continue;
-            }
+        let now = Instant::now();
+        let next = queue.iter().enumerate()
+            .filter(|(_, (_, _, due))| *due <= now)
+            .max_by_key(|(_, (job, _, due))| (job.priority, std::cmp::Reverse(*due)))
+            .map(|(index, _)| index);
+        if let Some(index) = next {
+            let (job, tries, _) = queue.remove(index);
+            let test = job.test;
             match send_now(&cfg, &job) {
-                Ok(()) => {
-                    let _ = engine.send(EngineMsg::NotifyResult { ok: true, test: job.test, err: String::new() });
+                Ok(_) => {
+                    let _ = engine.send(EngineMsg::NotifyResult { ok: true, test, err: String::new() });
                 }
-                Err(e) => {
-                    util::log(&format!("phone alert attempt {} failed: {}", tries + 1, e));
-                    if job.test || tries + 1 >= 8 {
-                        let _ = engine.send(EngineMsg::NotifyResult { ok: false, test: job.test, err: e });
-                    } else {
-                        keep.push((job, tries + 1));
-                    }
+                Err(err) if test || tries + 1 >= 8 => {
+                    let _ = engine.send(EngineMsg::NotifyResult { ok: false, test, err });
+                }
+                Err(err) => {
+                    util::log(&format!("phone alert attempt {} failed: {}", tries + 1, err));
+                    queue.push((job, tries + 1, Instant::now() + Duration::from_secs(6)));
                 }
             }
         }
-        queue = keep;
     }
 }
 
@@ -152,6 +215,7 @@ pub fn send_now_timeout(cfg: &NtfyCfg, job: &NotifyJob, timeout: Duration) -> Re
         req = req.set("Authorization", &format!("Bearer {}", cfg.token));
     }
     let photo = if cfg.photos { job.photo.as_ref().and_then(|p| std::fs::read(p).ok()) } else { None };
+    let attached = photo.is_some();
     let result = match photo {
         Some(bytes) => {
             let name = job
@@ -160,12 +224,21 @@ pub fn send_now_timeout(cfg: &NtfyCfg, job: &NotifyJob, timeout: Duration) -> Re
                 .and_then(|p| p.file_name())
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| "snapshot.jpg".to_string());
-            req.set("Filename", &name).set("Message", &header_safe(&job.message)).send_bytes(&bytes)
+            let content_type = if name.ends_with(".gif") { "image/gif" } else { "image/jpeg" };
+            req.set("Filename", &name)
+                .set("Content-Type", content_type)
+                .set("Message", &header_safe(&job.message))
+                .send_bytes(&bytes)
         }
         None => req.send_string(&job.message),
     };
     match result {
         Ok(_) => Ok(()),
+        Err(ureq::Error::Status(413 | 415, _)) if attached => {
+            let mut text = job.clone();
+            text.photo = None;
+            send_now_timeout(cfg, &text, timeout)
+        }
         Err(ureq::Error::Status(code, resp)) => {
             let body = resp.into_string().unwrap_or_default();
             Err(format!("the server answered {}: {}", code, body.chars().take(140).collect::<String>()))

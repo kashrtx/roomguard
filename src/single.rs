@@ -45,7 +45,7 @@ impl Guard {
 }
 
 fn addr() -> SocketAddr {
-    SocketAddr::from(([127, 0, 0, 1], PORT))
+    SocketAddr::from(([127, 0, 0, 1], if crate::update::experimental_build().is_some() { PORT + 1 } else { PORT }))
 }
 
 /// Becomes the one running copy, or finds the one that is. `wait` gives a

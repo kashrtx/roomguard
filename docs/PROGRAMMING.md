@@ -1,8 +1,8 @@
 # Programming reference
 
-All three panels are programmed the way the real ones are: from the keypad, with the real section and field numbers. Everything you change is saved per panel and kept across updates.
+Each panel saves its programming separately. The tables list the supported keypad commands, installer sections, and data fields.
 
-You don't have to memorize any of this. Open **Settings -> Panel** for plain-English controls (delays, chime, quick arm, zone types, buzzer/voice levels) synced live with the keypad, or open **Settings -> About** and tap the version number five times to reveal the full raw **Installer** section/field table.
+Open **Settings → Panel** for delays, chime, quick arm, zones, and keypad levels. To open the raw programming table, disarm the panel, open **Settings → About**, tap the version number five times, and enter the active panel’s master code. The **Installer** tab includes raw fields, access codes, and the programming reset. It locks again when you close Settings, switch panels, or arm.
 
 Default codes: master code `1234` until you set your own during setup. Installer code `1500` on **RmG Classic (`PC1550`)**, `5555` on **GuardSeries (`PC1832`)**, and `4112` on **VistaGuard 20P (`VISTA-20P`)**.
 
@@ -16,7 +16,7 @@ Default codes: master code `1234` until you set your own during setup. Installer
 | `*` `3` | Alarm memory. |
 | `*` `4` | PC1832: door chime on (three beeps) or off (a two second tone). PC1550: the downloading call. |
 | `*` `5` + master code | User codes. |
-| `*` `6` + master code | User functions: clock, auto arm, chime on the PC1550, system test, and on the LCD keypad the event buffer, brightness, contrast and the 21 step buzzer pitch. |
+| `*` `6` + master code | User functions: clock, auto arm, chime on the PC1550, system test, and on the LCD keypad the event buffer, brightness, contrast, 21 step buzzer pitch, **Display Blank (privacy mode)**, and **Zone Chime** (per-zone toggle & 4 chime melodies). |
 | `*` `7` | PC1550: utility output, which from the factory is the 5 second smoke detector reset. PC1832: command outputs, `*` `7` `2` is sensor reset. |
 | `*` `8` + installer code | Installer programming. |
 | `*` `9` + code | Arm with no entry delay. The Armed light flashes. |
@@ -24,7 +24,7 @@ Default codes: master code `1234` until you set your own during setup. Installer
 | Hold `F`, `A` or `P` | Fire, auxiliary (medical) and panic. One second on the PC1550, two on the PC1832. Holding one also closes any open menu. |
 | `#` | Back out of anything, and silence trouble beeps. |
 
-On the GuardSeries LCD keypad, hold **Stay**, **Away**, **Chime**, **Reset** or **Exit** for two seconds. Holding the digits `1` to `5` for two seconds does the same, exactly like the real PowerSeries keypads. Function keys don't work inside a `*` menu, and the keypad gives its error tone. Use `<` and `>` to scroll the screen and menus.
+On the GuardSeries LCD keypad, hold **Stay**, **Away**, **Chime**, **Reset** or **Exit** for two seconds. Holding digits `1` to `5` for two seconds triggers those same function keys, and holding `0` for two seconds triggers Quick Exit (while armed) or Quick Arm (while disarmed). Function keys don't work inside a `*` menu, and the keypad gives its error tone. Use `<` and `>` to scroll open zones, screens, and menus.
 
 ## How it sounds
 
@@ -46,7 +46,7 @@ On the GuardSeries LCD keypad, hold **Stay**, **Away**, **Chime**, **Reset** or 
 | --- | --- | --- | --- |
 | Low battery | Laptop unplugged and under 20% | light 1 | 1, Service Required |
 | AC failure | Laptop unplugged. Silent from the factory, light only. | light 2 | 2 |
-| Bell circuit | No working audio output | light 3 | 1, Service Required |
+| Bell circuit | Selected siren output unavailable | light 3 | 1, Service Required |
 | Failure to communicate | Phone alerts failed eight times. Clears when one gets through or when you leave `*` `2`. | light 4 | 4 |
 | Fire loop trouble | A fire zone reports a fault | light 5 | |
 | Loss of time | Never in RoomGuard, the computer keeps the time | light 6 | 8 |
@@ -68,7 +68,7 @@ The real PC1550 only has the six troubles on its zone lights, so RoomGuard shows
 
 ## RmG Classic PC1550 sections (v4.1)
 
-Enter installer programming with `*` `8` `1500`, then a two digit section. Zone lights 1 to 4 show the digit under the cursor in binary. `F` skips a digit, `*` switches to hex entry, and `#` leaves a section (finished entries are kept) and then leaves programming. Programming times out after two minutes without a key.
+Enter installer programming with `*` `8` `1500`, then a two digit section. Zone lights 1 to 4 show the digit under the cursor in binary. `F` skips a digit, `*` switches to hex entry (`0`–`5` enter `A`–`F`), and `#` leaves a section (finished entries are kept) and then leaves programming. Zone lights use distinct cadences: slow flash for open zones, fast flash for alarm memory, and steady on for bypassed zones in `*` `1`. Programming times out after two minutes without a key.
 
 | Section | Contents | Default |
 | --- | --- | --- |
@@ -105,7 +105,7 @@ Enter installer programming with `*` `8` `5555`, then a three digit section. The
 | Section | Contents | Default |
 | --- | --- | --- |
 | 000 | Keypad enrollment (`0` partition and slot, `1` to `5` what each function key does) | 11; 03 04 06 14 16 |
-| 001 | Zone definitions, two digits per zone (`01` delay 1, `02` delay 2, `03` instant, `04` interior, `05` stay/away, `06` delay stay/away, `07` delayed fire, `08` fire, `09` to `21` 24 hour types, `25` interior delay, `26` 24 hour non-alarm, `30` fire supervisory, `31` day zone, `32` instant stay/away, `35` 24 hour bell/buzzer, `36` non-latching tamper, `37` night zone, `41` carbon monoxide). Changing a zone sets its `[101]` to `[108]` attributes to that type's defaults. | 01 05 03 01 05 08 02 04. RoomGuard makes zone 2 the room. The factory has 01 03 03 03 04 04 04 04. |
+| 001–002 | Zone definitions for 01–16 and 17–32, two digits per zone (`01` delay 1, `02` delay 2, `03` instant, `04` interior, `05` stay/away, `06` delay stay/away, `07` delayed fire, `08` fire, `09` to `21` 24 hour types, `25` interior delay, `26` 24 hour non-alarm, `30` fire supervisory, `31` day zone, `32` instant stay/away, `35` 24 hour bell/buzzer, `36` non-latching tamper, `37` night zone, `41` carbon monoxide). Changing a zone sets its `[101]` to `[132]` attributes to that type's defaults. | 01 05 03 01 05 08 02 04. RoomGuard makes zone 2 the room. The factory has 01 03 03 03 04 04 04 04. |
 | 005 | System times: `[01]` partition 1 entry 1, entry 2 and exit, `[02]` partition 2, `[09]` bell cut-off | 030 045 120; 004 |
 | 006, 007, 008 | Installer, master and maintenance codes (the maintenance code only arms) | 5555, 1234, blank |
 | 009 to 011 | PGM outputs | 19 10 |
@@ -118,7 +118,7 @@ Enter installer programming with `*` `8` `5555`, then a three digit section. The
 | 018 | 6th system options (5 keypad buzzer follows bell, 7 exit delay restart, 8 AC trouble beeps) | all off |
 | 019, 021, 022, 023 | 7th to 10th system options (`019` 7 `*` `6` for all users, `021` 1 codes blocked during entry, `022` 1 code for `*` `1`, `*` `2`, `*` `3`, `022` 8 audible Stay exit, `023` 1 fire key beeps only, `023` 7 silent trouble beeps) | all off |
 | 030 | Fast loop response, zones 1 to 8 | all off, 400 ms |
-| 101 to 108 | Zone attributes: 1 audible, 2 steady, 3 chime, 4 bypassable, 5 force arm, 6 swinger shutdown, 7 transmission delay, 8 wireless | per zone type, from the manual's table |
+| 101 to 132 | Zone attributes: 1 audible, 2 steady, 3 chime, 4 bypassable, 5 force arm, 6 swinger shutdown, 7 transmission delay, 8 wireless | per zone type, from the manual's table |
 | 170, 176, 199 | PGM timer, cross zone timer, auto arm pre-alert | 005, 060, 004 |
 | 201, 202 | Partition mask and partition 1 zones | 1; zones 1 to 8 |
 | 301 to 303, 310, 311 | Phone numbers and account codes | 5551234 and 1234 for RoomGuard's monitoring center |
@@ -133,7 +133,7 @@ Enter installer programming with `*` `8` `5555`, then a three digit section. The
 | 990, 991 | Installer's lockout on and off | |
 | 999 | Factory default (`999` plus the installer code plus `999`) | |
 
-Keypad programming: `*` `8` `5555`, then `*`. Sections `074`, `076` and `077` hold key and display options, and `201` to `208` pick each zone's door chime sound (six beeps, bing bing, ding dong or alarm tone).
+Keypad programming: `*` `8` `5555`, then `*`. Sections `074`, `076` and `077` hold key and display options, and `201` to `232` pick each zone's door chime sound (six beeps, bing bing, ding dong or alarm tone).
 
 User codes on the PC1832: `*` `5` `1234`, then a two digit user number (`01` to `39`, `40` is the master, `41` to `71`), then four digits. `*` as the first digit erases. Enter `99` first to change a user's attributes (1 supervisor, 2 duress, 3 bypass, 7 bell squawk, 8 one time use).
 
@@ -151,12 +151,13 @@ Enter installer programming with `4112` `8` `0` `0`. Type `*field` to edit a fie
 | `*34`, `*35`, `*36` | Exit delay, Entry delay 1, Entry delay 2 (seconds; `97` = 120 s) | `60`, `30`, `30` |
 | `*37` | Audible exit warning (slow beeps, ramping to rapid beeps in the last 10 s) | `1` (on) |
 | `*38` | Confirmation of arming ding on external bell | `0` (off) |
+| `*39` | Restore the previous armed state on startup (`0` always starts disarmed) | `1` |
 | `*41`, `*42`, `*43` | Primary phone, secondary phone, Partition 1 account code | `5551234`, blank, `1234` |
 | `*50` | Burglary dialer delay (`0` none, `1` 15 s, `2` 30 s, `3` 45 s) | `2` (30 s) |
-| `*56` | Zone types (2 digits per zone: `01` entry/exit 1, `02` entry/exit 2, `03` perimeter, `04` interior follower, `05` trouble/day, `06`/`07`/`08` 24 h, `09` fire, `10` interior w/ delay, `14` CO, `16` fire w/ verify) | `01 04 03 01 04 09 02 10` |
+| `*56` | Zone type values for 01–48 (2 digits per zone: `01` entry/exit 1, `02` entry/exit 2, `03` perimeter, `04` interior follower, `05` trouble/day, `06`/`07`/`08` 24 h, `09` fire, `10` interior w/ delay, `14` CO, `16` fire w/ verify) | `01 04 03 01 04 09 02 10` |
 | `*57` | Function keys A-D (2 digits per key; `00` default panic/page, `01` paging, `02` Display Time/Date, `03` Away [Key D default], `04` Stay, `05` Night-Stay, `06` Step arming, `07` Output toggle, `08` Comm test, `09`–`12` Macros 1–4) | `00 00 00 03` |
 | `*59` | Exit error report code | `0` |
-| `*81` | Night-Stay zones (zone list 05, 1 digit per zone: `0`/`1`) | `00000000` |
+| `*81` | Zone list menu. Select a list, then enter each zone number followed by `*`. List 03 controls Chime-by-Zone and list 05 controls Night-Stay. | List 05 empty |
 | `*84` | Auto-Stay arming (converts Away to Stay, or Maximum to Instant, if no door opens during exit) | `3` (on) |
 | `*86` | Cancel verify display (`Alarm Canceled` when clearing alarm memory) | `1` (on) |
 | `*90` | Event log enables (`00`–`15` bitmask: `1` alarms, `2` troubles, `4` bypasses, `8` open/close) | `15` (all) |
@@ -166,13 +167,19 @@ Enter installer programming with `4112` `8` `0` `0`. Type `*field` to edit a fie
 | `*198` | Display partition number prefix on idle LCD (`0` off, `1` on) | `0` (off) |
 
 Advanced 6160V keypad commands:
-- **Voice & Message Center:** `#` `0` `2` voice volume (`3` louder, `6` quieter, `4` voice status/chime on/off, `#` save); `#` `0` `*` or `#` `*` voice status (press `*` again within 10 s to announce up to 3 faulted zones); `#` `0` `1` record voice memo (`1` stops, flashing `MSG` LED); `#` `0` `3` play & clear voice memo.
+- **Voice & Message Center:** `#` `0` `2` voice volume (`3` louder, `6` quieter, `4` voice status/chime on/off, `#` save); `#` `0` `*` or `#` `*` voice status (press `*` again within 10 s to announce up to 3 faulted zones); `#` `0` `1` record voice memo (`1` stops, flashing `MSG` LED); `#` `0` `3` plays the memo and clears the waiting light. The audio stays in memory until replaced or the panel session ends.
 - **Time & Date (`#63`):** `[Master]` + `#` + `63` shows `TIME/DATE` for 30 s; press `*` while disarmed to edit (`HH:MM`, `1`=PM/`2`=AM, `YY/MM/DD`, `*` forward/save at last digit, `#` back). Program `*57` option `02` for one-touch Time/Date viewing without a code.
 - **100-Event History Log (`#60`):** `[Master/Installer]` + `#` + `60` displays events in Contact ID format (`001 E401 U002 P1` / timestamp); `*` = older, `#` = newer.
 - **Schedules (`#64`):** `[Master/Installer]` + `#` + `64` configures schedules (`01`–`16` user, `17`–`32` installer) for Output On (`01`), Forced Stay (`04`), Forced Away (`05`), Auto Disarm (`06`), Reminder (`07`), or Periodic Test (`11`). `[Installer]` + `#` + `0` + `0`/`1`/`2` sets 24h / 7d / 28d test intervals.
 - **Macros (`#66`) & Outputs (`#7`/`#8`):** `[Master]` + `#` + `66` programs Macros 1–4 (`AWAY`/D inserts `F` separator and saves on second press); `[Code]` + `#` + `7`/`8` + `[01-18]` activates/deactivates virtual outputs.
-- **User Attributes:** `[Master]` + `8` + `[03-49]` + `#` + `0` (delete), `#` + `1` + `0`–`4` (authority: `0` Standard, `1` Arm-Only, `2` Guest, `3` Duress CID 121, `4` Partition Master), `#` + `2` + `0`–`8` (access group), `#` + `3` + `0` + `1`–`3` + `#` (partition), `#` + `5` + `0`/`1` (pager). `[Installer]` + `8` + `02` + `[4-digit]` sets the Master code in a single entry.
+- **User Attributes:** `[Master]` + `8` + `[03-49]` + `#` + `0` (delete), `#` + `1` + `0`–`5` (authority: `0` Standard, `1` Arm-Only, `2` Guest, `3` Duress CID 121, `4` Partition Master, `5` One-Time Maid/Guest that auto-deletes after arming and disarming once), `#` + `2` + `0`–`8` (access group), `#` + `3` + `0` + `1`–`3` + `#` (partition), `#` + `5` + `0`/`1` (pager). `[Installer]` + `8` + `02` + `[4-digit]` sets the Master code in a single entry.
 - **Partition Commands:** `[Code]` + `*` + `0`–`3` GoTo Partition; `[Code]` + `0` + `1`/`2`/`3`/`4`/`7` Multi-Partition global command.
+
+## Hardware coverage
+
+RoomGuard supports six PC1550 zones, 32 PC1832 zones, and 48 VISTA-20P zones. Up to eight zones can be mapped to the current webcam. Enabled expansion zones can be opened and closed from the Zones panel for testing.
+
+The PC1550 downloading command and the panels’ central-station communications are simulations. The PC1832 and VISTA each maintain one armed state. Independent partitions, physical bus peripherals, wireless enrollment, and complete installer menus such as VISTA `*58`, `*79`, `*80`, and `*82` remain outside the current implementation.
 
 ## Updating a panel saved by an older RoomGuard
 

@@ -73,7 +73,7 @@ pub fn zone_color(zone: u8) -> Color32 {
 
 /// Whether a panel zone makes sense as a camera-drawn zone (skip unused & 24h fire/life-safety).
 pub fn zone_drawable(z: &ZoneView) -> bool {
-    z.kind != ZoneKind::Null && !z.kind.is_24h()
+    z.num <= 8 && z.kind != ZoneKind::Null && !z.kind.is_24h()
 }
 
 /// Default visual contact setting for a newly drawn zone: ON for doors/windows/perimeter,
@@ -139,6 +139,20 @@ impl CameraView {
         show_motion: bool,
         show_tracks: bool,
     ) {
+        if !cfg.enabled {
+            self.draw = Draw::Off;
+            self.drag_from = None;
+            self.tex = None;
+            self.seq = 0;
+            ui.horizontal(|ui| {
+                ui.label(theme::heading("Webcam off"));
+                if ui.small_button("Turn on").clicked() {
+                    cfg.enabled = true;
+                    *changed = true;
+                }
+            });
+            return;
+        }
         let snap = match cam.shared.lock() {
             Ok(mut s) => {
                 if let Some((pan, tilt)) = s.home_pose.take() {

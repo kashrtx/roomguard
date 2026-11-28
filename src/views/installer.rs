@@ -10,14 +10,14 @@ use std::collections::BTreeMap;
 
 use eframe::egui::{self, RichText};
 
+use crate::config::AppConfig;
 use crate::engine::eeprom::{self, Kind, Spec};
-use crate::engine::types::Model;
-use crate::engine::{EngineHandle, EngineMsg, PanelEdit, ProgView};
+use crate::engine::types::{Model, ZoneKind};
+use crate::engine::{EngineHandle, EngineMsg, PanelEdit, ProgView, View};
 use crate::theme;
 
 #[derive(Default)]
 pub struct InstallerState {
-    pub last_model: Option<Model>,
     pub filter: String,
     pub master_code: String,
     pub installer_code: String,
@@ -197,7 +197,7 @@ fn options(m: Model, key: &str) -> &'static [&'static str] {
             "Zone 7 fast loop response, 36 ms (off: 400 ms)",
             "Zone 8 fast loop response, 36 ms (off: 400 ms)",
         ],
-        (Model::Pc1832, k) if k.len() == 3 && k.starts_with("10") => &[
+        (Model::Pc1832, k) if k.len() == 3 && matches!(k.parse::<u16>(), Ok(101..=132)) => &[
             "Audible (off: silent)",
             "Steady bell (off: pulsed)",
             "Door chime",
@@ -206,6 +206,7 @@ fn options(m: Model, key: &str) -> &'static [&'static str] {
             "Swinger shutdown",
             "Transmission delay",
             "Wireless zone",
+            "Cross zoning (requires [018] opt 6 and [176] timer)",
         ],
         (Model::Pc1832, "201") => &[
             "Partition 1 enabled",
@@ -390,7 +391,11 @@ fn about(m: Model, key: &str) -> &'static str {
         (Model::Pc1832, "999") => "Resets every section to the factory defaults.",
         (Model::Pc1832, "kp076") => "PK5500 keypad display options.",
         (Model::Pc1832, k) if k.starts_with("kp2") => "The door chime sound this zone makes on the keypad: 1 six beeps, 2 bing bing, 3 ding dong, 4 alarm tone.",
-        (Model::Pc1832, k) if k.len() == 3 && k.starts_with("10") => "This zone's attributes. They're set to the right defaults for the zone type whenever [001] changes.",
+        (Model::Pc1832, k) if k.len() == 3 && matches!(k.parse::<u16>(), Ok(101..=132)) => "This zone's attributes (1-8 plus 9 Cross Zoning). Reset automatically when zone definitions [001]/[002] change.",
+        (Model::Vista20p, "31") => "0 = unlimited alarm soundings per zone, 1 = single bell sounding per zone per armed period.",
+        (Model::Vista20p, "32") => "0 = fire alarm stops at *33 bell timeout, 1 = no fire sounder timeout (rings until silenced).",
+        (Model::Vista20p, "85") => "Cross-zone timer (00=15s, 01=30s ... 15=15m) for zones assigned to Zone List 04 (*81). Applies to zone types 03, 04, and 05.",
+        (Model::Vista20p, "panic") => "Keypad emergency pseudo-zone types for Keys A (Zone 95), C (Zone 96), and B (Zone 99): 00=Disabled, 06=24h Silent, 07=24h Audible, 08=24h Aux/Medical, 09=24h Fire.",
         _ => "",
     }
 }
@@ -420,7 +425,8 @@ fn zone_type_1550(d: char) -> &'static str {
         '6' => "24 hour buzzer",
         '7' => "Auxiliary delay",
         '8' => "Fire",
-        _ => "Unknown",
+        '9' => "Not used",
+        _ => "Not used",
     }
 }
 
@@ -684,6 +690,7 @@ const ZONE_CHOICES_1832: &[(&str, &str)] = &[
 ];
 
 const ZONE_CHOICES_1550: &[(char, &str)] = &[
+    ('9', "Not Used"),
     ('0', "Standard Delay"),
     ('1', "Instant"),
     ('2', "Interior"),
@@ -719,17 +726,10 @@ fn zone_type_vista(code: &str) -> &'static str {
 }
 
 /// Draws the live-editable Panel & Installer Programming tab.
-pub fn ui(ui: &mut egui::Ui, prog: &ProgView, armed: bool, engine: &EngineHandle, st: &mut InstallerState) {
+pub fn ui(ui: &mut egui::Ui, cfg: &mut AppConfig, changed: &mut bool, view: &View, engine: &EngineHandle) {
+    let prog = &view.prog;
+    let armed = view.armed;
     let m = prog.model;
-    if st.last_model != Some(m) {
-        st.last_model = Some(m);
-        st.raw_drafts.clear();
-        st.master_code.clear();
-        st.installer_code.clear();
-        st.extra_code.clear();
-        st.confirm_default = false;
-    }
-    let code = installer_code(m);
 
     section_hdr(
         ui,
@@ -740,8 +740,8 @@ pub fn ui(ui: &mut egui::Ui, prog: &ProgView, armed: bool, engine: &EngineHandle
         },
     );
     ui.label(theme::muted(match m {
-        Model::Vista20p => "Change Vista installer programming (*fields) and 6160V voice settings directly here. No 4112+800 sequences required.",
-        _ => "Change installer and keypad programming directly here. No keypad codes required. Everything writes to the same panel EEPROM as [*][8] programming.",
+        Model::Vista20p => "Adjust VISTA delays, zones, and 6160V voice settings.",
+        _ => "Adjust panel delays, zones, and keypad settings.",
     }));
     if armed {
         ui.add_space(4.0);
@@ -1073,10 +1073,6 @@ pub fn ui(ui: &mut egui::Ui, prog: &ProgView, armed: bool, engine: &EngineHandle
             });
         });
 
-        let mut lock = prog.installer_lockout;
-        if ui.checkbox(&mut lock, "Installer lockout (factory reset keeps your installer code)").changed() {
-            engine.send(EngineMsg::EditPanel(PanelEdit::SetInstallerLockout(lock)));
-        }
     });
 
     // --- 3. PK5500 LCD & Buzzer Levels (PC1832) ---
@@ -1118,30 +1114,78 @@ pub fn ui(ui: &mut egui::Ui, prog: &ProgView, armed: bool, engine: &EngineHandle
         });
     }
 
-    // --- 4. Zones (Definitions & Chime Sounds) ---
+    // --- 4. Zones (Names, Definitions, Chime Sounds & Quick Add) ---
     section_hdr(ui, "Zone programming");
+    ui.add(
+        egui::Label::new(theme::muted(
+            "Customize every zone's name and type here. Matching a real wall panel? Copy the zone numbers, names, and types written by your installer inside your keypad door.",
+        ))
+        .wrap(),
+    );
+    let page_id = egui::Id::new(("zone-program-page", m.file_key()));
+    let next_unused = view.zones.iter().find(|z| z.kind == ZoneKind::Null).map(|z| z.num);
+    let active_count = view.zones.iter().filter(|z| z.kind != ZoneKind::Null).count();
+    ui.horizontal_wrapped(|ui| {
+        ui.label(theme::muted(format!("{active_count} of {} zones active", m.zone_count())));
+        if let Some(znum) = next_unused {
+            if ui
+                .add_enabled(!armed, egui::Button::new(format!("+ Add Zone {:02}", znum)))
+                .on_hover_text("Enable the next unused zone slot as Instant (Perimeter)")
+                .clicked()
+            {
+                let default_code = match m {
+                    Model::Pc1550 => "01",
+                    Model::Pc1832 | Model::Vista20p => "03",
+                };
+                engine.send(EngineMsg::EditPanel(PanelEdit::SetZoneType {
+                    zone: znum,
+                    code: default_code.into(),
+                }));
+                let target_page = (usize::from(znum) - 1) / 8;
+                ui.data_mut(|data| data.insert_temp(page_id, target_page));
+            }
+        }
+    });
+    let zones = super::zone_page(ui, page_id, m.zone_count());
+    let ha_bindings: Vec<u8> = cfg
+        .home_assistant
+        .bindings
+        .iter()
+        .filter(|b| b.model == m)
+        .map(|b| b.zone)
+        .collect();
+    let labels = cfg.labels_mut(m);
     ui.add_enabled_ui(!armed, |ui| {
         if m == Model::Pc1832 {
-            let raw001 = raw_val(prog, "001");
-            egui::Grid::new("panel-zones-1832").num_columns(4).spacing([8.0, 6.0]).show(ui, |ui| {
+            egui::Grid::new("panel-zones-1832").num_columns(5).spacing([6.0, 6.0]).show(ui, |ui| {
                 ui.label(theme::muted("Zone"));
-                ui.label(theme::muted("Definition ([001])"));
-                ui.label(theme::muted("Chime sound"));
-                ui.label(theme::muted("Options ([101] to [108])"));
+                ui.label(theme::muted("Name"));
+                ui.label(theme::muted("Definition ([001]/[002])"));
+                ui.label(theme::muted("Chime"));
+                ui.label(theme::muted("Options"));
                 ui.end_row();
 
-                for z in 1..=8usize {
-                    ui.label(RichText::new(format!("Z{}", z)).font(theme::semi(12.5)));
-                    let cur_code = raw001.get((z - 1) * 2..(z - 1) * 2 + 2).unwrap_or("00");
+                for z in zones {
+                    let is_ha = ha_bindings.contains(&(z as u8));
+                    ui.label(RichText::new(if is_ha { format!("Z{:02}*", z) } else { format!("Z{:02}", z) }).font(theme::semi(12.5)))
+                        .on_hover_text(if is_ha { "Supplied by Home Assistant" } else { "Panel zone" });
+                    if let Some(lbl) = labels.get_mut(z - 1) {
+                        if ui.add_sized([102.0, 22.0], egui::TextEdit::singleline(lbl).char_limit(24)).changed() {
+                            *changed = true;
+                        }
+                    }
+                    let (section, index) = eeprom::pc1832_zone_section(z);
+                    let definitions = raw_val(prog, section);
+                    let cur_code = definitions.get(index * 2..index * 2 + 2).unwrap_or("00");
                     let cur_name = zone_type_1832(cur_code);
                     egui::ComboBox::from_id_salt(("zdef1832", z))
                         .selected_text(format!("{} {}", cur_code, cur_name))
-                        .width(175.0)
+                        .width(134.0)
                         .show_ui(ui, |ui| {
                             for &(code_str, label) in ZONE_CHOICES_1832 {
                                 if ui.selectable_label(cur_code == code_str, format!("{} {}", code_str, label)).clicked() {
-                                    let next = replace_entry_str(&raw001, 16, 2, z - 1, code_str);
-                                    engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: "001".into(), value: next }));
+                                    let next = replace_entry_str(&definitions, 16, 2, index, code_str);
+                                    engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: section.into(), value: next }));
                                 }
                             }
                         });
@@ -1157,7 +1201,7 @@ pub fn ui(ui: &mut egui::Ui, prog: &ProgView, armed: bool, engine: &EngineHandle
                     };
                     egui::ComboBox::from_id_salt(("zchime", z))
                         .selected_text(chime_label)
-                        .width(96.0)
+                        .width(78.0)
                         .show_ui(ui, |ui| {
                             for (c, lbl) in [('1', "Six beeps"), ('2', "Bing bing"), ('3', "Ding dong"), ('4', "Alarm tone")] {
                                 if ui.selectable_label(cur_c == c, lbl).clicked() {
@@ -1168,9 +1212,15 @@ pub fn ui(ui: &mut egui::Ui, prog: &ProgView, armed: bool, engine: &EngineHandle
 
                     let attr_key = format!("{:03}", 100 + z);
                     ui.horizontal(|ui| {
-                        for (opt, short) in [(1u8, "Aud"), (3, "Chime"), (4, "Byp"), (5, "Force")] {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        for (opt, short, tip) in [
+                            (1u8, "Aud", "Audible alarm"),
+                            (3, "Chm", "Door chime"),
+                            (4, "Byp", "Bypassable"),
+                            (5, "Frc", "Force arm"),
+                        ] {
                             let mut on = toggle_on(prog, &attr_key, opt);
-                            if ui.checkbox(&mut on, short).changed() {
+                            if ui.checkbox(&mut on, short).on_hover_text(tip).changed() {
                                 engine.send(EngineMsg::EditPanel(PanelEdit::SetToggle { key: attr_key.clone(), opt, on }));
                             }
                         }
@@ -1181,22 +1231,37 @@ pub fn ui(ui: &mut egui::Ui, prog: &ProgView, armed: bool, engine: &EngineHandle
         } else if m == Model::Vista20p {
             let raw56 = raw_val(prog, "56");
             let raw_resp = raw_val(prog, "resp");
-            egui::Grid::new("panel-zones-vista").num_columns(3).spacing([10.0, 6.0]).show(ui, |ui| {
+            egui::Grid::new("panel-zones-vista").num_columns(4).spacing([8.0, 6.0]).show(ui, |ui| {
                 ui.label(theme::muted("Zone"));
+                ui.label(theme::muted("Name"));
                 ui.label(theme::muted("Zone Type (*56)"));
                 ui.label(theme::muted("Loop Response"));
                 ui.end_row();
 
-                for z in 1..=8usize {
-                    ui.label(RichText::new(format!("Zone {:02}", z)).font(theme::semi(12.5)));
+                for z in zones {
+                    let is_ha = ha_bindings.contains(&(z as u8));
+                    ui.label(RichText::new(if is_ha { format!("Z{:02}*", z) } else { format!("Z{:02}", z) }).font(theme::semi(12.5)))
+                        .on_hover_text(if is_ha { "Supplied by Home Assistant" } else { "Panel zone" });
+                    if let Some(lbl) = labels.get_mut(z - 1) {
+                        let resp = ui.add_sized([135.0, 22.0], egui::TextEdit::singleline(lbl).char_limit(24));
+                        if resp.changed() {
+                            *changed = true;
+                        }
+                        let (spoken, matched) = crate::audio::voice::spoken_zone_preview(lbl, z as u8);
+                        resp.on_hover_text(if matched {
+                            format!("6160V voice will speak: \"{}\"", spoken)
+                        } else {
+                            format!("Words not in 6160V voice ROM. Voice falls back to: \"{}\"", spoken)
+                        });
+                    }
                     let cur_code = raw56.get((z - 1) * 2..(z - 1) * 2 + 2).unwrap_or("00");
                     egui::ComboBox::from_id_salt(("zdefvista", z))
                         .selected_text(format!("{} {}", cur_code, zone_type_vista(cur_code)))
-                        .width(195.0)
+                        .width(175.0)
                         .show_ui(ui, |ui| {
                             for &(code_str, label) in ZONE_CHOICES_VISTA {
                                 if ui.selectable_label(cur_code == code_str, format!("{} {}", code_str, label)).clicked() {
-                                    let next = replace_entry_str(&raw56, 8, 2, z - 1, code_str);
+                                    let next = replace_entry_str(&raw56, m.zone_count(), 2, z - 1, code_str);
                                     engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: "56".into(), value: next }));
                                 }
                             }
@@ -1206,15 +1271,15 @@ pub fn ui(ui: &mut egui::Ui, prog: &ProgView, armed: bool, engine: &EngineHandle
                         '0' => "10 ms (Fast)",
                         '2' => "700 ms",
                         '3' => "1.2 s",
-                        _ => "350 ms (Normal)",
+                        _ => "350 ms",
                     };
                     egui::ComboBox::from_id_salt(("zrespvista", z))
                         .selected_text(r_lbl)
-                        .width(120.0)
+                        .width(100.0)
                         .show_ui(ui, |ui| {
                             for (c, lbl) in [('0', "10 ms (Fast)"), ('1', "350 ms (Normal)"), ('2', "700 ms"), ('3', "1.2 s")] {
                                 if ui.selectable_label(cur_r == c, lbl).clicked() {
-                                    let next = replace_entry_str(&raw_resp, 8, 1, z - 1, &c.to_string());
+                                    let next = replace_entry_str(&raw_resp, m.zone_count(), 1, z - 1, &c.to_string());
                                     engine.send(EngineMsg::EditPanel(PanelEdit::SetSection { key: "resp".into(), value: next }));
                                 }
                             }
@@ -1224,21 +1289,29 @@ pub fn ui(ui: &mut egui::Ui, prog: &ProgView, armed: bool, engine: &EngineHandle
             });
         } else {
             let raw11 = raw_val(prog, "11");
-            egui::Grid::new("panel-zones-1550").num_columns(4).spacing([10.0, 6.0]).show(ui, |ui| {
+            egui::Grid::new("panel-zones-1550").num_columns(5).spacing([8.0, 6.0]).show(ui, |ui| {
                 ui.label(theme::muted("Zone"));
+                ui.label(theme::muted("Name"));
                 ui.label(theme::muted("Definition ([11])"));
                 ui.label(theme::muted("Audible"));
-                ui.label(theme::muted("Bypassable ([16])"));
+                ui.label(theme::muted("Bypass ([16])"));
                 ui.end_row();
 
                 for z in 1..=6usize {
-                    ui.label(RichText::new(format!("Zone {}", z)).font(theme::semi(12.5)));
+                    let is_ha = ha_bindings.contains(&(z as u8));
+                    ui.label(RichText::new(if is_ha { format!("Z{}*", z) } else { format!("Z{}", z) }).font(theme::semi(12.5)))
+                        .on_hover_text(if is_ha { "Supplied by Home Assistant" } else { "Panel zone" });
+                    if let Some(lbl) = labels.get_mut(z - 1) {
+                        if ui.add_sized([125.0, 22.0], egui::TextEdit::singleline(lbl).char_limit(24)).changed() {
+                            *changed = true;
+                        }
+                    }
                     let chars: Vec<char> = raw11.chars().collect();
                     let d1 = chars.get((z - 1) * 2).copied().unwrap_or('0');
                     let d2 = chars.get((z - 1) * 2 + 1).copied().unwrap_or('0');
                     egui::ComboBox::from_id_salt(("zdef1550", z))
                         .selected_text(format!("{} {}", d2, zone_type_1550(d2)))
-                        .width(175.0)
+                        .width(155.0)
                         .show_ui(ui, |ui| {
                             for &(ch, label) in ZONE_CHOICES_1550 {
                                 if ui.selectable_label(d2 == ch, format!("{} {}", ch, label)).clicked() {
@@ -1269,8 +1342,35 @@ pub fn ui(ui: &mut egui::Ui, prog: &ProgView, armed: bool, engine: &EngineHandle
             });
         }
     });
+    if m == Model::Vista20p {
+        ui.add_space(6.0);
+        egui::CollapsingHeader::new("6160V speakable zone words (48 words)")
+            .id_salt("vista-vocab-panel")
+            .show(ui, |ui| {
+                ui.add(
+                    egui::Label::new(theme::muted(
+                        "The 6160V voice chip speaks up to 3 words per zone from this built-in ROM list (plus Doorway/First/Second/Third). Names outside this list still show on the LCD, and voice speaks 'Zone XX':",
+                    ))
+                    .wrap(),
+                );
+                ui.add_space(3.0);
+                ui.add(
+                    egui::Label::new(RichText::new(crate::audio::voice::vocab_display_list()).size(12.0).color(theme::TEXT))
+                        .wrap(),
+                );
+            });
+    }
+}
 
-    // --- 5. Access Codes ---
+pub fn advanced_ui(ui: &mut egui::Ui, prog: &ProgView, armed: bool, engine: &EngineHandle, st: &mut InstallerState) {
+    let m = prog.model;
+    let code = installer_code(m);
+    let mut lock = prog.installer_lockout;
+    if ui.add_enabled(!armed, egui::Checkbox::new(&mut lock, "Installer lockout (factory reset keeps your installer code)")).changed() {
+        engine.send(EngineMsg::EditPanel(PanelEdit::SetInstallerLockout(lock)));
+    }
+
+    // Access codes
     section_hdr(ui, "Access codes");
     ui.add_enabled_ui(!armed, |ui| {
         let master_slot = match m {

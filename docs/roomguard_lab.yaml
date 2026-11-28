@@ -1,0 +1,90 @@
+# RoomGuard Home Assistant Test Lab Package (LOCAL TESTING SANDBOX ONLY)
+#
+# Save this file inside your Home Assistant folder at:
+#   /homeassistant/packages/roomguard_lab.yaml
+#
+# IMPORTANT: Keep the underscore (_) in "roomguard_lab.yaml".
+# Home Assistant rejects hyphens (-) in package filenames.
+#
+# CODES:
+# This file has no alarm code on purpose. RoomGuard checks your code at its own
+# keypad and forwards it, so Home Assistant accepts whatever RoomGuard sends.
+# A `code:` here that differs from your RoomGuard code would refuse it, and you
+# couldn't disarm from the keypad. Never put a real code in plain YAML.
+#
+# ALERTS:
+# RoomGuard publishes its own status as sensor.roomguard_alarm (disarmed,
+# arming, armed_away, armed_home, armed_night, pending, triggered) and fires
+# roomguard_alarm when an alarm starts. To get phone alerts, either fill in
+# "Phone alerts" in RoomGuard's Home Assistant settings, or uncomment the
+# automation at the end of this file and set your phone's notify service.
+
+input_boolean:
+  roomguard_lab_door:
+    name: Lab door open
+    initial: false
+  roomguard_lab_motion:
+    name: Lab motion detected
+    initial: false
+  roomguard_lab_siren:
+    name: Lab siren output
+    initial: false
+
+input_text:
+  roomguard_test_bypasses:
+    name: Lab bypassed zones (e.g. BY:1,BY:3)
+    initial: ""
+
+input_number:
+  roomguard_lab_temperature:
+    name: Lab temperature
+    min: 0
+    max: 60
+    initial: 20
+    step: 1
+    unit_of_measurement: "°C"
+
+template:
+  - binary_sensor:
+      - name: RoomGuard Test Door
+        unique_id: roomguard_test_door
+        default_entity_id: binary_sensor.roomguard_test_door
+        device_class: door
+        state: "{{ is_state('input_boolean.roomguard_lab_door', 'on') }}"
+      - name: RoomGuard Test Motion
+        unique_id: roomguard_test_motion
+        default_entity_id: binary_sensor.roomguard_test_motion
+        device_class: motion
+        state: "{{ is_state('input_boolean.roomguard_lab_motion', 'on') }}"
+
+alarm_control_panel:
+  - platform: manual
+    name: RoomGuard Test Panel
+    unique_id: roomguard_test_panel
+    # No `code:` (see CODES above). RoomGuard's keypad checks the code.
+    code_arm_required: false
+    # RoomGuard automatically measures and locks onto whatever arming_time / delay_time
+    # your Home Assistant panel uses so both countdowns finish together in sync.
+    arming_time: 15
+    delay_time: 15
+    trigger_time: 30
+    arming_states:
+      - armed_home
+      - armed_away
+      - armed_night
+    disarmed:
+      trigger_time: 0
+
+# Phone alert example. Uncomment, and change notify.mobile_app_your_phone to
+# your phone's notify service (Settings > Devices & services > Mobile App).
+#
+# automation:
+#   - alias: RoomGuard alarm alert
+#     triggers:
+#       - trigger: event
+#         event_type: roomguard_alarm
+#     actions:
+#       - action: notify.mobile_app_your_phone
+#         data:
+#           title: RoomGuard alarm
+#           message: "{{ trigger.event.data.message }}"

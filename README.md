@@ -1,12 +1,12 @@
 # RoomGuard
 
-RoomGuard turns your webcam into the sensors of a real security alarm system. It runs faithful, 1:1 replicas of three classic alarm panels and keypads:
+RoomGuard uses your webcam to monitor room entry and motion, with software emulations of three classic alarm panels and keypads.
 
 - **RmG Classic (`PC1550` / `PC1500RK`)**: classic 6-zone LED keypad with side-hinged cover.
-- **GuardSeries (`PC1832` / `PK5500`)**: 8-zone full-message 2x16 LCD keypad with bottom-hinged cover and 5 quick-function keys.
-- **VistaGuard 20P (`VISTA-20P` / `VG6160V`)**: 8-zone alpha-display **voice** keypad with 1-inch dynamic speaker, spoken status and zone announcements, `[Code] + [Action]` commands, and exposed A-D quick keys.
+- **GuardSeries (`PC1832` / `PK5500`)**: 32-zone panel with a full-message 2×16 LCD keypad with bottom-hinged cover and 5 quick-function keys.
+- **VistaGuard 20P (`VISTA-20P` / `VG6160V`)**: 48-zone panel with an alpha-display **voice** keypad with 1-inch dynamic speaker, spoken status and zone announcements, `[Code] + [Action]` commands, and exposed A-D quick keys.
 
-Every panel follows its real installation manuals, programming guides, and hardware bus behavior down to the section and field numbers, LED masks, beeps, exit/entry urgency cadences, and factory defaults.
+The keypads follow the manuals for supported commands, displays, tones, and programming. The programming reference describes the available controls and current hardware differences.
 
 ---
 
@@ -26,16 +26,16 @@ You don't need any alarm experience to use RoomGuard:
 
 ## What It Does
 
-- **Three authentic panels.** Key sequences, LEDs, LCD displays, entry/exit delays with last-10-second urgency beeps, zone bypassing, troubles, alarm memory, user codes, schedules, macros, keypad blanking, 6-digit codes, and installer programming work just like the real hardware. See [the programming reference](docs/PROGRAMMING.md).
+- **Three classic panels.** Key sequences, LEDs, LCD displays, entry/exit delays with last-10-second urgency beeps, zone bypassing, troubles, alarm memory, user codes, schedules, macros, keypad blanking, 6-digit codes, and installer programming are available according to the selected model. See [the programming reference](docs/PROGRAMMING.md).
 - **Live Panel Settings (no manual needed).** Open **Settings -> Panel** to adjust exit/entry delays, quick arm, buzzer/voice volume, chime, and zone definitions with plain-English checkboxes and sliders, synced live both ways with keypad programming.
 - **Your webcam is a multi-zone sensor.** Zone 1 is your **Doorway** (entry/exit delay + visual door contact) and Zone 2 is **Room Motion** (interior motion detector, automatically inactive in Stay mode). You can also draw boxes for any additional panel zone (`Z01`-`Z08`) directly on the **Room map** or **Live** view, with per-zone **Contact** or **Motion** monitoring.
 - **Smart person & limb detection.** Powered by pure-Rust neural networks (RTMDet-Nano + RTMPose-Tiny 17-joint skeleton, Kinect-style). Static objects like posters, hanging clothes, furniture, and lighting shifts are ignored, while a real person (or an arm/leg reaching into the doorway or a drawn zone) is caught even if their face isn't visible.
 - **Fresh empty-room calibration every launch.** Automatically calibrates your empty room and closed contacts on startup with lighting-invariant edge and intensity matching, so new or moved objects and shadows don't cause false alarms while opening a watched door or window trips its zone immediately.
 - **Offline face disarm.** Optionally enroll your face in **Settings -> Camera** so RoomGuard can automatically disarm during entry delay when it recognizes you. Everything stays 100% local on your computer.
-- **Authentic synthesized audio.** Every keypad buzzer, VG6160V voice announcement, phone-line Contact ID tone, and all four sirens (**WAVE-2F Horn Siren**, **Master Blaster Motor Siren**, **RX-7C Indoor Piezo**, and **10 inch motor bell**) are synthesized live from physical models and measurements of the real hardware. Switching speakers or headphones moves audio seamlessly within ~1 second.
+- **Authentic synthesized audio.** Every keypad buzzer, VG6160V voice announcement, phone-line Contact ID tone, and all four sirens (**WAVE-2F Horn Siren**, **Master Blaster Motor Siren**, **RX-7C Indoor Piezo**, and **10 inch motor bell**) are synthesized live from physical models and measurements of the real hardware. Under **Settings → Sound**, choose separate outputs for keypad tones and voice, and for the siren. Leave the siren on **Same as keypad** to use one speaker. The Test buttons check each selected output.
 - **Simulated monitoring center & phone alerts.** A built-in operator chats and calls on alarms (simulated only, nobody is ever dispatched), and free push alerts with camera snapshots can be sent to your phone via [ntfy](https://ntfy.sh) with no account required.
 - **Battery & CPU friendly.** Adaptive idle audio, background-priority body tracking, and automatic power-saving when minimized keep CPU, GPU, and laptop battery usage low.
-- **Tamper-resistant.** Closing while armed requires your code, power loss or restarts come back armed automatically, and covering or unplugging the camera raises a real panel trouble.
+- **Tamper-resistant.** Closing while armed requires your code, the panel can restore its armed state on restart, and covering or unplugging the camera raises a real panel trouble.
 
 ---
 
@@ -59,11 +59,11 @@ Uses `[Code] + [Action Key]` commands:
 - **Arm Stay:** `[Code] + 3` (press `3` again right after for **NIGHT-STAY**).
 - **Arm Maximum / Instant (no entry delay):** `[Code] + 4` (Max) or `[Code] + 7` (Instant).
 - **Disarm / Silence:** `[Code] + 1` (OFF). After an alarm, enter `[Code] + 1` a **second time** to clear alarm memory (`Alarm Canceled`).
-- **Bypass a zone:** `[Code] + 6` + 2-digit zone (`01`-`08`). Enter `[Code] + 6 + 00` or `[Code] + 1` while disarmed to clear all bypasses. (Enable `*23` in **Settings -> Panel** for quick bypass `[Code] + 6 + #`.)
+- **Bypass a zone:** `[Code] + 6` + 2-digit zone (`01`–`48`). Enter `[Code] + 6 + 00` or `[Code] + 1` while disarmed to clear all bypasses. (Enable `*23` in **Settings -> Panel** for quick bypass `[Code] + 6 + #`.)
 - **Door Chime:** `[Code] + 9` while disarmed (speaks the opened zone name).
 - **View Faults / Voice Status:** Press `*` to view or speak open zones, or `# + 0 + *` to hear system status (press `*` again within 10s to hear up to 3 faulted zones).
 - **Clock, Event Log, Schedules & Macros:** `[Master] + # + 63` (Time/Date, `*` to edit), `# + 60` (100-event log), `# + 64` (Schedules), `# + 66` (Macros), `# + 7 / # + 8` (Outputs `01`-`18`).
-- **Voice Volume & Message Center:** `# + 0 + 2` (`3` louder, `6` quieter, `4` voice on/off, `#` save), `# + 0 + 1` (record memo, `1` stop), `# + 0 + 3` (play memo).
+- **Voice Volume & Message Center:** `# + 0 + 2` (`3` louder, `6` quieter, `4` voice on/off, `#` save), `# + 0 + 1` (record an in-memory memo, `1` stops), `# + 0 + 3` (play or replay the memo).
 - **Emergencies (hold 2s):** **FIRE** (Zone 95), **POLICE** (Zone 99), **MED** (Zone 96).
 - **Installer Programming:** `4112 + 8 + 0 + 0`, then `*field` to edit, `#field` to review, `*99` to exit.
 
@@ -92,18 +92,54 @@ Download the latest release from the [Releases page](../../releases):
 
 ---
 
-## Phone Alerts in 2 Minutes (Free, No Account)
+## Test speakers and microphone
 
-RoomGuard sends push alerts and snapshots via [ntfy](https://ntfy.sh):
+Open **Settings → Sound** and choose a device for **Keypad & voice**, **Siren**, and **Microphone**. Use **Test keypad** and **Test siren** to check the selected outputs. On Windows, use the same output names shown in Sound settings. A speaker and a headphone jack can share a single Windows output, depending on the sound driver.
 
-1. Open **Settings -> Monitoring** and turn on **Send alerts to my phone**.
-2. Install the free **ntfy** app on Android or iOS.
-3. Tap **+** in ntfy and scan RoomGuard's QR code (or type the generated topic).
-4. Click **Send a test alert** to verify delivery.
+Select **Test microphone**, speak for three seconds, and listen for playback through **Keypad & voice**. The same microphone records VISTA memos. If Windows blocks recording, allow desktop app microphone access under **Settings → Privacy & security → Microphone**.
 
-*(Your topic name acts as a secret key; click **New topic** anytime to rotate it, or point it to your own self-hosted ntfy server.)*
+## Use RoomGuard as a touchscreen keypad
 
----
+Open **Layout** in the top bar to show or hide **Camera & zones** and **Monitoring & history** independently. Choose **Keypad only** to give the keypad the whole wall. **Exit keypad view** restores your sidebar choices.
+
+Turn on **Lock keypad view when armed** to switch to the keypad automatically when arming begins. The sidebars and setup controls stay hidden until you disarm by touch or keyboard. Monitoring and notifications keep running in keypad view.
+
+## Phone alerts and quiet monitoring
+
+1. Open **Settings → Phone alerts** and turn on **Send alerts to my phone**.
+2. Install ntfy on your phone and subscribe with the QR code. Tap **Send a test alert** and check your phone.
+3. Choose **Quiet intrusion alerts** to keep burglary and tamper alarms quiet. Keypad tones and emergency alarms still follow the panel. Choose **Use siren** for the panel's programmed alarm sounds.
+4. Turn on **Include camera evidence when available** to attach a snapshot. Enable **Send a short motion GIF for intrusion events** to include about three seconds around a burglary, entry, or unknown-person event. If an entry countdown ends in a burglary alarm, RoomGuard can attach the clip from when the door first opened. Open the attachment on your phone to watch it. RoomGuard falls back to a JPEG when it cannot make a GIF from the frames it has, or to text when the camera is unavailable.
+
+Phone alerts report actual RoomGuard events. The simulated operator is a separate practice feature. Keep a public ntfy topic private, or use access control on your ntfy server.
+
+The display can be off while RoomGuard runs. Keep the computer awake, the camera powered, and RoomGuard focused for keypad input from a paired wireless keyboard. Type your code to disarm a DSC panel. On Vista, enter your code followed by **1 (OFF)**.
+
+For a dedicated external siren speaker, use a stable, ventilated spot away from vents, fabrics, and exit paths. Try **Settings → Sound → Test** after the speaker has been idle and check where it can be heard.
+
+## Home Assistant ecosystem (wireless sensors & two-way panels)
+
+Use [the beginner-friendly Windows Home Assistant guide](docs/HOME_ASSISTANT_WINDOWS.md) to set up virtual sensors and a test alarm panel step by step (`docs/roomguard_lab.yaml`).
+
+1. In Home Assistant, click your profile (bottom-left) -> **Security** -> **Long-lived access tokens** -> **Create token**.
+2. In RoomGuard, open **Settings -> Home Assistant -> Connection**, enter your Home Assistant base URL and token, and click **Connect**. A live status card shows a **green checkmark** when connected, an animated **connecting** ring while connecting, and a **red X** if disconnected manually or if a network/VM drop is detected automatically.
+3. Under **Wireless sensors -> Zones**, use the searchable, filterable sensor browser to map any Zigbee, Z-Wave, Matter, Wi-Fi, ESPHome, or virtual sensor (door/window contact, motion, smoke, CO, leak, lock, cover, temperature, or button event) to any RoomGuard zone (`01` to `48` depending on panel). Use **`+ Next unused`** to enable new zones with an auto-suggested zone type and inline zone name in one click, and click **Disable unused simulated zones** to hide starter demo zones you don't use. RoomGuard treats `unavailable` sensors as supervisory zone faults instead of false alarms. Select a camera entity and click **Load snapshot** for an on-demand JPEG preview.
+4. Under **Sirens & alarm outputs**, link any Home Assistant siren, smart relay/switch, strobe light, or test toggle (`siren.*`, `switch.*`, `light.*`, `input_boolean.*`) so RoomGuard turns it ON automatically when an alarm siren sounds and OFF when disarmed, with built-in **`Test (3s)`** and **`Off`** controls.
+5. Turn off **Use webcam** in **Settings -> Home Assistant** or **Settings -> Camera** if you want to run purely on Home Assistant sensors while keeping phone alerts active.
+
+### Two-way alarm panel sync
+
+Connect a real physical alarm panel to Home Assistant through a compatible bridge (such as Envisalink, Keybus Interface, ESPHome ECP, or Alarmo), or load the test lab panel from [`docs/roomguard_lab.yaml`](docs/roomguard_lab.yaml), then select its `alarm_control_panel.*` entity under **Settings -> Home Assistant -> Alarm panel sync**:
+
+- **Do not sync with a real panel (Independent):** Keeps RoomGuard completely independent so it never conflicts with an existing house alarm.
+- **Two-way sync (arm & disarm both):** Arm and disarm from **either** the real panel / Home Assistant **or** RoomGuard's virtual keypad. Enter the Home Assistant panel PIN in Settings (or leave it blank to forward the code typed on RoomGuard's keypad). Stay, Away, Night-Stay, Entry Delay, Alarm, and Disarm stay synchronized in both directions without echo loops.
+- **Follow real panel only (read-only):** Mirror mode where arming and disarming stay exclusively on the real wall keypad while RoomGuard displays the partition state and guards your room zones.
+- **Prevent double alarms:** When mirroring a real panel's zones into RoomGuard, turn on **Real panel handles alarms for Home Assistant zones** so RoomGuard shows live open/closed status and door chimes without triggering duplicate local sirens. For a 1:1 layout, copy your installer's zone list from inside your physical keypad cover into **Settings -> Panel -> Zone programming** or **Settings -> Home Assistant**.
+- If the Home Assistant connection drops while armed, RoomGuard immediately reports the disconnect, raises a link trouble, and keeps its last confirmed arming state until the link returns.
+
+## Experimental builds
+
+The experimental branch publishes prereleases via GitHub Actions. Download the asset marked **experimental** for your platform. Experimental builds use their own data directory and check only experimental prereleases under **Settings → Updates**. Stable builds check stable releases.
 
 ## Where Your Data Lives
 

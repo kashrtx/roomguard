@@ -47,6 +47,10 @@ pub fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+pub fn app_name() -> &'static str {
+    if crate::update::experimental_build().is_some() { "RoomGuard Experimental" } else { "RoomGuard" }
+}
+
 /// Where everything RoomGuard saves lives. Deleting or updating the app
 /// never touches this folder.
 pub fn data_dir() -> PathBuf {
@@ -55,7 +59,7 @@ pub fn data_dir() -> PathBuf {
     }
     dirs::data_dir()
         .unwrap_or_else(std::env::temp_dir)
-        .join("RoomGuard")
+        .join(app_name())
 }
 
 pub fn log_init() {
@@ -193,7 +197,19 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     }
     let tmp = path.with_extension("tmp");
     {
-        let mut file = std::fs::File::create(&tmp)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        if path.file_name().is_some_and(|name| name == "config.json") {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&tmp)?;
+        #[cfg(unix)]
+        if path.file_name().is_some_and(|name| name == "config.json") {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
         file.write_all(bytes)?;
         file.sync_all()?;
     }

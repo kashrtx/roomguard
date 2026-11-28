@@ -3,6 +3,44 @@
 Every release lists what changed. The release workflow copies the section for
 each version onto its GitHub release page.
 
+## [2.3.0] - 2026-11-27
+
+RoomGuard 2.3.0 adds full two-way Home Assistant integration (wireless sensors, real physical alarm panel sync, two-way sirens, and alarm announcements), major audio routing and peak-limiting upgrades, quiet intrusion and lockable keypad mode, refined photo-referenced keypad housings, and deeper panel manual accuracy across PC1550, PC1832, and VistaGuard 20P.
+
+### Home Assistant Ecosystem & Two-Way Panel Sync
+
+- **Two-Way Alarm Panel & ESPHome Keybus / ECP Sync:**
+  - Link any Home Assistant `alarm_control_panel.*` (real house panel via ESPHome Keybus / ECP, Envisalink, Alarmo, or the local Test Lab) or link straight to an ESPHome partition status `sensor.*` in **Two-way sync** or **Follow real panel only (read-only)** mode.
+  - Lockstep exit and entry delays in both directions: RoomGuard reads `next_state`, `delay`, and `last_changed` attributes, automatically measures and saves your linked panel's exact Stay/Away exit and entry durations, and holds or finishes in sync without skipping the final seconds.
+  - Two-way zone bypass sync: auto-discovers ESPHome `zs` (`zone_status`), `byp_1`, `armi_1`, `fa_1`/`fire_1`, `al_1`/`alm_1`, and `alarm_keypress` / `set_alarm_state` services (plus the Test Lab `input_text.roomguard_test_bypasses` helper) so bypasses, alarmed zones, Instant/Night/Maximum modes, and Temporal-3 fire alarms mirror both ways.
+  - Secure PIN handling: leave **HA panel PIN** blank to forward whatever code you type on RoomGuard's keypad directly to Home Assistant / ESPHome without storing your real code in plaintext config or YAML.
+  - Open doors and windows block arming from both RoomGuard and Home Assistant (with a safe **Real panel handles alarms for HA zones** mirror toggle to avoid double sirens on real house panels).
+- **Home Assistant Alerts, Announcements & Supervision Grace:**
+  - RoomGuard publishes `sensor.roomguard_alarm` in Home Assistant's standard alarm states (`disarmed`, `arming`, `armed_away`, `armed_home`, `armed_night`, `pending`, `triggered`) with alarmed zones, troubles, AC power, and open/bypassed zones as attributes.
+  - Fires `roomguard_state` and `roomguard_alarm` events, displays a persistent Home Assistant notification during alarms (auto-cleared on disarm), and supports forwarding phone alerts through a Home Assistant `notify.*` service (configured under **Settings -> Home Assistant -> Alerts in Home Assistant**; access codes are never transmitted).
+  - 3-minute supervision grace window (`180 s`) for Home Assistant sensors and linked panels so a normal Home Assistant restart never triggers false trouble beeps while keeping last-known zone and armed states intact.
+- **Two-Way Sirens, Wireless Sensor Browser & Setup Guide:**
+  - One-click two-way siren linking (`siren.*`, `switch.*`, `light.*`, `input_boolean.*`, and ESPHome alarm/fire sensors): RoomGuard drives linked outputs on alarm, and turning a linked siren ON in Home Assistant immediately sounds RoomGuard's PC siren with a red **External siren active** bar and **Silence** button.
+  - Searchable, fixed-height entity dropdowns with live status dots, category filters (`Sensors`, `Doors & Motion`, `Cameras`, `All`), one-click **`+ Next unused`** zone expansion (Zones 01-48), automatic zone-type suggestions, unused simulated-zone cleanup, and on-demand Home Assistant camera snapshots.
+  - Includes a step-by-step Windows setup guide (`docs/HOME_ASSISTANT_WINDOWS.md`) and plug-and-play local Test Lab package (`docs/roomguard_lab.yaml`).
+
+### Audio Routing, Peak Limiter & Quiet Intrusion
+
+- **Separate Keypad & Siren Outputs with Automatic Fallback:** Route keypad tones/voice and alarm sirens to separate speakers (or the same speaker), with live device format reporting in Settings. If a dedicated siren speaker fails or disconnects, the siren automatically plays through the keypad speaker until it returns.
+- **Smooth Peak Limiter & Voice/Key Ducking:** Output is smoothly limited at `-1 dBFS` with peak hold so key beeps over a full-volume siren stay clean with zero clipping, and sirens duck ~6 dB under keypresses, confirmations, and voice prompts when sharing one speaker.
+- **Quiet Intrusion Alerts & Motion GIF Evidence:** Optional quiet intrusion mode keeps burglary sirens silent while still sending phone alerts, snapshots, and optional short motion GIF clips via `ntfy`.
+- **6160V Voice Vocabulary Visibility & Microphone Memos:** Lists all 48 speakable 6160V voice ROM words with live preview right next to zone names, plus selectable microphone input and playback test for VistaGuard 20P voice memos.
+
+### Panel Accuracy, Keypad Polish & UI Upgrades
+
+- **Manual-Verified Panel Features:**
+  - Added PC1832 Cross-Zoning (`[018]` opt 6, `[101]`-`[132]` opt 9, `[176]` timer) and Double-Hit (`[017]` opt 4), plus VistaGuard 20P `*85` Cross-Zone Timer with `*81` Zone List 04.
+  - Made VistaGuard 20P keypad emergency pseudo-zones `95` (Fire), `96` (Aux/Medical), and `99` (Police) installer-configurable (`00` disabled, `06` silent, `07` audible, `08` aux, `09` fire), distinct from physical fire sensors on zones `01`-`48`.
+  - Wired up VistaGuard 20P `*32` continuous fire sounder timeout, `*31` single alarm sounding per zone, Type `05` Day/Trouble `CHECK XX` display, multi-zone alarm and alarm-memory LCD cycling with Fire priority, clean silenced-alarm purge on the second `Code + 1`, and spoken `"zone XX"` fallback for custom zone names.
+  - Fixed multi-delay entry follower tracking, PC1550 `[34]` opt 1 exit beep lookup during synced arming, and PC1832 Installer UI zone attribute labels for zones `10`-`32`.
+- **Keypad & Settings Polish:**
+  - Refined PC1550, PC1832, and VistaGuard 20P keypad housings from hardware photo references, added **Keypad only** view and optional **Lock keypad view when armed**, added master-code unlock for the hidden Installer tab, and fixed Settings text wrapping and dropdown alignment.
+
 ## [2.2.0] - 2026-11-26
 
 RoomGuard 2.2.0 brings wire-level panel accuracy across all three emulated keypads, a rebuilt VG6160V voice bank with real keypad recordings and uniform loudness, full VistaGuard 20P advanced keypad functions (clock, event log, schedules, macros, outputs, and message center), multi-zone drawing on both the Room map and Live camera views, automatic fresh empty-room calibration on every launch, and native platform app icons.

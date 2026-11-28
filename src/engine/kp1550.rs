@@ -36,7 +36,7 @@ impl Panel {
             KpMode::Normal => self.k50_normal(key, now),
             KpMode::Star { .. } => self.k50_star(key, now),
             KpMode::NeedCode { purpose, buf } => self.k_need_code(purpose, buf, key, now),
-            KpMode::Bypass { .. } => self.k50_bypass(key),
+            KpMode::Bypass { .. } => self.k50_bypass(key, now),
             KpMode::Troubles { mem, .. } => self.k50_troubles(mem, key),
             KpMode::Memory { level, .. } => self.k50_memory(level, key),
             KpMode::UserCodes { slot, buf, .. } => self.k50_usercodes(slot, buf, key),
@@ -125,14 +125,17 @@ impl Panel {
             }
             Key::Digit(5) if disarmed => KpMode::NeedCode { purpose: CodeFor::UserCodes, buf: String::new() },
             Key::Digit(6) if disarmed => KpMode::NeedCode { purpose: CodeFor::UserFns, buf: String::new() },
-            Key::Digit(7) => {
-                if self.ee.raw(self.model, "24") == "03" {
-                    return KpMode::NeedCode { purpose: CodeFor::CmdOut, buf: String::new() };
+            Key::Digit(7) => match self.ee.raw(self.model, "24").as_str() {
+                "03" => KpMode::NeedCode { purpose: CodeFor::CmdOut, buf: String::new() },
+                "02" | "04" => {
+                    self.classic_utility_output(now);
+                    KpMode::Normal
                 }
-                self.util_until = Some(now + Duration::from_secs(5));
-                self.sensor_reset(now);
-                KpMode::Normal
-            }
+                _ => {
+                    self.error_tone();
+                    KpMode::Normal
+                }
+            },
             Key::Digit(8) if disarmed => KpMode::NeedCode { purpose: CodeFor::Installer, buf: String::new() },
             Key::Digit(9) if disarmed => KpMode::NeedCode { purpose: CodeFor::NoEntry, buf: String::new() },
             Key::Digit(0) => {
@@ -154,21 +157,34 @@ impl Panel {
         }
     }
 
-    fn k50_bypass(&mut self, key: Key) -> KpMode {
+    /// Only the normally-low reset programming cuts smoke detector power.
+    pub(crate) fn classic_utility_output(&mut self, now: Instant) {
+        let until = now + Duration::from_secs(5);
+        self.util_until = Some(until);
+        if self.ee.raw(self.model, "24") == "04" {
+            self.sensor_reset(now);
+        } else {
+            self.log(EvKind::Info, "Utility output active for five seconds");
+        }
+    }
+
+    fn k50_bypass(&mut self, key: Key, now: Instant) -> KpMode {
         let stay = KpMode::Bypass { buf: String::new(), idx: 0 };
         match key {
             Key::Digit(9) => {
-                let mut any = false;
+                let mut recalled = Vec::new();
                 for z in self.last_bypass.clone() {
                     let zi = z as usize;
                     if zi >= 1 && zi <= self.n() && self.cfg(zi).bypassable {
                         self.zones[zi - 1].bypassed = true;
-                        any = true;
+                        recalled.push(z);
                     }
                 }
-                if any {
+                if !recalled.is_empty() {
                     self.beeps(3);
                     self.log(EvKind::Info, "Bypass group recalled");
+                    let c = self.last_entered_code.clone();
+                    self.emit_ha_bypass(HaBypassCmd::RecallGroup { code_num: 9, zones: recalled, code: c }, now);
                 } else {
                     self.error_tone();
                 }
@@ -187,11 +203,14 @@ impl Panel {
                     let on = r.bypassed;
                     self.key_beep();
                     self.log(EvKind::Info, format!("Zone {} {}", z, if on { "bypassed" } else { "unbypassed" }));
+                    let code = self.last_entered_code.clone();
+                    self.emit_ha_bypass(HaBypassCmd::SetZone { zone: z as u8, bypassed: on, code }, now);
                 }
                 stay
             }
             Key::Hash => {
                 self.key_beep();
+                self.last_entered_code = None;
                 let list: Vec<u8> = (1..=self.n()).filter(|&z| self.zones[z - 1].bypassed).map(|z| z as u8).collect();
                 if !list.is_empty() {
                     self.last_bypass = list;
@@ -525,7 +544,7 @@ impl Panel {
                 l[2] = Led::Flash;
                 if let Some(list) = self.memory.get(*level) {
                     for &z in list {
-                        zone(&mut l, z as usize, Led::Flash);
+                        zone(&mut l, z as usize, Led::Fast);
                     }
                 }
                 return l;
@@ -533,7 +552,7 @@ impl Panel {
             _ => {}
         }
         let armed = self.armed.is_some();
-        let exiting = self.exit.is_some();
+        let exiting = self.is_on() && !armed;
         if armed || exiting {
             let no_entry = self.armed.map_or(false, |a| a.no_entry) || self.exit.map_or(false, |e| e.how == ArmHow::NoEntry);
             l[1] = if no_entry { Led::Flash } else { Led::On };
@@ -554,9 +573,9 @@ impl Panel {
             for z in 1..=self.n().min(6) {
                 let r = self.zones[z - 1];
                 if self.mem_flash_until.is_some() && r.alarm {
-                    zone(&mut l, z, Led::Flash);
+                    zone(&mut l, z, Led::Fast);
                 } else if r.open || r.tamper || r.fault {
-                    zone(&mut l, z, Led::On);
+                    zone(&mut l, z, Led::Flash);
                 }
             }
         } else {
@@ -575,7 +594,7 @@ impl Panel {
             if self.ee.toggle(self.model, "12", 3) {
                 for z in 1..=self.n().min(6) {
                     if self.zones[z - 1].alarm {
-                        zone(&mut l, z, Led::Flash);
+                        zone(&mut l, z, Led::Fast);
                     }
                 }
             }

@@ -7,6 +7,7 @@ use eframe::egui::{self, RichText, Sense, Vec2};
 
 use crate::config::CameraCfg;
 use crate::engine::{EngineHandle, EngineMsg, View};
+use crate::engine::types::ZoneKind;
 use crate::theme;
 
 use super::camera::{zone_color, zone_drawable};
@@ -17,13 +18,20 @@ pub fn ui(ui: &mut egui::Ui, view: &View, cfg: &CameraCfg, engine: &EngineHandle
     ui.horizontal(|ui| {
         ui.label(theme::heading("Zones"));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(theme::muted("Click Draw to place on map"));
+            if cfg.enabled {
+                ui.label(theme::muted("Click Draw to place on map"));
+            }
         });
     });
     ui.add_space(4.0);
     let mut want_draw: Option<u8> = None;
     let total_w = ui.available_width();
-    for z in &view.zones {
+    let active_zones: Vec<_> = view.zones.iter().filter(|z| z.kind != ZoneKind::Null).collect();
+    if active_zones.is_empty() {
+        ui.add(egui::Label::new(theme::muted("No active zones. Enable zones in Settings -> Panel or Home Assistant.")).wrap());
+        return None;
+    }
+    for z in active_zones {
         let (state, color) = if !z.note.is_empty() && (z.open || z.tamper || z.fault) {
             // The camera itself is the problem, so say that instead of "Open".
             (z.note.as_str(), theme::AMBER)
@@ -40,8 +48,9 @@ pub fn ui(ui: &mut egui::Ui, view: &View, cfg: &CameraCfg, engine: &EngineHandle
         } else {
             ("Closed", theme::GREEN)
         };
-        let can_draw = cfg.enabled && zone_drawable(z);
-        let mapped_box = cfg.zone_rect(z.num).is_some();
+        let home = view.home_zones[usize::from(z.num) - 1];
+        let can_draw = !home && cfg.enabled && zone_drawable(z);
+        let mapped_box = cfg.enabled && !home && cfg.zone_rect(z.num).is_some();
         let right_reserve = if !z.camera {
             (if z.alarm { 178.0 } else { 132.0 }) + if can_draw { 46.0 } else { 0.0 }
         } else if z.alarm {
@@ -60,7 +69,9 @@ pub fn ui(ui: &mut egui::Ui, view: &View, cfg: &CameraCfg, engine: &EngineHandle
                 ui.set_max_width(name_max_w);
                 ui.add(egui::Label::new(RichText::new(&z.label).font(theme::semi(13.0))).truncate());
                 let mut kind = z.kind.short().to_string();
-                if mapped_box {
+                if home {
+                    kind.push_str(", Home Assistant");
+                } else if mapped_box {
                     kind.push_str(", on map");
                 } else if z.camera {
                     kind.push_str(", camera");
@@ -68,7 +79,7 @@ pub fn ui(ui: &mut egui::Ui, view: &View, cfg: &CameraCfg, engine: &EngineHandle
                 ui.add(egui::Label::new(theme::muted(kind)).truncate());
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if !z.camera {
+                if !z.camera && !home {
                     let open = view.sim.get(z.num as usize - 1).copied().unwrap_or(false);
                     let label = if open { "Close" } else { "Open" };
                     if ui.small_button(label).on_hover_text("Simulate this sensor").clicked() {

@@ -689,6 +689,8 @@ pub struct Synth {
     buzzer_level: u8,
     piezo: Piezo,
     voice_player: VoicePlayer,
+    memo: Option<(super::memo::Clip, f64, bool)>,
+    voice_level: u8,
     sounder: Gate,
     segs: VecDeque<Seg>,
     seg: Option<(Seg, u32, f32)>,
@@ -698,6 +700,16 @@ pub struct Synth {
     siren: Siren,
     preview: Option<(Siren, u32)>,
     vol_master: f32,
+    /// Output limiter gain, peak-hold counter, and its attack and release coefficients.
+    lim_gain: f32,
+    lim_att: f32,
+    lim_rel: f32,
+    lim_hold: u32,
+    lim_hold_max: u32,
+    /// How far the siren dips under key beeps and the voice.
+    duck: f32,
+    duck_att: f32,
+    duck_rel: f32,
     vol_siren: f32,
     vol_keypad: f32,
     vol_line: f32,
@@ -732,6 +744,8 @@ impl Synth {
             buzzer_level: 14,
             piezo: Piezo::new(sr, KeypadVoice::Pk5500, 14),
             voice_player: VoicePlayer::new(sr),
+            memo: None,
+            voice_level: 5,
             sounder: Gate { pat: Pattern::Off, pos: 0 },
             segs: VecDeque::new(),
             seg: None,
@@ -741,6 +755,14 @@ impl Synth {
             siren: Siren::new(sr, SirenModel::Wave2F, true),
             preview: None,
             vol_master: 0.8,
+            lim_gain: 1.0,
+            lim_att: (-1.0 / (0.00015 * sr)).exp(),
+            lim_rel: (-1.0 / (0.180 * sr)).exp(),
+            lim_hold: 0,
+            lim_hold_max: ms(sr, 12),
+            duck: 1.0,
+            duck_att: (-1.0 / (0.006 * sr)).exp(),
+            duck_rel: (-1.0 / (0.120 * sr)).exp(),
             vol_siren: 0.45,
             vol_keypad: 0.7,
             vol_line: 0.0,
@@ -812,10 +834,19 @@ impl Synth {
                 self.piezo.set_level(self.buzzer_level);
             }
             AudioCmd::VoiceLevel(level) => {
+                self.voice_level = level.min(7);
                 self.voice_player.set_level(level);
             }
             AudioCmd::Speak(tokens) => {
                 self.voice_player.speak(tokens);
+            }
+            AudioCmd::PlayMemo(clip) => {
+                self.voice_player.stop();
+                self.memo = Some((clip, 0.0, false));
+            }
+            AudioCmd::PlayTest(clip) => {
+                self.voice_player.stop();
+                self.memo = Some((clip, 0.0, true));
             }
             AudioCmd::Sounder(p) => {
                 // Starting a brand-new sounder (e.g. exit delay right after arming)
@@ -830,11 +861,10 @@ impl Synth {
             AudioCmd::KeyBeep => {
                 // A keypress is ~80 ms on PC1550, ~65 ms on PC1832, or a crisp ~46 ms
                 // chirp on Vista 6160V. When an exit/entry/trouble sounder is already
-                // running, duck it for 1.8 s after each keypress so typing a code never
-                // overlaps with countdown beeps. Pressing a key also fades out any
-                // in-progress 6160V voice phrase cleanly without a click.
+                // running, the first key starts a 1.8 s pause. Further keys
+                // get their own chirps without extending that pause.
                 let was_ducking = self.key_duck_left > 0;
-                if self.sounder.pat != Pattern::Off {
+                if !was_ducking && self.sounder.pat != Pattern::Off {
                     self.key_duck_left = ms(self.sr, 1800);
                 }
                 self.segs.clear();
@@ -961,12 +991,19 @@ impl Synth {
                 self.preview = Some((Siren::new(self.sr, model, warble), ms(self.sr, dur)));
             }
             AudioCmd::Wake => self.wake_left = ms(self.sr, 2500),
+            AudioCmd::ClearSiren => {
+                self.bell = BellPattern::Off;
+                self.squawks.clear();
+                self.preview = None;
+                self.siren = Siren::new(self.sr, self.siren.model, self.siren.warble);
+            }
             AudioCmd::Silence => {
                 self.sounder.set(Pattern::Off);
                 self.key_duck_left = 0;
                 self.segs.clear();
                 self.seg = None;
                 self.voice_player.stop();
+                self.memo = None;
                 self.bell = BellPattern::Off;
                 self.squawks.clear();
                 self.line.clear();
@@ -1094,6 +1131,51 @@ impl Synth {
         self.click_res.tick(n) * 2.0
     }
 
+    fn memo_next(&mut self) -> f32 {
+        let Some((clip, position, test)) = self.memo.as_mut() else {
+            return 0.0;
+        };
+        let index = *position as usize;
+        let Some(&sample) = clip.samples.get(index) else {
+            self.memo = None;
+            return 0.0;
+        };
+        let next = clip.samples.get(index + 1).copied().unwrap_or(sample);
+        let interpolated = sample + (next - sample) * position.fract() as f32;
+        *position += f64::from(clip.rate) / f64::from(self.sr);
+        let gain = if *test { 1.0 } else if self.voice_level == 0 { 0.0 } else { 0.28 + 0.72 * f32::from(self.voice_level) / 7.0 };
+        interpolated * gain
+    }
+
+    /// A peak limiter on everything summed into this output, so the keypad,
+    /// the voice and a siren playing together stay clean instead of clipping.
+    /// Below -1 dBFS it does nothing at all.
+    fn limit(&mut self, x: f32) -> f32 {
+        const CEILING: f32 = 0.891;
+        if !x.is_finite() {
+            self.lim_gain = 1.0;
+            return 0.0;
+        }
+        let peak = x.abs();
+        let target = if peak > CEILING { CEILING / peak } else { 1.0 };
+        if target < self.lim_gain {
+            self.lim_gain = target + (self.lim_gain - target) * self.lim_att;
+            self.lim_hold = self.lim_hold_max;
+        } else if self.lim_hold > 0 {
+            self.lim_hold -= 1;
+        } else {
+            self.lim_gain = target + (self.lim_gain - target) * self.lim_rel;
+        }
+        let y = x * self.lim_gain;
+        // Whatever the fast attack lets through is rounded off softly.
+        let a = y.abs();
+        if a <= 0.9 {
+            y
+        } else {
+            y.signum() * (0.9 + 0.0999 * ((a - 0.9) / 0.0999).tanh())
+        }
+    }
+
     pub fn next(&mut self) -> f32 {
         let (bg_on_raw, bg_freq) = self.sounder.next(self.sr);
         let key_ducked = if self.key_duck_left > 0 {
@@ -1113,12 +1195,14 @@ impl Synth {
             None => (bg_on, bg_freq.unwrap_or(self.piezo.tone), 1.0),
         };
         let power = self.bell_gate() | self.squawk_next();
-        let speaking = self.voice_player.is_speaking();
+        let playing_memo = self.memo.is_some();
+        let speaking = self.voice_player.is_speaking() || playing_memo;
         let voice_active = self.voice_player.is_active();
         // Fast path when every voice is silent: skip 48 kHz resonator and tanh
         // math so idle audio uses near-zero CPU and battery.
         let idle = !on
             && !voice_active
+            && !playing_memo
             && self.piezo.quiet()
             && !power
             && self.siren.quiet()
@@ -1137,7 +1221,9 @@ impl Synth {
             // always drains smoothly so interrupting speech never clicks.
             let keypad_on = if has_seg { on } else { on && !speaking };
             let keypad = self.piezo.next(keypad_on, freq, amp) * self.vol_keypad;
-            let spoken = if has_seg && speaking && !self.voice_player.is_fading() {
+            let spoken = if playing_memo {
+                if has_seg { 0.0 } else { self.memo_next() * self.vol_keypad }
+            } else if has_seg && speaking && !self.voice_player.is_fading() {
                 0.0
             } else {
                 self.voice_player.next() * self.vol_keypad
@@ -1158,7 +1244,13 @@ impl Synth {
             let line = self.line_next() * self.vol_line;
             let ring = self.ring_next();
             let click = self.click_next() * self.vol_keypad * 0.12;
-            (keypad * 0.8 + spoken + siren + preview + line + ring + click) * self.vol_master
+            // A key beep, confirmation or the voice stays clear over a siren on
+            // the same output: the siren dips about 6 dB under it, the way a
+            // keypad right in front of you cuts through a siren on the wall.
+            let target = if has_seg || speaking { 0.5 } else { 1.0 };
+            let coef = if target < self.duck { self.duck_att } else { self.duck_rel };
+            self.duck = target + (self.duck - target) * coef;
+            (keypad * 0.8 + spoken + click + (siren + preview) * self.duck + line + ring) * self.vol_master
         };
         // Keeps the output awake. Silence lets many laptop speakers and USB,
         // HDMI and Bluetooth outputs power their amplifier down, and waking it
@@ -1179,6 +1271,6 @@ impl Synth {
             5.0e-4
         };
         self.keepalive = -self.keepalive;
-        mix.clamp(-0.9999, 0.9999) + (TAU * self.ka_phase).sin() * ka_level + self.keepalive
+        self.limit(mix) + (TAU * self.ka_phase).sin() * ka_level + self.keepalive
     }
 }
