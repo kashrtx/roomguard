@@ -418,8 +418,8 @@ impl Panel {
         // "When entering codes and commands, sequential key depressions must be
         // made within 4-5 seconds of one another. If 4-5 seconds elapse without a
         // key depression, the entry will be aborted."
-        // (Long-lived interactive displays, such as Time/Date, Event Log, Schedules and
-        // Macros, have a 30-second timeout handled below and in tick_vista.)
+        // (Long-lived interactive displays — Time/Date, Event Log, Schedules,
+        // Macros — have a 30-second timeout handled below and in tick_vista.)
         let elapsed = now.saturating_duration_since(self.vista_prev_key).as_secs_f32();
         self.vista_prev_key = now;
         if elapsed > 5.0 {
@@ -528,7 +528,7 @@ impl Panel {
                     }
                     self.log(EvKind::Disarm, "Fire alarm silenced with OFF");
                 }
-                // # + 0 + 1: 6160V Voice Message Center: record memo (up to 2.5 min, 1 stops).
+                // # + 0 + 1: 6160V Voice Message Center — Record memo (up to 2.5 min, 1 stops).
                 if self.buf == "#0" && d == 1 {
                     self.buf.clear();
                     if self.exit.is_some() || self.vista_msg_recording.is_some() || self.vista_msg_saving.is_some()
@@ -553,7 +553,7 @@ impl Panel {
                     self.vista_speak(vec!["system".into()]);
                     return VistaKp::Volume;
                 }
-                // # + 0 + 3: 6160V Voice Message Center: play memo & clear MESSAGE LED.
+                // # + 0 + 3: 6160V Voice Message Center — Play memo & clear MESSAGE LED.
                 if self.buf == "#0" && d == 3 {
                     self.buf.clear();
                     self.vista_confirm_beep();

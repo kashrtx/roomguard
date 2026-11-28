@@ -376,7 +376,7 @@ impl CameraView {
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.label(
-                        RichText::new("Room calibrated for this session: new objects & closed contacts locked.")
+                        RichText::new("Room calibrated for this session — new objects & closed contacts locked.")
                             .size(11.5)
                             .color(theme::GREEN),
                     );

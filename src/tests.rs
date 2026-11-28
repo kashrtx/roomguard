@@ -2040,7 +2040,7 @@ fn vista_6160v_bypass_voice_is_silent_on_entry_and_speaks_on_status_and_arming()
     let mut p = panel(Model::Vista20p);
     p.chime = true;
 
-    // 1. Bypassing zone 03 emits confirmation beep ONLY, NO spoken words!
+    // 1. Bypassing zone 03 emits confirmation beep ONLY — NO spoken words!
     p.out.clear();
     keys(&mut p, "1234603", t0);
     assert!(p.zones[2].bypassed && !p.zones[2].auto_bypass);
@@ -3509,71 +3509,4 @@ fn learned_ha_timers_prevent_early_exit_skip_and_external_siren_status_works() {
         v.out.iter().any(|o| matches!(o, Out::Disarmed { .. })),
         "Vista Code+1 while disarmed must emit Out::Disarmed to silence active external HA siren"
     );
-}
-
-#[test]
-fn roomguard_reports_home_assistant_alarm_states() {
-    use crate::engine::types::ArmMode;
-    use crate::engine::{ha_alarm_state, notify_target};
-    assert_eq!(ha_alarm_state(false, false, false, None, false), "disarmed");
-    assert_eq!(ha_alarm_state(false, false, true, None, false), "arming");
-    assert_eq!(ha_alarm_state(false, false, false, Some(ArmMode::Away), false), "armed_away");
-    assert_eq!(ha_alarm_state(false, false, false, Some(ArmMode::Stay), false), "armed_home");
-    assert_eq!(ha_alarm_state(false, false, false, Some(ArmMode::Stay), true), "armed_night");
-    assert_eq!(ha_alarm_state(false, true, false, Some(ArmMode::Away), false), "pending");
-    assert_eq!(ha_alarm_state(true, true, false, Some(ArmMode::Away), false), "triggered");
-    assert_eq!(notify_target("notify.mobile_app_pixel"), Some(("notify".to_string(), "mobile_app_pixel".to_string())));
-    assert_eq!(notify_target(" mobile_app_pixel "), Some(("notify".to_string(), "mobile_app_pixel".to_string())));
-    assert_eq!(notify_target("   "), None);
-    assert_eq!(notify_target("notify.bad name"), None);
-}
-
-#[test]
-fn home_assistant_sensor_outages_wait_out_a_grace_period() {
-    use crate::engine::sensor_outage;
-    let grace = crate::engine::panel::HA_SUPERVISION_GRACE;
-    let t0 = Instant::now();
-    let mut since = None;
-    assert_eq!(sensor_outage(&mut since, true, t0), (false, None));
-    let (lost, due) = sensor_outage(&mut since, false, t0 + secs(1));
-    assert!(!lost, "a brief outage keeps the sensor's last known state");
-    assert_eq!(due, Some(t0 + secs(1) + grace), "and schedules one re-check");
-    assert!(!sensor_outage(&mut since, false, t0 + secs(90)).0, "a Home Assistant restart is not a trouble");
-    assert!(sensor_outage(&mut since, false, t0 + secs(1) + grace).0, "an outage that lasts is a supervision fault");
-    assert_eq!(sensor_outage(&mut since, true, t0 + secs(200)), (false, None), "reporting again clears it");
-    assert!(since.is_none());
-}
-
-#[test]
-fn a_linked_panel_outage_waits_out_the_grace_period() {
-    use crate::engine::panel::tb;
-    let t0 = Instant::now();
-    let mut p = panel(Model::Vista20p);
-    p.physical_unavailable_since = Some(t0);
-    p.tick(t0 + secs(90), 0);
-    assert_eq!(p.troubles & tb::HOME_PANEL, 0, "no trouble beeping during a Home Assistant restart");
-    p.tick(t0 + secs(125), 0);
-    assert_ne!(p.troubles & tb::HOME_PANEL, 0, "a lasting outage is a trouble");
-}
-
-#[test]
-fn the_lab_package_keeps_no_alarm_code() {
-    // With a code here, disarming at RoomGuard sends the keypad code to Home
-    // Assistant, which refuses it whenever the two differ, and Two-Way sync
-    // pulls RoomGuard straight back to armed.
-    let yaml = include_str!("../docs/roomguard_lab.yaml");
-    assert!(yaml.lines().all(|l| !l.trim_start().starts_with("code:")));
-}
-
-#[test]
-fn the_bus_bits_match_the_reference_decoders() {
-    use crate::engine::bus::*;
-    // dscClassic.cpp: panelData[1] bit 7 ready, bit 6 armed, bit 0 beep.
-    assert_eq!((CLASSIC_READY, CLASSIC_ARMED, CLASSIC_BEEP), (0x80, 0x40, 0x01));
-    // dscKeybusInterface: the 0x05 lights byte, bit 3 bypass and bit 4 trouble.
-    assert_eq!((PS_LIGHT_READY, PS_LIGHT_ARMED, PS_LIGHT_BYPASS, PS_LIGHT_TROUBLE), (0x01, 0x02, 0x08, 0x10));
-    // esphome-components vista.h, the F7 keypad message masks.
-    assert_eq!((ECP_B1_BEEP_MASK, ECP_B1_NIGHT), (0x07, 0x10));
-    assert_eq!((ECP_B2_ARMED_STAY, ECP_B2_READY, ECP_B2_CHECK_FLAG, ECP_B2_FIRE), (0x80, 0x10, 0x02, 0x01));
-    assert_eq!((ECP_B3_INSTANT, ECP_B3_CHIME, ECP_B3_AC_POWER, ECP_B3_ARMED_AWAY, ECP_B3_IN_ALARM), (0x80, 0x20, 0x08, 0x04, 0x01));
 }

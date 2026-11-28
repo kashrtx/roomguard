@@ -1320,33 +1320,6 @@ impl HomeUi {
             });
         }
 
-        // --- Alarm notifications: tell Home Assistant about RoomGuard itself ---
-        ui.add_space(14.0);
-        ui.label(theme::heading("Alarm notifications"));
-        wrapped_muted(
-            ui,
-            "RoomGuard tells Home Assistant what it's doing, even with no panel linked: a roomguard_state event on every change (disarmed, arming, armed_away, armed_home, armed_night, pending or triggered), and a roomguard_alarm event when an alarm starts or clears, for your automations. Each alarm also shows a notification in Home Assistant until it's disarmed. Duress and silent alarms send the event only.",
-        );
-        if ui
-            .checkbox(&mut cfg.home_assistant.announce_alarms, "Tell Home Assistant about RoomGuard's alarms and arming")
-            .changed()
-        {
-            *changed = true;
-        }
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Phone alert (optional)");
-            let field = egui::TextEdit::singleline(&mut cfg.home_assistant.notify_service)
-                .hint_text("notify.mobile_app_your_phone")
-                .desired_width(260.0);
-            if ui.add(field).changed() {
-                *changed = true;
-            }
-        });
-        wrapped_muted(
-            ui,
-            "Find your phone's service in Home Assistant under Developer tools, Actions: search for notify.mobile_app. Alarms arrive as urgent notifications with an alarm sound, and clear themselves when RoomGuard is disarmed. Events need an administrator's access token.",
-        );
-
         // --- Section 5: Two-Way Home Assistant Sirens & Alarm Outputs (One-Click Linking!) ---
         ui.add_space(14.0);
         ui.label(theme::heading("Sirens & alarm outputs (two-way)"));

@@ -68,13 +68,6 @@ pub struct Config {
     pub learned_exit_stay: Option<u64>,
     #[serde(default)]
     pub learned_entry: Option<u64>,
-    /// Tell Home Assistant about RoomGuard itself: a `roomguard_state` event on
-    /// every change, and on an alarm a `roomguard_alarm` event plus a notification.
-    #[serde(default = "default_true")]
-    pub announce_alarms: bool,
-    /// Optional phone push for alarms, e.g. `notify.mobile_app_pixel_8`.
-    #[serde(default)]
-    pub notify_service: String,
 }
 
 impl Default for Config {
@@ -93,8 +86,6 @@ impl Default for Config {
             learned_exit_away: None,
             learned_exit_stay: None,
             learned_entry: None,
-            announce_alarms: true,
-            notify_service: String::new(),
         }
     }
 }
@@ -881,9 +872,6 @@ pub enum Update {
     ServiceResult { action: AlarmAction, result: Result<(), String> },
     OutputResult { entity_id: String, on: bool, result: Result<(), String> },
     KeypressResult { service: String, result: Result<(), String> },
-    /// Home Assistant refused one of RoomGuard's announcements: an event
-    /// (which needs an administrator's token) or a notification service.
-    AnnounceFailed { what: String, error: String },
     Preview { id: String, result: Result<Arc<Rgb>, String> },
 }
 
@@ -900,10 +888,6 @@ enum CallKind {
     EspHomeKeypress { service: String, keys: String, partition: Option<u8> },
     EspHomeAlarmState { service: String, state: String, code: String, partition: u8, action: AlarmAction },
     InputText { value: String },
-    /// A Home Assistant event for automations, e.g. `roomguard_alarm`.
-    Event { event_type: String, data: Value },
-    /// Any other service, e.g. `persistent_notification.create` or a phone's notify service.
-    Service { domain: String, service: String, data: Value },
 }
 
 #[derive(Clone, Debug)]
@@ -972,42 +956,13 @@ impl Handle {
         });
     }
 
-    /// Fires a Home Assistant event (an automation trigger).
-    pub fn fire_event(&self, epoch: u64, event_type: &str, data: Value) {
-        let _ = self.calls.send(ServiceCall {
-            epoch,
-            entity_id: String::new(),
-            kind: CallKind::Event { event_type: event_type.into(), data },
-        });
-    }
-
-    /// Calls any Home Assistant service with the given data.
-    pub fn call_service(&self, epoch: u64, domain: &str, service: &str, data: Value) {
-        let _ = self.calls.send(ServiceCall {
-            epoch,
-            entity_id: String::new(),
-            kind: CallKind::Service { domain: domain.into(), service: service.into(), data },
-        });
-    }
-
     pub fn preview(&self, cfg: &Config, epoch: u64, id: String) -> bool {
         self.previews.try_send((connection(cfg, epoch), id)).is_ok()
     }
 }
 
 fn connection(cfg: &Config, epoch: u64) -> Connection {
-    Connection { epoch, url: normalized_url(&cfg.url), token: cfg.token.trim().into() }
-}
-
-/// `homeassistant.local:8123` typed without a scheme means plain http, like a
-/// browser assumes. Trailing slashes are dropped.
-fn normalized_url(raw: &str) -> String {
-    let url = raw.trim().trim_end_matches('/');
-    if url.is_empty() || url.contains("://") {
-        url.into()
-    } else {
-        format!("http://{}", url)
-    }
+    Connection { epoch, url: cfg.url.trim().trim_end_matches('/').into(), token: cfg.token.trim().into() }
 }
 
 pub fn start(engine: mpsc::Sender<EngineMsg>) -> Handle {
@@ -1099,9 +1054,7 @@ fn open(cfg: &Connection) -> Result<Socket, String> {
     tcp.set_read_timeout(Some(Duration::from_secs(4))).map_err(|_| "Could not set Home Assistant read timeout")?;
     tcp.set_write_timeout(Some(Duration::from_secs(4))).map_err(|_| "Could not set Home Assistant write timeout")?;
     let prefix = if secure { "wss" } else { "ws" };
-    // Never panic on the typed URL: that would end this thread silently.
-    let rest = cfg.url.split_once("://").map_or(cfg.url.as_str(), |(_, rest)| rest);
-    let url = format!("{}://{}/api/websocket", prefix, rest);
+    let url = format!("{}://{}/api/websocket", prefix, cfg.url.split_once("://").unwrap().1);
     let request = url.into_client_request().map_err(|_| "Invalid Home Assistant WebSocket URL")?;
     let limits = tungstenite::protocol::WebSocketConfig {
         max_message_size: Some(16 * 1024 * 1024),
@@ -1232,29 +1185,6 @@ fn service_call_payload(id: u64, call: &ServiceCall) -> Option<Value> {
                     "code": code,
                     "partition": partition,
                 },
-            }))
-        }
-        CallKind::Event { event_type, data } => {
-            if event_type.trim().is_empty() {
-                return None;
-            }
-            Some(json!({
-                "id": id,
-                "type": "fire_event",
-                "event_type": event_type,
-                "event_data": data,
-            }))
-        }
-        CallKind::Service { domain, service, data } => {
-            if domain.trim().is_empty() || service.trim().is_empty() {
-                return None;
-            }
-            Some(json!({
-                "id": id,
-                "type": "call_service",
-                "domain": domain,
-                "service": service,
-                "service_data": data,
             }))
         }
         CallKind::InputText { value } => {
@@ -1448,19 +1378,6 @@ fn session(
                             }
                         }
                         CallKind::InputText { .. } => {}
-                        CallKind::Event { event_type, .. } => {
-                            if let Err(e) = result {
-                                // Firing events needs an administrator's token.
-                                crate::util::log(&format!("Home Assistant refused the {} event: {}", event_type, e));
-                                emit(engine, cfg.epoch, Update::AnnounceFailed { what: format!("the {} event", event_type), error: e });
-                            }
-                        }
-                        CallKind::Service { domain, service, .. } => {
-                            if let Err(e) = result {
-                                crate::util::log(&format!("Home Assistant {}.{} failed: {}", domain, service, e));
-                                emit(engine, cfg.epoch, Update::AnnounceFailed { what: format!("{}.{}", domain, service), error: e });
-                            }
-                        }
                     }
                 }
             }
@@ -1504,46 +1421,6 @@ fn preview(cfg: &Connection, id: &str) -> Result<Rgb, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_url_without_a_scheme_is_treated_as_http() {
-        assert_eq!(normalized_url(" homeassistant.local:8123/ "), "http://homeassistant.local:8123");
-        assert_eq!(normalized_url("https://ha.example.com/"), "https://ha.example.com");
-        assert_eq!(normalized_url(""), "");
-    }
-
-    #[test]
-    fn events_and_notifications_use_home_assistant_message_formats() {
-        let event = service_call_payload(
-            7,
-            &ServiceCall {
-                epoch: 1,
-                entity_id: String::new(),
-                kind: CallKind::Event { event_type: "roomguard_alarm".into(), data: json!({"state": "triggered"}) },
-            },
-        )
-        .unwrap();
-        assert_eq!(event["type"], "fire_event");
-        assert_eq!(event["event_type"], "roomguard_alarm");
-        assert_eq!(event["event_data"]["state"], "triggered");
-        let note = service_call_payload(
-            8,
-            &ServiceCall {
-                epoch: 1,
-                entity_id: String::new(),
-                kind: CallKind::Service {
-                    domain: "persistent_notification".into(),
-                    service: "create".into(),
-                    data: json!({"message": "x"}),
-                },
-            },
-        )
-        .unwrap();
-        assert_eq!(note["type"], "call_service");
-        assert_eq!(note["domain"], "persistent_notification");
-        assert_eq!(note["service"], "create");
-        assert_eq!(note["service_data"]["message"], "x");
-    }
 
     #[test]
     fn sensor_rules_handle_binary_numeric_case_and_unavailable_states() {

@@ -645,7 +645,7 @@ impl Eeprom {
         }
     }
 
-    /// Default PC1832 zone attributes (Sections [101] to [132]) for a given zone
+    /// Default PC1832 zone attributes (Sections [101]–[132]) for a given zone
     /// definition code, applied automatically when Section [001] changes.
     /// Straight from the v4.6 manual's attribute table: 1 audible, 2 steady,
     /// 3 chime, 4 bypass, 5 force arm, 6 swinger shutdown, 7 transmission

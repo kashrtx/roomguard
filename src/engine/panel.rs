@@ -4017,7 +4017,7 @@ impl Panel {
         if self.home_sensor_unavailable {
             t |= tb::HOME_SENSOR;
         }
-        if self.physical_unavailable_since.is_some_and(|since| now.saturating_duration_since(since) >= HA_SUPERVISION_GRACE) {
+        if self.physical_unavailable_since.is_some_and(|since| now.saturating_duration_since(since) >= Duration::from_secs(8)) {
             t |= tb::HOME_PANEL;
         }
         if t == self.troubles {
@@ -4623,12 +4623,6 @@ impl Panel {
 }
 
 /// The trouble types, in the order each keypad numbers them.
-/// How long a Home Assistant sensor, or a linked panel, may stop reporting
-/// before it counts as a supervision trouble. A Home Assistant restart (an
-/// update or a reboot) takes a minute or two, and real panels likewise wait
-/// out a supervision window instead of faulting on the first gap.
-pub const HA_SUPERVISION_GRACE: Duration = Duration::from_secs(120);
-
 pub fn trouble_names(model: Model) -> Vec<(u32, &'static str)> {
     match model {
         Model::Pc1550 => vec![
