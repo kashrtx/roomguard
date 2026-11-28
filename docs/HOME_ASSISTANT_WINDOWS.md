@@ -113,13 +113,16 @@ To add the test lab sensors and virtual test alarm panel, you need a quick way t
    - **Lab temperature** (`input_number.roomguard_lab_temperature`)
    - **RoomGuard Test Panel** (`alarm_control_panel.roomguard_test_panel`)
 3. In RoomGuard, open **Settings -> Home Assistant** and scroll down to **Wireless sensors -> Zones**:
-   - Assign each sensor using the table below (RoomGuard fills in the recommended rule automatically when you select a sensor!):
+   - Assign each sensor using the table below (RoomGuard fills in the recommended rule, zone name, and zone type automatically when you select a sensor!):
 
    | Control to flip in Home Assistant Helpers | Sensor to pick in RoomGuard | Rule | Recommended Zone |
    | --- | --- | --- | --- |
    | **Lab door open** | **RoomGuard Test Door** (`binary_sensor.roomguard_test_door`) | `Is` `on` | `01 · Room Doorway` |
    | **Lab motion detected** | **RoomGuard Test Motion** (`binary_sensor.roomguard_test_motion`) | `Is` `on` | `02 · Room Motion` |
    | **Lab temperature** | **Lab temperature** (`input_number.roomguard_lab_temperature`) | `Above` `28` | `03 · Window` |
+
+   - **Adding more zones (Zones 09 to 48):** Need more than the 8 starter zones? Click **`+ Next unused`** right next to the zone picker (or pick any `(Unused - will enable)` slot), confirm the suggested **Zone type** and **Name zone** box, and click **Enable & assign**. RoomGuard enables that zone on the panel, names it, and connects your Home Assistant sensor in one click.
+   - **Hiding unused simulated zones:** Once your real sensors are assigned, click **`Disable X unused simulated zones`** under **Zone assignments** so the left-hand **Zones** sidebar only shows your real sensors (you can re-enable any zone anytime in **Settings -> Panel** or **Settings -> Home Assistant**).
 
 4. Now click **Lab door open** in Home Assistant Helpers and toggle it **ON** and **OFF**:
    - Watch the live dot under **Zone assignments** flip between **Closed** (green) and **OPEN** (amber).
@@ -135,9 +138,12 @@ To add the test lab sensors and virtual test alarm panel, you need a quick way t
 1. Make sure RoomGuard is **Disarmed**.
 2. Open **Settings -> Home Assistant** and find **Alarm panel sync**.
 3. Open the dropdown and select **`RoomGuard Test Panel (alarm_control_panel.roomguard_test_panel)`**.
-4. Pick **`Two-way sync (recommended)`**.
-5. In **HA panel PIN**, type **`1234`**.
-   - **Remember this PIN!** The test lab panel's disarm code is **`1234`** (the same as RoomGuard's default Master Code). If you changed `code:` inside `roomguard_lab.yaml` to something else (like `1357`), enter that exact code here instead.
+4. Pick **`Two-way sync (arm & disarm both)`**.
+5. **HA panel PIN:**
+   - **Recommended for real panels:** Leave **HA panel PIN** **blank**. RoomGuard forwards whatever code you type on its keypad straight to Home Assistant / ESPHome without storing your real code in plaintext config or YAML.
+   - **For this local Test Lab:** Leave it blank if your RoomGuard keypad code matches the test code in `roomguard_lab.yaml` (`1234`), or enter the test lab's PIN here if you use a different code on RoomGuard's keypad. You can also move the lab PIN into Home Assistant's `secrets.yaml` (`code: !secret roomguard_test_code`) or delete the `code:` line in `roomguard_lab.yaml` completely (RoomGuard's own keypad still checks your real salted/hashed Master Code before disarming).
+   - **Lockstep exit & entry timers:** Home Assistant's `manual` panel does not read your RoomGuard EEPROM delay settings, so RoomGuard automatically measures your linked panel's exact `arming_time` and `delay_time` on its first cycle and locks both countdowns together second-for-second (no skipping the last seconds!).
+   - **Open doors block arming:** Just like a real wall panel, if an assigned door or window zone is open, RoomGuard blocks arming from both RoomGuard's keypad and Home Assistant until the zone is closed or bypassed.
 
 ### Test A: Arm and Disarm from Home Assistant -> Watch RoomGuard Follow
 1. In Home Assistant, go to **Settings -> Devices & services -> Helpers**.
@@ -156,10 +162,13 @@ To add the test lab sensors and virtual test alarm panel, you need a quick way t
 4. Now disarm on **RoomGuard's virtual keypad** (`1234` on Classic/GuardSeries, or `1234` + `1` on VistaGuard 20P).
 5. Watch **`RoomGuard Test Panel`** in Home Assistant immediately switch to **Disarmed**!
 
-### Test C: Trigger an Entry Delay & Alarm
-1. Arm the panel from either side and wait 8 seconds until it is armed.
-2. Flip **Lab door open** ON in Home Assistant Helpers (to trigger RoomGuard's Zone 1 entry delay), **OR** open **Developer tools -> Actions**, run `alarm_control_panel.alarm_trigger` against `alarm_control_panel.roomguard_test_panel` to test a physical-panel entry delay and alarm.
-3. Disarm from **either** RoomGuard's keypad (`1234` / `12341`) **or** Home Assistant (`1234` -> **Disarm**).
+### Test C: Trigger an Entry Delay, Alarm, and Two-Way Bypass Sync
+1. **Two-way zone bypass:** Open **Lab door open** (Zone 1) in Home Assistant so the panel shows **Not ready**.
+   - On RoomGuard's keypad, bypass Zone 1 (`*101#` on GuardSeries, `*11#` on RmG Classic, or `1234` + `6` + `01` on VistaGuard 20P). Watch **`Lab bypassed zones`** (`input_text.roomguard_test_bypasses`) in Home Assistant Helpers automatically update to `BY:1`!
+   - Clear or edit **`Lab bypassed zones`** in Home Assistant (for example, type `BY:1,BY:3` or clear it to blank) and watch RoomGuard immediately mirror the bypassed zones on its keypad.
+2. **Entry delay & alarm:** Arm the panel from either side and wait 8 seconds until both RoomGuard and Home Assistant switch to **Armed** in lockstep (even if RoomGuard's local exit timer is longer or shorter than Home Assistant's).
+3. Flip **Lab door open** ON in Home Assistant Helpers (to trigger Zone 1's entry delay and alarm, which also flips `RoomGuard Test Panel` to **Triggered**), **OR** open **Developer tools -> Actions**, run `alarm_control_panel.alarm_trigger` against `alarm_control_panel.roomguard_test_panel` to test a physical-panel entry delay and alarm.
+4. Disarm from **either** RoomGuard's keypad (`1234` / `12341`) **or** Home Assistant (`1234` -> **Disarm**).
 
 ### Test D: Test Automatic Disconnect Detection
 1. In VirtualBox, pause the Home Assistant VM (or click **Disconnect** in RoomGuard).
@@ -172,7 +181,12 @@ To add the test lab sensors and virtual test alarm panel, you need a quick way t
 
 Once the lab works, connecting real hardware works the exact same way:
 
-- **Wireless sensors (Zigbee, Z-Wave, Thread/Matter, Wi-Fi, ESPHome, RF):** Pair your door/window contacts, PIR motion detectors, smoke/CO detectors, water leak sensors, smart locks, or garage covers in Home Assistant first. They appear automatically under **Settings -> Home Assistant -> Wireless sensors -> Zones** in RoomGuard. If a wireless sensor goes offline or runs out of battery (`unavailable`), RoomGuard raises a supervisory zone fault instead of a false burglary alarm.
-- **Real physical alarm panels:** Connect your physical panel to Home Assistant using a compatible bridge (such as Envisalink, DSC Keybus Interface, ESPHome VISTA ECP, or Alarmo) so it exposes an `alarm_control_panel.*` entity. Pick it under **Settings -> Home Assistant -> Alarm panel sync**:
-  - Choose **Two-way sync** to arm and disarm from both your real wall keypads and RoomGuard's virtual keypad.
-  - Choose **Follow physical panel only** if you want RoomGuard to stay a read-only display/room-guard mirror of your physical panel.
+- **Wireless sensors (Zigbee, Z-Wave, Thread/Matter, Wi-Fi, ESPHome, RF):** Pair your door/window contacts, PIR motion detectors, smoke/CO detectors, water leak sensors, smart locks, or garage covers in Home Assistant first. They appear automatically in the clean, searchable **Wireless sensors -> Zones** browser (with category filters for **Sensors**, **Doors & Motion**, **Cameras**, and **All**). Click any sensor, use **`+ Next unused`** to add new zones with auto-suggested zone types and inline zone names in one click, and click **Disable unused simulated zones** to keep the sidebar focused on your actual sensors. If a wireless sensor goes offline or runs out of battery (`unavailable`), RoomGuard raises a supervisory zone fault instead of a false burglary alarm.
+- **Home Assistant sirens & alarm outputs (two-way):** Under **Settings -> Home Assistant -> Sirens & alarm outputs**, click any real Zigbee/Z-Wave/Wi-Fi/ESPHome siren (`siren.*`), smart relay/plug (`switch.*`), strobe (`light.*`), or lab toggle (`input_boolean.roomguard_lab_siren`) in the dropdown (or click **`+ Quick-link Lab siren`**) to link it immediately. RoomGuard automatically turns linked outputs ON whenever RoomGuard's alarm siren sounds and turns them OFF when disarmed, AND manually turning a linked siren switch ON in Home Assistant immediately sounds RoomGuard's PC siren live (with a one-click **Silence** button in the top bar and Settings).
+- **Real physical alarm panels (and avoiding conflicts):** Connect your physical panel to Home Assistant using a compatible bridge (such as Envisalink, ESPHome Keybus Interface, ESPHome ECP, or Alarmo) so it exposes an `alarm_control_panel.*` entity (or an ESPHome partition status `sensor.*` entity directly). Notice that on a real ESPHome bridge you do **not** put your real alarm code in plain YAML: Home Assistant's template panel uses `code: '{{ code }}'` so your physical panel validates whatever code you type on the keypad (and any optional ESPHome fallback stays inside `secrets.yaml` via `!secret access_code`). Under **Settings -> Home Assistant -> Alarm panel sync**, choose the mode that matches how you want RoomGuard to behave:
+  - **Do not sync with a real panel (Independent):** Keeps RoomGuard 100% separate so it never touches or conflicts with your existing house alarm.
+  - **Two-way sync (arm & disarm both):** Lets you arm, disarm, and bypass zones from both your real wall keypads and RoomGuard's virtual keypad. Exit and entry delays stay in lockstep with the real panel so neither side finishes early or drifts out of sync.
+  - **Follow real panel only (read-only):** RoomGuard shows the real panel's state without ever sending arm or disarm commands to it.
+  - **Automatic ESPHome Keybus / ECP integration:** When an ESPHome bridge exposes `sensor.*_zone_status` (`zs`), `fa_1`/`fire_1`, `armi_1`, and `esphome.<node>_alarm_keypress` / `set_alarm_state` services, RoomGuard auto-detects them to mirror real-panel bypasses, alarmed zones, Instant/Night/Away modes, and fire alarms (Temporal-3) two-way with zero extra YAML.
+  - **Preventing double alarms:** When linked to a real panel whose sensors are also mapped into RoomGuard zones, check **Real panel handles alarms for Home Assistant zones (prevent double alarms)**. RoomGuard will still show live open/closed zone status, bypasses, and play Door Chime / voice chimes, while letting your real panel handle entry delays and alarms without duplicate sirens.
+  - **Match your real zone list:** Open the flip-down door on your real wall keypad and copy the zone numbers, names, and types written by your installer directly into **Settings -> Panel -> Zone programming** or **Settings -> Home Assistant -> Wireless sensors -> Zones**.

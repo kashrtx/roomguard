@@ -2789,7 +2789,7 @@ fn two_way_home_assistant_panel_sync_controls_both_sides_without_loops() {
         assert!(
             p.out.iter().any(|o| matches!(
                 o,
-                Out::HaPanelCmd(HaPanelCmd::Arm { mode: ArmMode::Away, night: false, code: Some(c) }) if c == "1234"
+                Out::HaPanelCmd(HaPanelCmd::Arm { mode: ArmMode::Away, night: false, code: Some(c), .. }) if c == "1234"
             )),
             "{model:?} must send outbound Arm Away command to HA"
         );
@@ -2964,4 +2964,549 @@ fn pc1550_hex_mode_0_to_5_and_distinct_zone_led_flash_cadences() {
     assert_eq!(p.leds_1550(t0 + secs(148))[5 + 2], Led::Fast, "post-disarm alarm memory zone must fast-flash");
     keys(&mut p, "*3", t0 + secs(150));
     assert_eq!(p.leds_1550(t0 + secs(150))[5 + 2], Led::Fast, "*3 alarm memory zone must fast-flash");
+}
+
+#[test]
+fn mirrored_ha_zones_display_and_chime_without_firing_duplicate_alarms() {
+    use crate::home_assistant::{AlarmState, PanelLink};
+    let t0 = Instant::now();
+    for model in [Model::Pc1550, Model::Pc1832, Model::Vista20p] {
+        let mut p = panel(model);
+        p.set_panel_link(PanelLink::TwoWay, t0);
+        p.ha_zone_mirror_only = true;
+        p.home_zone[0] = true; // Zone 1 (Delay) comes from real panel via HA
+        p.home_zone[5] = true; // Zone 6 (24h Fire) comes from real panel via HA
+        p.chime = true;
+
+        // 1. Disarmed: opening mirrored HA Zone 1 updates live keypad zone state AND chimes.
+        p.out.clear();
+        p.set_zone(1, true, false, false, t0 + secs(1));
+        assert!(p.zones[0].open, "{model:?} mirrored HA zone must still display open");
+        assert!(
+            p.out.iter().any(|o| matches!(o, Out::Audio(AudioCmd::Chime(_) | AudioCmd::Speak(_)))),
+            "{model:?} mirrored HA zone must still chime when disarmed"
+        );
+        p.set_zone(1, false, false, false, t0 + secs(2));
+
+        // 2. Armed via linked real panel: opening mirrored HA Zone 1 or 24h Zone 6 must NOT fire duplicate local alarms/entry!
+        p.sync_physical_panel(Some(AlarmState::Away), true, t0 + secs(4));
+        assert!(p.armed.is_some());
+        p.out.clear();
+        p.set_zone(1, true, false, false, t0 + secs(6));
+        p.set_zone(6, true, false, false, t0 + secs(7));
+        p.tick(t0 + secs(8), 0);
+        assert!(p.zones[0].open && p.zones[5].open, "{model:?} mirrored HA zones keep live open state while armed");
+        assert!(p.entry.is_none(), "{model:?} mirrored HA zone must NOT start duplicate RoomGuard entry delay");
+        assert!(p.alarms.is_empty(), "{model:?} mirrored HA zone must NOT fire duplicate RoomGuard alarm");
+
+        // 3. Meanwhile, a local non-HA zone (Zone 3 Instant) STILL triggers RoomGuard's local alarm!
+        p.set_zone(3, true, false, false, t0 + secs(10));
+        p.tick(t0 + secs(11), 0);
+        assert!(!p.alarms.is_empty(), "{model:?} non-HA local zone must still alarm normally");
+    }
+}
+
+#[test]
+fn ha_sensor_suggested_zone_codes_match_panel_models() {
+    let make = |id: &str, name: &str, dc: Option<&str>| -> crate::home_assistant::Entity {
+        let dc_json = dc.map(|d| format!(r#","device_class":"{d}""#)).unwrap_or_default();
+        serde_json::from_str(&format!(
+            r#"{{"entity_id":"{id}","state":"off","attributes":{{"friendly_name":"{name}"{dc_json}}}}}"#
+        ))
+        .expect("valid entity json")
+    };
+    let door = make("binary_sensor.front_door", "Front Door", Some("door"));
+    let motion = make("binary_sensor.hall_pir", "Hallway Motion", Some("motion"));
+    let window = make("binary_sensor.kitchen_window", "Kitchen Window", Some("window"));
+    let smoke = make("binary_sensor.upstairs_smoke", "Upstairs Smoke", Some("smoke"));
+    let co = make("binary_sensor.basement_co", "Basement CO", Some("carbon_monoxide"));
+    let water = make("binary_sensor.sink_leak", "Sink Leak", Some("moisture"));
+
+    assert_eq!(door.suggested_zone_code(Model::Pc1832), "01");
+    assert_eq!(motion.suggested_zone_code(Model::Pc1832), "05");
+    assert_eq!(window.suggested_zone_code(Model::Pc1832), "03");
+    assert_eq!(smoke.suggested_zone_code(Model::Pc1832), "08");
+    assert_eq!(co.suggested_zone_code(Model::Pc1832), "41");
+    assert_eq!(water.suggested_zone_code(Model::Pc1832), "19");
+
+    assert_eq!(door.suggested_zone_code(Model::Vista20p), "01");
+    assert_eq!(motion.suggested_zone_code(Model::Vista20p), "04");
+    assert_eq!(window.suggested_zone_code(Model::Vista20p), "03");
+    assert_eq!(smoke.suggested_zone_code(Model::Vista20p), "09");
+    assert_eq!(co.suggested_zone_code(Model::Vista20p), "14");
+    assert_eq!(water.suggested_zone_code(Model::Vista20p), "07");
+
+    assert_eq!(door.suggested_zone_code(Model::Pc1550), "00");
+    assert_eq!(motion.suggested_zone_code(Model::Pc1550), "03");
+    assert_eq!(window.suggested_zone_code(Model::Pc1550), "01");
+    assert_eq!(smoke.suggested_zone_code(Model::Pc1550), "08");
+    assert_eq!(co.suggested_zone_code(Model::Pc1550), "04");
+    assert_eq!(water.suggested_zone_code(Model::Pc1550), "04");
+}
+
+#[test]
+fn pc1550_zone_9_is_null_and_disabled_zones_stay_ready() {
+    let t0 = Instant::now();
+    let mut p = panel(Model::Pc1550);
+    // Disable Zone 3 by setting its zone definition digit 2 to '9' in section [11].
+    p.ee.sections.insert("11".into(), "000309000308".into());
+    assert_eq!(p.cfg(3).kind, ZoneKind::Null);
+    p.set_zone(3, true, false, false, t0);
+    assert!(p.ready(), "PC1550 disabled ('9') zone must not block Ready to Arm even if open");
+}
+
+#[test]
+fn two_way_ha_blocks_arming_with_open_door_and_reconciles_drifted_disarm() {
+    use crate::engine::panel::HaPanelCmd;
+    use crate::home_assistant::{AlarmState::*, PanelLink};
+
+    for model in [Model::Pc1550, Model::Pc1832, Model::Vista20p] {
+        let t0 = Instant::now();
+        let mut p = panel(model);
+        p.set_panel_link(PanelLink::TwoWay, t0);
+        p.sync_physical_panel(Some(Disarmed), false, t0);
+
+        // 1. Open Zone 1 (Delay 1 door): Home Assistant tries to Arm Away -> MUST be blocked AND send Disarm back!
+        p.set_zone(1, true, false, false, t0 + secs(1));
+        assert!(!p.ready(), "{model:?} must not be ready when Zone 1 door is open");
+        p.out.clear();
+        p.sync_physical_panel(Some(Arming), true, t0 + secs(2));
+        assert!(!p.is_on(), "{model:?} must NOT arm from HA while Zone 1 door is open");
+        assert!(
+            p.out.iter().any(|o| matches!(o, Out::HaPanelCmd(HaPanelCmd::Disarm { .. }))),
+            "{model:?} must send Disarm back to HA to cancel arming with open door"
+        );
+        // Even if HA immediately jumped to Away while door is open (after outbound grace expires), still blocked!
+        p.out.clear();
+        p.sync_physical_panel(Some(Away), true, t0 + secs(6));
+        assert!(!p.is_on(), "{model:?} must block HA Away while door is open");
+
+        // 2. Close Zone 1 -> Arm from RoomGuard -> if HA stays Disarmed after grace window,
+        //    re-syncing `Disarmed` (even though previous physical_state was already Disarmed!) MUST disarm RoomGuard!
+        p.set_zone(1, false, false, false, t0 + secs(8));
+        assert!(p.ready());
+        p.out.clear();
+        if model == Model::Vista20p {
+            keys(&mut p, "12342", t0 + secs(9));
+        } else {
+            keys(&mut p, "1234", t0 + secs(9));
+        }
+        assert!(p.is_on(), "{model:?} should start arming locally");
+        // After 3s outbound window expires (t0 + 13s), periodic HA refresh reports Disarmed -> RoomGuard reconciles!
+        p.sync_physical_panel(Some(Disarmed), true, t0 + secs(13));
+        assert!(!p.is_on(), "{model:?} must reconcile back to Disarmed when live HA state is Disarmed");
+    }
+}
+
+#[test]
+fn ha_triggered_and_external_siren_sound_pc_bell_and_esphome_helpers_work() {
+    use crate::home_assistant::{AlarmState, Entity, PanelLink};
+
+    // 1. AlarmState parses ESPHome DSC/Vista partition states (`ready`, `not_ready`, `armed_stay`, etc.).
+    assert_eq!(AlarmState::parse("ready"), Some(AlarmState::Disarmed));
+    assert_eq!(AlarmState::parse("not_ready"), Some(AlarmState::Disarmed));
+    assert_eq!(AlarmState::parse("exit_delay"), Some(AlarmState::Arming));
+    assert_eq!(AlarmState::parse("entry_delay"), Some(AlarmState::Pending));
+    assert_eq!(AlarmState::parse("armed_instant"), Some(AlarmState::StayInstant));
+    assert_eq!(AlarmState::parse("armed_maximum"), Some(AlarmState::AwayMax));
+
+    // 2. ESPHome zone hints (`_z1`, `_z17`) and siren/bell binary_sensor detection.
+    let z17: Entity = serde_json::from_str(
+        r#"{"entity_id":"binary_sensor.dscalarm_top_floor_motion_z17","state":"off","attributes":{"friendly_name":"Top floor motion z17","device_class":"motion"}}"#,
+    )
+    .unwrap();
+    assert_eq!(z17.esphome_zone_hint(32), Some(17));
+    assert_eq!(z17.esphome_zone_hint(6), None);
+
+    let esp_fire: Entity = serde_json::from_str(
+        r#"{"entity_id":"binary_sensor.vistaalarm_fire_partition_1","state":"on","attributes":{"friendly_name":"Fire partition 1","device_class":"smoke"}}"#,
+    )
+    .unwrap();
+    assert!(esp_fire.is_output());
+    assert!(esp_fire.is_fire_output());
+    assert!(!esp_fire.is_writable_output());
+
+    let sun_ts: Entity = serde_json::from_str(
+        r#"{"entity_id":"sensor.sun_next_dusk","state":"2026-11-27T18:44:21+00:00","attributes":{"friendly_name":"Sun Next dusk","device_class":"timestamp"}}"#,
+    )
+    .unwrap();
+    assert!(!sun_ts.is_sensor_candidate(), "Sun/timestamp noise must be hidden from default Sensors tab");
+
+    // 3. External HA siren (e.g. Lab siren toggle or ESPHome alarm) and HA `Triggered` state sound RoomGuard's bell!
+    let t0 = Instant::now();
+    let mut p = panel(Model::Pc1832);
+    p.set_panel_link(PanelLink::TwoWay, t0);
+    p.sync_physical_panel(Some(AlarmState::Disarmed), false, t0);
+    p.ha_external_siren = Some(BellPattern::Steady);
+    p.tick(t0 + secs(1), 0);
+    assert_eq!(p.bell_sent, BellPattern::Steady, "external HA siren ON must sound PC siren");
+    assert!(!p.local_bell_active(t0 + secs(1)), "external HA siren must not count as local bell (loop guard)");
+    p.ha_external_siren = None;
+    p.tick(t0 + secs(2), 0);
+    assert_eq!(p.bell_sent, BellPattern::Off, "external HA siren OFF must silence PC siren");
+
+    p.sync_physical_panel(Some(AlarmState::Triggered), true, t0 + secs(3));
+    p.tick(t0 + secs(4), 0);
+    assert_eq!(p.bell_sent, BellPattern::Steady, "HA Triggered alarm panel must sound PC siren");
+}
+
+#[test]
+fn lockstep_exit_and_entry_delays_stay_synced_with_real_panel() {
+    use crate::engine::panel::HaPanelCmd;
+    use crate::home_assistant::{AlarmState::*, PanelLink};
+
+    for model in [Model::Pc1550, Model::Pc1832, Model::Vista20p] {
+        let t0 = Instant::now();
+        let mut p = panel(model);
+        p.set_panel_link(PanelLink::TwoWay, t0);
+        p.sync_physical_panel(Some(Disarmed), false, t0);
+
+        // 1. RoomGuard initiates arming, real panel has a LONGER exit delay (200s > RG's local 60/120s):
+        //    RoomGuard must HOLD in exit delay while HA is `Arming`, and transition to Armed at the exact
+        //    moment HA transitions to `Away`!
+        if model == Model::Vista20p {
+            keys(&mut p, "12342", t0 + secs(1));
+        } else {
+            keys(&mut p, "1234", t0 + secs(1));
+        }
+        assert!(p.exit.is_some());
+        p.sync_physical_panel(Some(Arming), true, t0 + secs(2));
+        p.tick(t0 + secs(180), 0);
+        assert!(
+            p.exit.is_some() && p.armed.is_none(),
+            "{model:?} must hold in exit delay while linked real panel is still Arming"
+        );
+        p.sync_physical_panel(Some(Away), true, t0 + secs(200));
+        assert!(p.exit.is_none() && p.armed.is_some_and(|a| a.mode == ArmMode::Away));
+
+        // 2. Entry delay lockstep: Door opens locally AND real panel reports Pending (longer delay):
+        //    RoomGuard must NOT alarm before real panel triggers, and MUST immediately trigger on exact zone
+        //    when real panel transitions to Triggered!
+        p.set_zone(1, true, false, false, t0 + secs(210));
+        assert!(p.entry.is_some());
+        p.sync_physical_panel(Some(Pending), true, t0 + secs(211));
+        p.tick(t0 + secs(260), 0); // past RG's 30s entry delay
+        assert!(
+            p.entry.is_some() && p.alarms.is_empty(),
+            "{model:?} must hold entry delay while linked real panel is still Pending"
+        );
+        p.sync_physical_panel(Some(Triggered), true, t0 + secs(265));
+        assert!(p.entry.is_none(), "{model:?} entry delay finishes when real panel triggers");
+        assert!(
+            p.alarms.iter().any(|a| a.zone == 1 && a.kind == AlarmKind::Burglary),
+            "{model:?} must alarm on exact violated Zone 1 when real panel triggers"
+        );
+
+        // Disarm clears everything cleanly.
+        p.set_zone(1, false, false, false, t0 + secs(266));
+        p.sync_physical_panel(Some(Disarmed), true, t0 + secs(270));
+        assert!(!p.is_on() && p.alarms.is_empty());
+
+        // 3. Real panel has SHORTER exit delay (8s): RoomGuard snaps to Armed immediately at t=8s!
+        if model == Model::Vista20p {
+            keys(&mut p, "12342", t0 + secs(280));
+        } else {
+            keys(&mut p, "1234", t0 + secs(280));
+        }
+        p.sync_physical_panel(Some(Arming), true, t0 + secs(281));
+        p.sync_physical_panel(Some(Away), true, t0 + secs(288));
+        assert!(p.exit.is_none() && p.armed.is_some_and(|a| a.mode == ArmMode::Away));
+        p.sync_physical_panel(Some(Disarmed), true, t0 + secs(290));
+
+        // 4. Instant & Maximum from real panel preserve `no_entry = true`!
+        p.sync_physical_panel(Some(StayInstant), true, t0 + secs(300));
+        assert!(p.armed.is_some_and(|a| a.mode == ArmMode::Stay && a.no_entry));
+        p.sync_physical_panel(Some(AwayMax), true, t0 + secs(305));
+        assert!(p.armed.is_some_and(|a| a.mode == ArmMode::Away && a.no_entry));
+        p.sync_physical_panel(Some(Disarmed), true, t0 + secs(310));
+    }
+
+    // 5. PC1832 [*][1] Stay -> Away sends outbound Arm Away to HA!
+    let t0 = Instant::now();
+    let mut p = panel(Model::Pc1832);
+    p.set_panel_link(PanelLink::TwoWay, t0);
+    p.sync_physical_panel(Some(Stay), false, t0);
+    p.out.clear();
+    keys(&mut p, "*1", t0 + secs(5));
+    assert!(
+        p.out.iter().any(|o| matches!(o, Out::HaPanelCmd(HaPanelCmd::Arm { mode: ArmMode::Away, night: false, .. }))),
+        "PC1832 [*][1] Stay->Away must forward Arm Away to HA"
+    );
+}
+
+#[test]
+fn two_way_bypass_sync_and_esphome_zone_status_parsing_work_both_ways() {
+    use crate::engine::panel::HaBypassCmd;
+    use crate::home_assistant::{self as ha, AlarmState, PanelLink};
+
+    // 1. ESPHome `zs` parser & service/companion auto-detection.
+    let snap = ha::parse_zone_status("OP:1,BY:3,BY:5,AL:2,TA:4,CK:6", 32, false);
+    assert!(snap.open.contains(&1));
+    assert!(snap.bypassed.contains(&3) && snap.bypassed.contains(&5));
+    assert!(snap.alarmed.contains(&2));
+    assert!(snap.tampered.contains(&4));
+    assert!(snap.faulted.contains(&6));
+
+    let lab = ha::parse_zone_status("1, 3, BY:5", 32, true);
+    assert_eq!(lab.bypassed.iter().copied().collect::<Vec<_>>(), vec![1, 3, 5]);
+    assert_eq!(ha::format_bypass_list(&[1, 3]), "BY:1,BY:3");
+
+    let svcs = vec![
+        "dscalarm_alarm_keypress_partition".to_string(),
+        "dscalarm_set_alarm_state".to_string(),
+    ];
+    assert_eq!(
+        ha::detect_esphome_prefix("sensor.dscalarm_status_partition_1", &svcs).as_deref(),
+        Some("dscalarm")
+    );
+    assert_eq!(ha::detect_partition("sensor.dscalarm_status_partition_2"), 2);
+
+    // 2. Real panel -> RoomGuard bypass reflection: bypassing open Zone 3 on real panel makes
+    //    RoomGuard ready to arm and unbypassing restores it!
+    let t0 = Instant::now();
+    let mut p = panel(Model::Pc1832);
+    p.set_panel_link(PanelLink::TwoWay, t0);
+    p.sync_physical_panel(Some(AlarmState::Disarmed), false, t0);
+    p.set_zone(3, true, false, false, t0 + secs(1));
+    assert!(!p.ready(), "open Zone 3 blocks arming before bypass");
+
+    p.sync_ha_bypasses(&[3], &[], false, true, t0 + secs(2));
+    assert!(p.zones[2].bypassed && !p.zones[2].auto_bypass, "real panel BY:3 must bypass Zone 3 in RoomGuard");
+    assert!(p.ready(), "bypassed open Zone 3 must allow arming");
+
+    p.sync_ha_bypasses(&[], &[], false, true, t0 + secs(3));
+    assert!(!p.zones[2].bypassed, "clearing real panel BY:3 must unbypass Zone 3 in RoomGuard");
+
+    // 3. RoomGuard -> Real panel bypass emission (PC1832 *103# and *100#; Vista 1234603 and 1234600).
+    p.out.clear();
+    keys(&mut p, "*103#", t0 + secs(4));
+    assert!(p.zones[2].bypassed);
+    assert!(
+        p.out.iter().any(|o| matches!(o, Out::HaBypassCmd(HaBypassCmd::SetZone { zone: 3, bypassed: true, .. }))),
+        "PC1832 keypad bypass must emit HaBypassCmd::SetZone"
+    );
+    // Stale empty HA bypass refresh within 3s echo guard must NOT undo the local bypass!
+    p.sync_ha_bypasses(&[], &[], false, true, t0 + secs(5));
+    assert!(p.zones[2].bypassed, "echo guard must protect outbound bypass from stale HA refresh");
+
+    p.out.clear();
+    keys(&mut p, "*100#", t0 + secs(6));
+    assert!(
+        p.out.iter().any(|o| matches!(o, Out::HaBypassCmd(HaBypassCmd::ClearAll { .. }))),
+        "PC1832 *100# must emit HaBypassCmd::ClearAll"
+    );
+
+    // 4. Physical panel fire alarm with AL:6 displays Fire Zone 6 and sounds Temporal-3!
+    p.ee.sections.insert("013".into(), "35678".into()); // Temporal-3 fire enabled
+    p.sync_ha_bypasses(&[], &[6], true, false, t0 + secs(10));
+    p.sync_physical_panel(Some(AlarmState::Triggered), true, t0 + secs(10));
+    p.tick(t0 + secs(11), 0);
+    assert_eq!(p.bell_sent, BellPattern::Temporal3, "real panel fire alarm must sound Temporal-3");
+    assert_eq!(p.lcd_1832(t0 + secs(11), 0).lines[0].trim(), "Fire Zone");
+    assert_eq!(p.lcd_1832(t0 + secs(11), 0).lines[1].trim(), "Smoke Detector");
+
+    // Vista bypass emission with user code preserved.
+    let mut v = panel(Model::Vista20p);
+    v.set_panel_link(PanelLink::TwoWay, t0);
+    v.sync_physical_panel(Some(AlarmState::Disarmed), false, t0);
+    v.out.clear();
+    keys(&mut v, "1234603", t0 + secs(1));
+    assert!(v.zones[2].bypassed);
+    assert!(
+        v.out.iter().any(|o| matches!(
+            o,
+            Out::HaBypassCmd(HaBypassCmd::SetZone { zone: 3, bypassed: true, code: Some(c) }) if c == "1234"
+        )),
+        "Vista bypass must emit HaBypassCmd::SetZone with 4-digit code"
+    );
+}
+
+#[test]
+fn cross_zoning_multi_zone_alarms_and_vista_panic_match_manuals() {
+    let t0 = Instant::now();
+
+    // 1. PC1832 Cross-Zoning ([018] opt 6 + [103]/[104] opt 9 + [176] timer) & Double-Hit ([017] opt 4).
+    let mut p = panel(Model::Pc1832);
+    p.ee.sections.insert("001".into(), "01050303050802040000000000000000".into()); // Z3 & Z4 Instant
+    p.ee.sections.insert("018".into(), "6".into()); // Cross Zoning ON
+    p.ee.sections.insert("103".into(), "123469".into()); // Z3 Cross-Zoned
+    p.ee.sections.insert("104".into(), "123469".into()); // Z4 Cross-Zoned
+    p.ee.sections.insert("176".into(), "030".into()); // 30s cross-zone timer
+    p.arm(ArmHow::AwayKey, 40, t0);
+    p.tick(t0 + secs(130), 0);
+    assert!(p.armed.is_some());
+
+    // First trip on Z3 waits (no burglary alarm yet).
+    p.set_zone(3, true, false, false, t0 + secs(140));
+    assert!(p.alarms.is_empty(), "single cross-zoned trip must wait for verification");
+    p.set_zone(3, false, false, false, t0 + secs(142));
+    // Re-tripping Z3 alone while Double-Hit ([017] opt 4) is OFF does NOT alarm!
+    p.set_zone(3, true, false, false, t0 + secs(145));
+    assert!(p.alarms.is_empty(), "same zone re-trip must not alarm with Double-Hit OFF");
+    // Tripping Z4 within 30s verifies cross-zone and triggers BOTH Z3 and Z4!
+    p.set_zone(4, true, false, false, t0 + secs(150));
+    assert!(p.alarms.iter().any(|a| a.zone == 3), "cross-zone must alarm first zone (Z3)");
+    assert!(p.alarms.iter().any(|a| a.zone == 4), "cross-zone must alarm second zone (Z4)");
+
+    // With Double-Hit ON ([017] opt 4), re-tripping Z3 within 30s alarms immediately!
+    keys(&mut p, "1234", t0 + secs(155));
+    p.set_zone(3, false, false, false, t0 + secs(156));
+    p.set_zone(4, false, false, false, t0 + secs(156));
+    p.ee.sections.insert("017".into(), "14".into()); // Double-Hit ON
+    p.arm(ArmHow::AwayKey, 40, t0 + secs(160));
+    p.tick(t0 + secs(290), 0);
+    p.set_zone(3, true, false, false, t0 + secs(300));
+    assert!(p.alarms.is_empty());
+    p.set_zone(3, false, false, false, t0 + secs(302));
+    p.set_zone(3, true, false, false, t0 + secs(305));
+    assert!(p.alarms.iter().any(|a| a.zone == 3), "Double-Hit ON must trigger on 2nd trip of same zone");
+
+    // 2. VISTA-20P: Fire detector on Zone 08 displays FIRE 08 (NOT Zone 95!), while Keypad [A]
+    //    displays FIRE 95 (configurable/disableable via panic types), *32 continuous fire, and *85 cross-zone!
+    let mut v = panel(Model::Vista20p);
+    let mut z56 = v.ee.raw(Model::Vista20p, "56");
+    z56.replace_range(14..16, "09"); // Zone 08 = Type 09 Fire
+    z56.replace_range(6..8, "03");   // Zone 04 = Type 03 Perimeter
+    v.ee.sections.insert("56".into(), z56);
+    v.ee.sections.insert("32".into(), "1".into()); // Fire Sounder Timeout = No timeout (continuous)
+    v.ee.sections.insert("33".into(), "1".into()); // Normal bell timeout = 4 min
+
+    // Fire sensor on Zone 08 trips -> displays FIRE 08 (never FIRE 95!) and rings past 4-min bell timeout!
+    v.set_zone(8, true, false, false, t0);
+    assert!(v.lcd_vista(t0, 0).lines[0].starts_with("FIRE 08"), "wired fire sensor on Zone 08 must show FIRE 08");
+    v.tick(t0 + secs(600), 0); // 10 min > 4 min bell timeout
+    assert_eq!(v.bell_sent, BellPattern::Temporal3, "Vista *32=1 fire sounder must stay continuous past *33 timeout");
+    v.set_zone(8, false, false, false, t0 + secs(601));
+    keys(&mut v, "12341", t0 + secs(602));
+    keys(&mut v, "12341", t0 + secs(604));
+
+    // Holding Keypad [A] Fire panic fires Zone 95 by default, and respects disabling ("00") in panic config!
+    v.ee.sections.insert("panic".into(), "000806".into()); // 95 disabled, 96 aux, 99 silent police
+    v.key(Key::Fire, true, t0 + secs(610));
+    v.tick(t0 + secs(613), 0);
+    v.key(Key::Fire, false, t0 + secs(613));
+    assert!(v.alarms.is_empty(), "Vista Zone 95 disabled (00) must not trigger Fire panic");
+    v.key(Key::Panic, true, t0 + secs(615));
+    v.tick(t0 + secs(618), 0);
+    v.key(Key::Panic, false, t0 + secs(618));
+    assert!(
+        v.alarms.iter().any(|a| a.zone == 99 && !a.audible),
+        "Vista Zone 99 programmed as 06 must be 24h silent panic"
+    );
+
+    // VISTA-20P *85 Cross-Zone with Zone List 04 (Zones 3 & 4) + multi-alarm display cycling!
+    keys(&mut v, "12341", t0 + secs(620));
+    keys(&mut v, "12341", t0 + secs(622));
+    v.ee.sections.insert("zone_list_04".into(), ((1u64 << 2) | (1u64 << 3)).to_string()); // Z3 & Z4
+    v.ee.sections.insert("85".into(), "01".into()); // 30s cross-zone timer
+    v.arm(ArmHow::AwayKey, 2, t0 + secs(630));
+    v.tick(t0 + secs(700), 0);
+    v.set_zone(3, true, false, false, t0 + secs(710));
+    assert!(v.alarms.is_empty(), "Vista Zone List 04 first trip must wait for second zone");
+    v.set_zone(4, true, false, false, t0 + secs(720));
+    assert!(v.alarms.iter().any(|a| a.zone == 3) && v.alarms.iter().any(|a| a.zone == 4));
+    let l_a = v.lcd_vista(t0 + secs(720), 0).lines[0].clone();
+    let l_b = v.lcd_vista(t0 + secs(723), 0).lines[0].clone();
+    assert_ne!(l_a, l_b, "Vista LCD must cycle between multiple simultaneous alarmed zones");
+
+    // 3. PC1550 physical Arming exit beeps obey section [34] option 1 (not [12] option 5).
+    let mut c = panel(Model::Pc1550);
+    c.set_panel_link(crate::home_assistant::PanelLink::TwoWay, t0);
+    c.sync_physical_panel(Some(crate::home_assistant::AlarmState::Arming), true, t0);
+    c.tick(t0 + secs(1), 0);
+    assert_eq!(c.sounder_sent, Pattern::Off, "PC1550 [34] opt 1 OFF = silent exit delay");
+    c.ee.sections.insert("34".into(), "14".into());
+    c.tick(t0 + secs(2), 0);
+    assert_ne!(c.sounder_sent, Pattern::Off, "PC1550 [34] opt 1 ON = audible exit delay during physical Arming");
+}
+
+#[test]
+fn learned_ha_timers_prevent_early_exit_skip_and_external_siren_status_works() {
+    use crate::engine::panel::HaExpect;
+    use crate::home_assistant::{self as ha, AlarmState::*, PanelLink};
+
+    // 1. Entity parsing for HA manual/Alarmo `next_state`, `delay`, and `is_output_on()`.
+    let manual_arming: ha::Entity = serde_json::from_str(
+        r#"{"entity_id":"alarm_control_panel.roomguard_test_panel","state":"arming","attributes":{"friendly_name":"RoomGuard Test Panel","next_state":"armed_away","delay":12}}"#,
+    )
+    .unwrap();
+    assert_eq!(manual_arming.alarm_next_state(), Some(Away));
+    assert_eq!(manual_arming.alarm_delay_secs(), Some(12));
+
+    let siren_on: ha::Entity = serde_json::from_str(
+        r#"{"entity_id":"input_boolean.roomguard_lab_siren","state":"on","attributes":{"friendly_name":"Lab siren output"}}"#,
+    )
+    .unwrap();
+    assert!(siren_on.is_output_on());
+
+    // 2. Learning HA panel's exact exit & entry durations keeps RoomGuard's countdown in lockstep
+    //    (zero skipped seconds on subsequent arms even when HA arming_time=8 != EEPROM 60/120s).
+    let t0 = Instant::now();
+    let mut v = panel(Model::Vista20p);
+    v.ee.sections.insert("197".into(), "1".into()); // Show 1-second exit countdown on Vista LCD
+    v.set_panel_link(PanelLink::TwoWay, t0);
+    v.sync_physical_panel(Some(Disarmed), false, t0);
+
+    // First cycle: HA arms with 8s exit delay -> RoomGuard learns ha_learned_exit_away = 8s.
+    keys(&mut v, "12342", t0 + secs(1));
+    v.sync_physical_panel_meta(Some(Arming), Some(Away), None, None, true, t0 + secs(2));
+    v.sync_physical_panel_meta(Some(Away), None, None, None, true, t0 + secs(10));
+    assert_eq!(v.ha_learned_exit_away, Some(8), "RoomGuard must learn HA Away exit delay (8s)");
+    assert_eq!(v.armed.unwrap().user, 2, "arm_from_physical must preserve the user who armed on RoomGuard");
+
+    // Local entry delay + HA Pending: status() must still show local Zone 1 countdown (not generic Physical entry).
+    v.set_zone(1, true, false, false, t0 + secs(20));
+    v.sync_physical_panel_meta(Some(Pending), None, None, None, true, t0 + secs(21));
+    let (st, title, detail) = v.status(t0 + secs(22));
+    assert_eq!(st, StatusKind::Entry);
+    assert_eq!(title, "Entry delay");
+    assert!(detail.contains("Zone 1"), "lockstep entry status must preserve local zone detail: {detail}");
+    // HA triggers 8s later -> learns ha_learned_entry = 8s.
+    v.sync_physical_panel_meta(Some(Triggered), None, None, None, true, t0 + secs(29));
+    assert_eq!(v.ha_learned_entry, Some(8), "RoomGuard must learn HA entry delay (8s)");
+
+    // Disarm and arm again from RoomGuard: exit countdown immediately starts at exact 8s!
+    v.set_zone(1, false, false, false, t0 + secs(30));
+    v.sync_physical_panel(Some(Disarmed), true, t0 + secs(31));
+    keys(&mut v, "12342", t0 + secs(35));
+    assert_eq!(
+        v.exit.unwrap().dur,
+        secs(8),
+        "second arm must start directly at learned 8s so countdown hits 0 in lockstep with HA"
+    );
+    // When HA confirms Arming 1s later, ex.started re-anchors so network lag doesn't drift!
+    v.sync_physical_panel_meta(Some(Arming), Some(Away), None, None, true, t0 + secs(36));
+    assert_eq!(v.exit.unwrap().started, t0 + secs(36));
+    assert_eq!(v.lcd_vista(t0 + secs(36), 0).lines[1].trim(), "May Exit Now 08");
+    v.sync_physical_panel(Some(Disarmed), true, t0 + secs(40));
+
+    // 3. HA-initiated Arming with explicit delay shows synced countdown & urgency beeps without inventing ExitRt.
+    v.sync_physical_panel_meta(Some(Arming), Some(Away), Some(12), None, true, t0 + secs(50));
+    assert!(v.exit.is_none());
+    let (st, _, detail) = v.status(t0 + secs(54));
+    assert_eq!(st, StatusKind::Exit);
+    assert!(detail.contains("0:08"), "HA-initiated Arming must show live remaining seconds: {detail}");
+    assert_eq!(v.lcd_vista(t0 + secs(54), 0).lines[1].trim(), "May Exit Now 08");
+    v.tick(t0 + secs(54), 0); // 8s left <= 10s urgency threshold -> rapid beeps
+    assert_eq!(v.sounder_sent, Pattern::Beeps { on_ms: 90, off_ms: 70, count: 1, period_ms: 160 });
+    v.sync_physical_panel(Some(Disarmed), true, t0 + secs(55));
+
+    // 4. HaExpect::Night accepts Arming (e.g. Vista Code+3+3 Night-Stay while HA is still arming).
+    assert!(HaExpect::Night.matches(Arming));
+
+    // 5. External HA siren active surfaces red Alarm status and can be silenced with Vista Code + 1!
+    v.ha_external_siren = Some(BellPattern::Steady);
+    v.ha_external_siren_label = Some("Lab siren output".into());
+    v.tick(t0 + secs(60), 0);
+    assert_eq!(v.bell_sent, BellPattern::Steady);
+    let (st, title, detail) = v.status(t0 + secs(60));
+    assert_eq!(st, StatusKind::Alarm);
+    assert_eq!(title, "External siren active");
+    assert!(detail.contains("Lab siren output"));
+    v.out.clear();
+    keys(&mut v, "12341", t0 + secs(62));
+    assert!(
+        v.out.iter().any(|o| matches!(o, Out::Disarmed { .. })),
+        "Vista Code+1 while disarmed must emit Out::Disarmed to silence active external HA siren"
+    );
 }

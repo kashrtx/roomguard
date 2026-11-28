@@ -26,7 +26,12 @@ pub fn ui(ui: &mut egui::Ui, view: &View, cfg: &CameraCfg, engine: &EngineHandle
     ui.add_space(4.0);
     let mut want_draw: Option<u8> = None;
     let total_w = ui.available_width();
-    for z in view.zones.iter().filter(|z| z.num <= 8 || z.kind != ZoneKind::Null) {
+    let active_zones: Vec<_> = view.zones.iter().filter(|z| z.kind != ZoneKind::Null).collect();
+    if active_zones.is_empty() {
+        ui.add(egui::Label::new(theme::muted("No active zones. Enable zones in Settings -> Panel or Home Assistant.")).wrap());
+        return None;
+    }
+    for z in active_zones {
         let (state, color) = if !z.note.is_empty() && (z.open || z.tamper || z.fault) {
             // The camera itself is the problem, so say that instead of "Open".
             (z.note.as_str(), theme::AMBER)

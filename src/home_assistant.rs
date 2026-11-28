@@ -1,7 +1,7 @@
 //! Home Assistant entity discovery, live states, two-way alarm panel control,
 //! and on-demand camera snapshots.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{ErrorKind, Read};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::{mpsc, Arc};
@@ -33,7 +33,11 @@ pub enum PanelLink {
     TwoWay,
 }
 
-#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub enabled: bool,
@@ -43,6 +47,47 @@ pub struct Config {
     pub follow_panel: Option<String>,
     pub panel_sync: PanelSyncMode,
     pub panel_code: String,
+    /// When linked to a real Home Assistant alarm panel, set to `false` to mirror
+    /// HA zones on the keypad (live open/closed + chimes) without firing duplicate
+    /// RoomGuard alarms on top of the real panel.
+    #[serde(default = "default_true")]
+    pub ha_zones_trigger_alarm: bool,
+    /// Home Assistant entities (`siren.*`, `switch.*`, `light.*`, `input_boolean.*`)
+    /// turned ON automatically when RoomGuard's alarm siren sounds and OFF when silenced.
+    #[serde(default)]
+    pub siren_outputs: Vec<String>,
+    /// Sync zone bypasses two-way with a linked ESPHome DSC/Vista panel (via `zs` and
+    /// `alarm_keypress`) or the Home Assistant Test Lab (`input_text.roomguard_test_bypasses`).
+    #[serde(default = "default_true")]
+    pub sync_bypasses: bool,
+    /// Automatically measured exit/entry delay durations (seconds) of the linked HA panel
+    /// so RoomGuard's countdown stays in lockstep with HA without skipping the final seconds.
+    #[serde(default)]
+    pub learned_exit_away: Option<u64>,
+    #[serde(default)]
+    pub learned_exit_stay: Option<u64>,
+    #[serde(default)]
+    pub learned_entry: Option<u64>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            url: String::new(),
+            token: String::new(),
+            bindings: Vec::new(),
+            follow_panel: None,
+            panel_sync: PanelSyncMode::TwoWay,
+            panel_code: String::new(),
+            ha_zones_trigger_alarm: true,
+            siren_outputs: Vec::new(),
+            sync_bypasses: true,
+            learned_exit_away: None,
+            learned_exit_stay: None,
+            learned_entry: None,
+        }
+    }
 }
 
 impl std::fmt::Debug for Config {
@@ -57,7 +102,10 @@ impl std::fmt::Debug for Config {
 
 impl Config {
     pub fn followed_panel(&self) -> Option<&str> {
-        self.follow_panel.as_deref().filter(|id| self.enabled && id.starts_with("alarm_control_panel."))
+        self.follow_panel.as_deref().filter(|id| {
+            self.enabled
+                && (id.starts_with("alarm_control_panel.") || id.starts_with("sensor."))
+        })
     }
 
     pub fn panel_link(&self) -> PanelLink {
@@ -96,6 +144,8 @@ pub enum AlarmState {
     Stay,
     Away,
     Night,
+    StayInstant,
+    AwayMax,
     Vacation,
     CustomBypass,
     Pending,
@@ -105,16 +155,18 @@ pub enum AlarmState {
 
 impl AlarmState {
     pub fn parse(state: &str) -> Option<Self> {
-        Some(match state {
-            "disarmed" => Self::Disarmed,
-            "arming" => Self::Arming,
-            "armed_home" => Self::Stay,
+        Some(match state.trim().to_ascii_lowercase().as_str() {
+            "disarmed" | "ready" | "not_ready" => Self::Disarmed,
+            "arming" | "exit_delay" => Self::Arming,
+            "armed_home" | "armed_stay" => Self::Stay,
+            "armed_instant" => Self::StayInstant,
             "armed_away" => Self::Away,
+            "armed_max" | "armed_maximum" => Self::AwayMax,
             "armed_night" => Self::Night,
             "armed_vacation" => Self::Vacation,
             "armed_custom_bypass" => Self::CustomBypass,
-            "pending" => Self::Pending,
-            "triggered" => Self::Triggered,
+            "pending" | "entry_delay" => Self::Pending,
+            "triggered" | "alarm" => Self::Triggered,
             "disarming" => Self::Disarming,
             _ => return None,
         })
@@ -125,7 +177,9 @@ impl AlarmState {
             Self::Disarmed => "Disarmed",
             Self::Arming => "Exit delay",
             Self::Stay => "Armed stay",
+            Self::StayInstant => "Armed instant",
             Self::Away => "Armed away",
+            Self::AwayMax => "Armed maximum",
             Self::Night => "Armed night",
             Self::Vacation => "Armed vacation",
             Self::CustomBypass => "Armed with custom bypass",
@@ -142,6 +196,7 @@ pub enum AlarmAction {
     ArmHome,
     ArmAway,
     ArmNight,
+    Trigger,
 }
 
 impl AlarmAction {
@@ -151,6 +206,7 @@ impl AlarmAction {
             Self::ArmHome => "alarm_arm_home",
             Self::ArmAway => "alarm_arm_away",
             Self::ArmNight => "alarm_arm_night",
+            Self::Trigger => "alarm_trigger",
         }
     }
 
@@ -160,6 +216,7 @@ impl AlarmAction {
             Self::ArmHome => "Arm Stay",
             Self::ArmAway => "Arm Away",
             Self::ArmNight => "Arm Night",
+            Self::Trigger => "Trigger Alarm",
         }
     }
 }
@@ -230,6 +287,8 @@ pub struct Entity {
     attributes: Attributes,
     #[serde(default)]
     last_updated: String,
+    #[serde(default)]
+    last_changed: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
@@ -240,6 +299,12 @@ struct Attributes {
     supported_features: Option<u32>,
     code_format: Option<String>,
     code_arm_required: Option<bool>,
+    bypassed: Option<bool>,
+    bypassed_zones: Option<Vec<Value>>,
+    /// Exposed by Home Assistant `manual` alarm_control_panel and Alarmo during `arming`/`pending`.
+    next_state: Option<String>,
+    /// Exposed by Alarmo (and some custom panels) in seconds for active exit/entry delays.
+    delay: Option<Value>,
 }
 
 impl Entity {
@@ -247,11 +312,26 @@ impl Entity {
         self.attributes.friendly_name.as_deref().unwrap_or(&self.entity_id)
     }
 
+    pub fn domain(&self) -> &str {
+        self.entity_id.split('.').next().unwrap_or("")
+    }
+
     pub fn camera(&self) -> bool {
         self.entity_id.starts_with("camera.")
     }
 
     pub fn alarm_panel(&self) -> bool {
+        if self.entity_id.starts_with("alarm_control_panel.") {
+            return true;
+        }
+        // Also recognize ESPHome DSC / Vista partition status text sensors
+        // (e.g. sensor.dscalarm_status_partition_1, sensor.vistaalarm_system_status_partition_1).
+        self.entity_id.starts_with("sensor.")
+            && (self.entity_id.contains("status_partition") || self.entity_id.contains("alarm_status"))
+            && AlarmState::parse(&self.state).is_some()
+    }
+
+    pub fn supports_alarm_services(&self) -> bool {
         self.entity_id.starts_with("alarm_control_panel.")
     }
 
@@ -261,9 +341,233 @@ impl Entity {
             || self.entity_id.starts_with("switch.")
     }
 
+    /// True for Home Assistant entities that RoomGuard can turn ON/OFF via `turn_on`/`turn_off`.
+    pub fn is_writable_output(&self) -> bool {
+        matches!(self.domain(), "siren" | "switch" | "light" | "input_boolean")
+    }
+
+    /// True for entities usable in Sirens & alarm outputs: writable sirens/switches/lights/toggles
+    /// PLUS read-only ESPHome DSC/Vista alarm, bell, and fire binary sensors (`al_1`, `alm_1`, `fa_1`, `fire_1`, `bell`).
+    pub fn is_output(&self) -> bool {
+        if self.is_writable_output() {
+            return true;
+        }
+        if self.domain() == "binary_sensor" {
+            let id = self.entity_id.to_ascii_lowercase();
+            let name = self.name().to_ascii_lowercase();
+            return id.contains("siren")
+                || id.contains("bell")
+                || id.contains("alarm")
+                || id.contains("fire")
+                || id.ends_with("_al_1")
+                || id.ends_with("_alm_1")
+                || id.ends_with("_fa_1")
+                || name.contains("siren")
+                || name.contains("bell")
+                || name.contains("alarm status")
+                || name.contains("fire status");
+        }
+        false
+    }
+
+    /// True when this siren/alarm output represents a fire alarm (plays Temporal-3).
+    pub fn is_fire_output(&self) -> bool {
+        let id = self.entity_id.to_ascii_lowercase();
+        let name = self.name().to_ascii_lowercase();
+        let dc = self.device_class().unwrap_or("").to_ascii_lowercase();
+        dc == "smoke" || dc == "fire" || id.contains("fire") || id.contains("_fa_") || name.contains("fire")
+    }
+
+    /// True when a Home Assistant siren, switch, toggle, or alarm binary_sensor is currently ON/active.
+    pub fn is_output_on(&self) -> bool {
+        matches!(
+            self.state.trim().to_ascii_lowercase().as_str(),
+            "on" | "true" | "triggered" | "active" | "alarm"
+        )
+    }
+
+    /// Target alarm state exposed by Home Assistant `manual` / Alarmo during `arming` or `pending`.
+    pub fn alarm_next_state(&self) -> Option<AlarmState> {
+        self.attributes.next_state.as_deref().and_then(AlarmState::parse)
+    }
+
+    /// Remaining or total delay seconds exposed by Alarmo / custom HA alarm panels (`attributes.delay`).
+    pub fn alarm_delay_secs(&self) -> Option<u64> {
+        let v = self.attributes.delay.as_ref()?;
+        let secs = v
+            .as_u64()
+            .or_else(|| v.as_f64().filter(|f| f.is_finite() && *f > 0.0).map(|f| f.round() as u64))
+            .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))?;
+        (secs > 0 && secs <= 600).then_some(secs)
+    }
+
+    /// Whole seconds elapsed since HA's `last_changed` RFC-3339 timestamp (clamped to 0..=600).
+    pub fn elapsed_since_last_changed_secs(&self) -> Option<u64> {
+        let raw = self.last_changed.trim();
+        if raw.is_empty() {
+            return None;
+        }
+        let changed = chrono::DateTime::parse_from_rfc3339(raw).ok()?;
+        let now = chrono::Utc::now();
+        let diff = now.signed_duration_since(changed.with_timezone(&chrono::Utc)).num_seconds();
+        if diff < 0 {
+            Some(0)
+        } else {
+            Some((diff as u64).min(600))
+        }
+    }
+
+    /// Detects ESPHome DSC/Vista zone numbers from entity IDs or names like `_z1`, `_z17`, `(z9)`.
+    pub fn esphome_zone_hint(&self, max_zone: u8) -> Option<u8> {
+        for source in [self.entity_id.as_str(), self.name()] {
+            let low = source.to_ascii_lowercase();
+            for part in low.split(|c: char| !c.is_ascii_alphanumeric()) {
+                if let Some(rest) = part.strip_prefix('z') {
+                    if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()) {
+                        if let Ok(n) = rest.parse::<u8>() {
+                            if n >= 1 && n <= max_zone {
+                                return Some(n);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// True for typical contact, motion, lock, or door/window binary sensors.
+    pub fn is_contact_or_motion(&self) -> bool {
+        matches!(self.domain(), "binary_sensor" | "cover" | "lock" | "input_boolean")
+    }
+
+    /// Filters out noisy internal Home Assistant entities (conversation, sun, backup events,
+    /// timestamps, updates, weather, TTS, zones) from the default sensor browser.
+    pub fn is_sensor_candidate(&self) -> bool {
+        if self.entity_id.starts_with("sensor.sun_") || self.device_class() == Some("timestamp") {
+            return false;
+        }
+        match self.domain() {
+            "binary_sensor" | "sensor" | "cover" | "lock" | "input_boolean" | "input_number" | "switch" | "camera"
+            | "siren" | "light" => true,
+            "event" => !self.entity_id.contains("backup") && !self.entity_id.contains("update"),
+            _ => false,
+        }
+    }
+
+    /// Short, readable category tag for the entity browser row.
+    pub fn category_badge(&self) -> &str {
+        if let Some(dc) = self.device_class() {
+            if !dc.trim().is_empty() {
+                return dc;
+            }
+        }
+        match self.domain() {
+            "binary_sensor" => "binary",
+            "input_boolean" => "toggle",
+            "input_number" => "number",
+            "device_tracker" => "tracker",
+            other => other,
+        }
+    }
+
+    /// Concise live state string (shortens raw ISO timestamps so rows stay clean).
+    pub fn short_state(&self) -> String {
+        let raw = self.description();
+        // Trim ISO-8601 timestamps like "2026-11-27T18:44:21.398665+00:00" to "18:44:21".
+        if raw.len() >= 19 && raw.as_bytes().get(4) == Some(&b'-') && raw.as_bytes().get(10) == Some(&b'T') {
+            return raw[11..19].to_string();
+        }
+        let mut s: String = raw.chars().take(20).collect();
+        if raw.chars().count() > 20 {
+            s.push_str("...");
+        }
+        s
+    }
+
+    /// Visual live status hint for the entity row dot (`Some(true)` = active/open/on, `Some(false)` = closed/off).
+    pub fn live_active_hint(&self) -> Option<bool> {
+        let st = self.state.trim().to_ascii_lowercase();
+        if st.is_empty() || matches!(st.as_str(), "unavailable" | "unknown") {
+            return None;
+        }
+        if matches!(st.as_str(), "on" | "open" | "opening" | "unlocked" | "detected" | "triggered" | "home" | "active") {
+            Some(true)
+        } else if matches!(st.as_str(), "off" | "closed" | "locked" | "clear" | "idle" | "disarmed" | "not_home") {
+            Some(false)
+        } else {
+            Some(false)
+        }
+    }
+
+    /// Multi-word relevance search across friendly name, entity_id, device_class, domain, and state.
+    /// Returns a sort priority (`0` = best match) when all words match.
+    pub fn matches_search(&self, query: &str) -> Option<u8> {
+        let q = query.trim().to_ascii_lowercase();
+        if q.is_empty() {
+            return Some(2);
+        }
+        let name = self.name().to_ascii_lowercase();
+        let id = self.entity_id.to_ascii_lowercase();
+        let dc = self.device_class().unwrap_or("").to_ascii_lowercase();
+        let st = self.state.to_ascii_lowercase();
+        for term in q.split_whitespace() {
+            if !name.contains(term) && !id.contains(term) && !dc.contains(term) && !st.contains(term) {
+                return None;
+            }
+        }
+        if name.starts_with(&q) || id.starts_with(&q) {
+            Some(0)
+        } else if name.contains(&q) || dc == q {
+            Some(1)
+        } else {
+            Some(2)
+        }
+    }
+
     pub fn supports_night(&self) -> bool {
         // HA AlarmControlPanelEntityFeature.ARM_NIGHT = 4
         self.attributes.supported_features.map_or(true, |f| (f & 4) != 0)
+    }
+
+    pub fn supports_trigger(&self) -> bool {
+        // HA AlarmControlPanelEntityFeature.TRIGGER = 32
+        self.entity_id.starts_with("alarm_control_panel.")
+            && self.attributes.supported_features.is_some_and(|f| (f & 32) != 0)
+    }
+
+    /// True if this entity reports its zone is bypassed (e.g. ESPHome Vista ECP
+    /// zone text_sensor state `"B"`, `"bypassed"`, or `attributes.bypassed == true`).
+    pub fn is_zone_bypassed(&self) -> bool {
+        if self.attributes.bypassed == Some(true) {
+            return true;
+        }
+        let s = self.state.trim();
+        if self.domain() == "sensor" {
+            return s.eq_ignore_ascii_case("b")
+                || s.eq_ignore_ascii_case("bypass")
+                || s.eq_ignore_ascii_case("bypassed");
+        }
+        false
+    }
+
+    /// Extracts any `bypassed_zones` integer/string attribute exposed by Alarmo or custom HA panels.
+    pub fn attribute_bypassed_zones(&self, max_zone: u8) -> Vec<u8> {
+        let mut out = Vec::new();
+        if let Some(list) = &self.attributes.bypassed_zones {
+            for item in list {
+                let n = item
+                    .as_u64()
+                    .and_then(|v| u8::try_from(v).ok())
+                    .or_else(|| item.as_str().and_then(|s| s.trim().parse::<u8>().ok()));
+                if let Some(z) = n {
+                    if z >= 1 && z <= max_zone && !out.contains(&z) {
+                        out.push(z);
+                    }
+                }
+            }
+        }
+        out
     }
 
     pub fn needs_code(&self) -> bool {
@@ -287,6 +591,77 @@ impl Entity {
         }
     }
 
+    pub fn device_class(&self) -> Option<&str> {
+        self.attributes.device_class.as_deref()
+    }
+
+    /// Suggests the best EEPROM zone-type code for `model` based on this sensor's
+    /// Home Assistant `device_class` and name.
+    pub fn suggested_zone_code(&self, model: Model) -> &'static str {
+        let dc = self.device_class().unwrap_or("").to_ascii_lowercase();
+        let name = self.name().to_ascii_lowercase();
+        let id = self.entity_id.to_ascii_lowercase();
+        let has = |word: &str| dc == word || name.contains(word) || id.contains(word);
+        let is_co = has("carbon_monoxide")
+            || name == "co"
+            || name.starts_with("co ")
+            || name.ends_with(" co")
+            || name.contains(" co ")
+            || id.ends_with("_co")
+            || id.contains("_co_");
+        match model {
+            Model::Pc1832 => {
+                if has("smoke") || has("fire") || has("heat") {
+                    "08" // 24h Standard Fire
+                } else if is_co {
+                    "41" // 24h Carbon Monoxide
+                } else if has("moisture") || has("water") || has("leak") {
+                    "19" // 24h Water
+                } else if has("gas") {
+                    "13" // 24h Gas
+                } else if has("tamper") {
+                    "21" // 24h Tamper
+                } else if has("panic") || has("siren") {
+                    "16" // 24h Panic
+                } else if has("motion") || has("occupancy") || has("presence") {
+                    "05" // Interior Stay/Away
+                } else if has("door") || has("garage") || has("lock") {
+                    "01" // Delay 1 (Entry/Exit)
+                } else {
+                    "03" // Instant (Perimeter / Window / Vibration)
+                }
+            }
+            Model::Vista20p => {
+                if has("smoke") || has("fire") || has("heat") {
+                    "09" // Fire
+                } else if is_co {
+                    "14" // Carbon Monoxide
+                } else if has("moisture") || has("water") || has("leak") || has("gas") || has("tamper") || has("panic") || has("siren") {
+                    "07" // 24h Audible Alarm
+                } else if has("motion") || has("occupancy") || has("presence") {
+                    "04" // Interior Follower
+                } else if has("door") || has("garage") || has("lock") {
+                    "01" // Entry/Exit #1
+                } else {
+                    "03" // Perimeter (Instant / Window / Vibration)
+                }
+            }
+            Model::Pc1550 => {
+                if has("smoke") || has("fire") || has("heat") {
+                    "08" // 24h Fire
+                } else if is_co || has("moisture") || has("water") || has("leak") || has("gas") || has("tamper") || has("panic") || has("siren") {
+                    "04" // 24h Bell
+                } else if has("motion") || has("occupancy") || has("presence") {
+                    "03" // Interior Home-Away
+                } else if has("door") || has("garage") || has("lock") {
+                    "00" // Standard Delay
+                } else {
+                    "01" // Instant
+                }
+            }
+        }
+    }
+
     pub fn description(&self) -> String {
         match &self.attributes.unit_of_measurement {
             Some(unit) => format!("{} {}", self.state, unit),
@@ -297,11 +672,206 @@ impl Entity {
 
 pub type Entities = BTreeMap<String, Entity>;
 
+/// Parsed snapshot of ESPHome DSC Keybus / Vista ECP `zs` (`sensor.*_zone_status`)
+/// or Home Assistant Test Lab `input_text.roomguard_test_bypasses`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ZoneStatusSnapshot {
+    pub bypassed: BTreeSet<u8>,
+    pub alarmed: BTreeSet<u8>,
+    pub open: BTreeSet<u8>,
+    pub tampered: BTreeSet<u8>,
+    pub faulted: BTreeSet<u8>,
+}
+
+/// Parses ESPHome `zs` (`OP:1,BY:3,AL:2,TA:4,CK:5,ZF:6`) and optionally bare zone numbers
+/// (`"1, 3, 5"` in `input_text.roomguard_test_bypasses`) into structured zone sets.
+pub fn parse_zone_status(raw: &str, max_zone: u8, allow_bare_nums: bool) -> ZoneStatusSnapshot {
+    let mut snap = ZoneStatusSnapshot::default();
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("unknown")
+        || trimmed.eq_ignore_ascii_case("unavailable")
+        || trimmed.eq_ignore_ascii_case("none")
+    {
+        return snap;
+    }
+    for token in trimmed.split(|c: char| c == ',' || c == ';' || c.is_ascii_whitespace()) {
+        let tok = token.trim();
+        if tok.is_empty() {
+            continue;
+        }
+        if let Some((prefix, num_str)) = tok.split_once(':') {
+            if let Ok(z) = num_str.trim().parse::<u8>() {
+                if z >= 1 && z <= max_zone {
+                    match prefix.trim().to_ascii_uppercase().as_str() {
+                        "BY" | "BYP" | "BYPASS" => { snap.bypassed.insert(z); }
+                        "AL" | "ALM" | "ALARM" => { snap.alarmed.insert(z); }
+                        "OP" | "OPEN" => { snap.open.insert(z); }
+                        "TA" | "TAMP" | "TAMPER" => { snap.tampered.insert(z); }
+                        "CK" | "ZF" | "FAULT" | "CHECK" => { snap.faulted.insert(z); }
+                        _ => {}
+                    }
+                }
+            }
+        } else if allow_bare_nums {
+            let digits = tok.strip_prefix('z').or_else(|| tok.strip_prefix('Z')).unwrap_or(tok);
+            if let Ok(z) = digits.parse::<u8>() {
+                if z >= 1 && z <= max_zone {
+                    snap.bypassed.insert(z);
+                }
+            }
+        }
+    }
+    snap
+}
+
+/// Formats a set of bypassed zones into canonical ESPHome/Lab `BY:1,BY:3` format.
+pub fn format_bypass_list(zones: &[u8]) -> String {
+    zones
+        .iter()
+        .map(|z| format!("BY:{z}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Detects the ESPHome node prefix (e.g. `"dscalarm"` or `"vistaalarm"`) from discovered
+/// `esphome.*` services matching the linked alarm panel.
+pub fn detect_esphome_prefix(followed_panel: &str, esphome_services: &[String]) -> Option<String> {
+    let mut prefixes: Vec<String> = Vec::new();
+    for svc in esphome_services {
+        for suffix in ["_alarm_keypress_partition", "_alarm_keypress", "_set_alarm_state"] {
+            if let Some(prefix) = svc.strip_suffix(suffix) {
+                if !prefix.is_empty() && !prefixes.iter().any(|p| p == prefix) {
+                    prefixes.push(prefix.to_string());
+                }
+            }
+        }
+    }
+    let fp = followed_panel.to_ascii_lowercase();
+    if let Some(matched) = prefixes.iter().find(|p| fp.contains(&p.to_ascii_lowercase())) {
+        return Some(matched.clone());
+    }
+    if prefixes.len() == 1 {
+        return Some(prefixes[0].clone());
+    }
+    None
+}
+
+/// Extracts a 1-based partition number from an entity ID like `sensor.dscalarm_status_partition_2` (defaults to 1).
+pub fn detect_partition(entity_id: &str) -> u8 {
+    let low = entity_id.to_ascii_lowercase();
+    if let Some((_, rest)) = low.rsplit_once("partition_") {
+        if let Some(d) = rest.chars().next().and_then(|c| c.to_digit(10)) {
+            if (1..=8).contains(&d) {
+                return d as u8;
+            }
+        }
+    }
+    if let Some((_, tail)) = low.rsplit_once('_') {
+        if tail.len() == 1 {
+            if let Some(d) = tail.chars().next().and_then(|c| c.to_digit(10)) {
+                if (1..=8).contains(&d) {
+                    return d as u8;
+                }
+            }
+        }
+    }
+    1
+}
+
+/// Companion entities automatically discovered alongside a linked alarm panel
+/// (ESPHome DSC Keybus / Vista ECP `zs`, `byp_p`, `armi_p`, `fa_p`/`fire_p`, `al_p`/`alm_p`,
+/// or the RoomGuard Test Lab `input_text.roomguard_test_bypasses`).
+#[derive(Clone, Debug, Default)]
+pub struct PanelCompanions {
+    pub zone_status: Option<String>,
+    pub lab_bypasses: Option<String>,
+    pub bypass_flag: Option<String>,
+    pub instant_flag: Option<String>,
+    pub fire_flag: Option<String>,
+    pub alarm_flag: Option<String>,
+}
+
+pub fn find_panel_companions(
+    followed_panel: &str,
+    entities: &Entities,
+    esphome_prefix: Option<&str>,
+) -> PanelCompanions {
+    let part = detect_partition(followed_panel);
+    let pfx = esphome_prefix.map(|s| s.to_ascii_lowercase());
+    let matches_prefix = |id: &str| -> bool {
+        match &pfx {
+            Some(p) => id.contains(p),
+            None => true,
+        }
+    };
+    let mut comp = PanelCompanions::default();
+    let is_lab = followed_panel.contains("roomguard_test_panel") || followed_panel.contains("roomguard_lab");
+    if is_lab && entities.contains_key("input_text.roomguard_test_bypasses") {
+        comp.lab_bypasses = Some("input_text.roomguard_test_bypasses".to_string());
+    }
+    for (id, ent) in entities {
+        let low = id.to_ascii_lowercase();
+        let dom = ent.domain();
+        if dom == "input_text" && comp.lab_bypasses.is_none() && (low.contains("roomguard") && low.contains("bypass")) {
+            comp.lab_bypasses = Some(id.clone());
+        }
+        if !matches_prefix(&low) {
+            continue;
+        }
+        if dom == "sensor" {
+            if comp.zone_status.is_none()
+                && (low.ends_with("_zone_status") || low.ends_with("_zs"))
+            {
+                comp.zone_status = Some(id.clone());
+            }
+        } else if dom == "binary_sensor" {
+            let byp_suf = format!("_byp_{part}");
+            let byp_suf2 = format!("_bypass_partition_{part}");
+            if comp.bypass_flag.is_none() && (low.ends_with(&byp_suf) || low.ends_with(&byp_suf2)) {
+                comp.bypass_flag = Some(id.clone());
+            }
+            let inst_suf = format!("_armi_{part}");
+            let inst_suf2 = format!("_instant_partition_{part}");
+            if comp.instant_flag.is_none() && (low.ends_with(&inst_suf) || low.ends_with(&inst_suf2)) {
+                comp.instant_flag = Some(id.clone());
+            }
+            let fa_suf = format!("_fa_{part}");
+            let fire_suf = format!("_fire_partition_{part}");
+            let fire_suf2 = format!("_fire_status_partition_{part}");
+            if comp.fire_flag.is_none()
+                && (low.ends_with(&fa_suf) || low.ends_with(&fire_suf) || low.ends_with(&fire_suf2))
+            {
+                comp.fire_flag = Some(id.clone());
+            }
+            let al_suf = format!("_al_{part}");
+            let alm_suf = format!("_alm_{part}");
+            let alm_suf2 = format!("_alarm_partition_{part}");
+            let alm_suf3 = format!("_alarm_status_partition_{part}");
+            if comp.alarm_flag.is_none()
+                && (low.ends_with(&al_suf)
+                    || low.ends_with(&alm_suf)
+                    || low.ends_with(&alm_suf2)
+                    || low.ends_with(&alm_suf3))
+            {
+                comp.alarm_flag = Some(id.clone());
+            }
+        }
+    }
+    comp
+}
+
 pub enum Update {
     Connection(ConnectionState),
     Snapshot(Entities),
+    /// Periodic / post-command live state refresh so RoomGuard and Home Assistant never drift out of sync.
+    Refresh(Entities),
+    /// Discovered `esphome.*` service names (e.g. `dscalarm_alarm_keypress`, `vistaalarm_set_alarm_state`).
+    Services(Vec<String>),
     State { id: String, entity: Option<Entity> },
     ServiceResult { action: AlarmAction, result: Result<(), String> },
+    OutputResult { entity_id: String, on: bool, result: Result<(), String> },
+    KeypressResult { service: String, result: Result<(), String> },
     Preview { id: String, result: Result<Arc<Rgb>, String> },
 }
 
@@ -312,11 +882,19 @@ struct Connection {
 }
 
 #[derive(Clone, Debug)]
+enum CallKind {
+    Alarm { action: AlarmAction, code: Option<String> },
+    Output { on: bool },
+    EspHomeKeypress { service: String, keys: String, partition: Option<u8> },
+    EspHomeAlarmState { service: String, state: String, code: String, partition: u8, action: AlarmAction },
+    InputText { value: String },
+}
+
+#[derive(Clone, Debug)]
 struct ServiceCall {
     epoch: u64,
     entity_id: String,
-    action: AlarmAction,
-    code: Option<String>,
+    kind: CallKind,
 }
 
 pub struct Handle {
@@ -331,7 +909,51 @@ impl Handle {
     }
 
     pub fn call_alarm(&self, epoch: u64, entity_id: String, action: AlarmAction, code: Option<String>) {
-        let _ = self.calls.send(ServiceCall { epoch, entity_id, action, code });
+        let _ = self.calls.send(ServiceCall {
+            epoch,
+            entity_id,
+            kind: CallKind::Alarm { action, code },
+        });
+    }
+
+    pub fn set_output(&self, epoch: u64, entity_id: String, on: bool) {
+        let _ = self.calls.send(ServiceCall {
+            epoch,
+            entity_id,
+            kind: CallKind::Output { on },
+        });
+    }
+
+    pub fn call_esphome_keypress(&self, epoch: u64, service: String, keys: String, partition: Option<u8>) {
+        let _ = self.calls.send(ServiceCall {
+            epoch,
+            entity_id: String::new(),
+            kind: CallKind::EspHomeKeypress { service, keys, partition },
+        });
+    }
+
+    pub fn call_esphome_alarm_state(
+        &self,
+        epoch: u64,
+        service: String,
+        state: String,
+        code: String,
+        partition: u8,
+        action: AlarmAction,
+    ) {
+        let _ = self.calls.send(ServiceCall {
+            epoch,
+            entity_id: String::new(),
+            kind: CallKind::EspHomeAlarmState { service, state, code, partition, action },
+        });
+    }
+
+    pub fn set_input_text(&self, epoch: u64, entity_id: String, value: String) {
+        let _ = self.calls.send(ServiceCall {
+            epoch,
+            entity_id,
+            kind: CallKind::InputText { value },
+        });
     }
 
     pub fn preview(&self, cfg: &Config, epoch: u64, id: String) -> bool {
@@ -494,19 +1116,104 @@ fn state_change(message: &Value) -> Option<(String, Option<Entity>)> {
     Some((id, entity))
 }
 
-fn service_call_payload(id: u64, call: &ServiceCall) -> Value {
-    let mut service_data = serde_json::Map::new();
-    service_data.insert("entity_id".into(), json!(call.entity_id));
-    if let Some(code) = call.code.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
-        service_data.insert("code".into(), json!(code));
+fn service_call_payload(id: u64, call: &ServiceCall) -> Option<Value> {
+    match &call.kind {
+        CallKind::Alarm { action, code } => {
+            let mut service_data = serde_json::Map::new();
+            if let Some(code) = code.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+                service_data.insert("code".into(), json!(code));
+            }
+            let mut payload = json!({
+                "id": id,
+                "type": "call_service",
+                "domain": "alarm_control_panel",
+                "service": action.service(),
+                "target": {
+                    "entity_id": call.entity_id,
+                },
+            });
+            if !service_data.is_empty() {
+                payload["service_data"] = Value::Object(service_data);
+            }
+            Some(payload)
+        }
+        CallKind::Output { on } => {
+            let domain = call.entity_id.split('.').next().unwrap_or("");
+            if !matches!(domain, "siren" | "switch" | "light" | "input_boolean") {
+                return None;
+            }
+            Some(json!({
+                "id": id,
+                "type": "call_service",
+                "domain": domain,
+                "service": if *on { "turn_on" } else { "turn_off" },
+                "target": {
+                    "entity_id": call.entity_id,
+                },
+            }))
+        }
+        CallKind::EspHomeKeypress { service, keys, partition } => {
+            if service.trim().is_empty() || keys.trim().is_empty() {
+                return None;
+            }
+            let mut data = serde_json::Map::new();
+            data.insert("keys".into(), json!(keys));
+            if let Some(p) = partition {
+                if service.ends_with("_partition") {
+                    data.insert("partition".into(), json!(p));
+                }
+            }
+            Some(json!({
+                "id": id,
+                "type": "call_service",
+                "domain": "esphome",
+                "service": service,
+                "service_data": Value::Object(data),
+            }))
+        }
+        CallKind::EspHomeAlarmState { service, state, code, partition, .. } => {
+            if service.trim().is_empty() {
+                return None;
+            }
+            Some(json!({
+                "id": id,
+                "type": "call_service",
+                "domain": "esphome",
+                "service": service,
+                "service_data": {
+                    "state": state,
+                    "code": code,
+                    "partition": partition,
+                },
+            }))
+        }
+        CallKind::InputText { value } => {
+            if !call.entity_id.starts_with("input_text.") {
+                return None;
+            }
+            Some(json!({
+                "id": id,
+                "type": "call_service",
+                "domain": "input_text",
+                "service": "set_value",
+                "target": {
+                    "entity_id": call.entity_id,
+                },
+                "service_data": {
+                    "value": value,
+                },
+            }))
+        }
     }
-    json!({
-        "id": id,
-        "type": "call_service",
-        "domain": "alarm_control_panel",
-        "service": call.action.service(),
-        "service_data": service_data,
-    })
+}
+
+pub fn extract_esphome_services(result: &Value) -> Vec<String> {
+    let Some(map) = result.get("esphome").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = map.keys().cloned().collect();
+    out.sort();
+    out
 }
 
 fn session(
@@ -534,11 +1241,15 @@ fn session(
 
     let deadline = Instant::now() + Duration::from_secs(12);
     let mut buffered: BTreeMap<String, Option<Entity>> = BTreeMap::new();
-    let mut pending_calls: HashMap<u64, AlarmAction> = HashMap::new();
+    let mut pending_calls: HashMap<u64, ServiceCall> = HashMap::new();
     let mut online = false;
     let mut next_id = 2u64;
     let mut active_ping: Option<(u64, Instant)> = None;
     let mut next_ping = Instant::now() + Duration::from_secs(6);
+    let mut refresh_id: Option<u64> = None;
+    let mut next_refresh = Instant::now() + Duration::from_secs(10);
+    let mut services_id: Option<u64> = None;
+    let mut services_at: Option<Instant> = None;
     loop {
         match settings.try_recv() {
             Ok(next) => return Ok(next),
@@ -549,16 +1260,28 @@ fn session(
         if !online && now >= deadline {
             return Err("Home Assistant did not return entity states".into());
         }
-        // Send any outbound two-way alarm panel service calls once online.
+        // Send any outbound alarm panel or siren/output service calls once online.
         if online {
             while let Ok(call) = calls.try_recv() {
                 if call.epoch != cfg.epoch {
                     continue;
                 }
                 next_id += 1;
-                let payload = service_call_payload(next_id, &call);
-                send(&mut socket, payload)?;
-                pending_calls.insert(next_id, call.action);
+                if let Some(payload) = service_call_payload(next_id, &call) {
+                    send(&mut socket, payload)?;
+                    pending_calls.insert(next_id, call);
+                }
+            }
+            if services_id.is_none() && services_at.is_some_and(|at| now >= at) {
+                services_at = None;
+                next_id += 1;
+                send(&mut socket, json!({"id":next_id,"type":"get_services"}))?;
+                services_id = Some(next_id);
+            }
+            if refresh_id.is_none() && now >= next_refresh {
+                next_id += 1;
+                send(&mut socket, json!({"id":next_id,"type":"get_states"}))?;
+                refresh_id = Some(next_id);
             }
         }
         if let Some((_, sent_at)) = active_ping {
@@ -598,18 +1321,64 @@ fn session(
             }
             emit(engine, cfg.epoch, Update::Snapshot(entities));
             online = true;
+            next_refresh = Instant::now() + Duration::from_secs(10);
+            services_at = Some(Instant::now() + Duration::from_millis(600));
+        } else if message["type"] == "result" && services_id.is_some_and(|sid| message["id"] == sid) {
+            services_id = None;
+            if message["success"] == true {
+                let svcs = extract_esphome_services(&message["result"]);
+                emit(engine, cfg.epoch, Update::Services(svcs));
+            }
+        } else if message["type"] == "result" && refresh_id.is_some_and(|rid| message["id"] == rid) {
+            refresh_id = None;
+            next_refresh = Instant::now() + Duration::from_secs(10);
+            if message["success"] == true {
+                if let Some(states) = message["result"].as_array() {
+                    let entities: Entities = states
+                        .iter()
+                        .filter_map(|state| serde_json::from_value::<Entity>(state.clone()).ok())
+                        .map(|entity| (entity.entity_id.clone(), entity))
+                        .collect();
+                    emit(engine, cfg.epoch, Update::Refresh(entities));
+                }
+            }
         } else if message["type"] == "result" {
             if let Some(id) = message["id"].as_u64() {
-                if let Some(action) = pending_calls.remove(&id) {
+                if let Some(call) = pending_calls.remove(&id) {
                     let result = if message["success"] == true {
                         Ok(())
                     } else {
                         let detail = message["error"]["message"]
                             .as_str()
-                            .unwrap_or("Home Assistant rejected the panel command");
+                            .unwrap_or("Home Assistant rejected the command");
                         Err(detail.to_owned())
                     };
-                    emit(engine, cfg.epoch, Update::ServiceResult { action, result });
+                    match call.kind {
+                        CallKind::Alarm { action, .. } | CallKind::EspHomeAlarmState { action, .. } => {
+                            emit(engine, cfg.epoch, Update::ServiceResult { action, result });
+                            // Verify live panel state shortly after every outbound command in case HA
+                            // ignored a wrong PIN silently (manual alarm_control_panel returns success:true).
+                            let soon = Instant::now() + Duration::from_millis(1200);
+                            if soon < next_refresh {
+                                next_refresh = soon;
+                            }
+                        }
+                        CallKind::Output { on } => {
+                            emit(
+                                engine,
+                                cfg.epoch,
+                                Update::OutputResult { entity_id: call.entity_id, on, result },
+                            );
+                        }
+                        CallKind::EspHomeKeypress { service, .. } => {
+                            emit(engine, cfg.epoch, Update::KeypressResult { service, result });
+                            let soon = Instant::now() + Duration::from_millis(1200);
+                            if soon < next_refresh {
+                                next_refresh = soon;
+                            }
+                        }
+                        CallKind::InputText { .. } => {}
+                    }
                 }
             }
         } else if let Some((id, entity)) = state_change(&message) {
@@ -687,13 +1456,14 @@ mod tests {
             &ServiceCall {
                 epoch: 1,
                 entity_id: "alarm_control_panel.roomguard_test_panel".into(),
-                action: AlarmAction::Disarm,
-                code: Some("1234".into()),
+                kind: CallKind::Alarm { action: AlarmAction::Disarm, code: Some("1234".into()) },
             },
-        );
+        )
+        .unwrap();
         assert_eq!(with_code["type"], "call_service");
         assert_eq!(with_code["domain"], "alarm_control_panel");
         assert_eq!(with_code["service"], "alarm_disarm");
+        assert_eq!(with_code["target"]["entity_id"], "alarm_control_panel.roomguard_test_panel");
         assert_eq!(with_code["service_data"]["code"], "1234");
 
         let without_code = service_call_payload(
@@ -701,12 +1471,81 @@ mod tests {
             &ServiceCall {
                 epoch: 1,
                 entity_id: "alarm_control_panel.roomguard_test_panel".into(),
-                action: AlarmAction::ArmAway,
-                code: Some("   ".into()),
+                kind: CallKind::Alarm { action: AlarmAction::ArmAway, code: Some("   ".into()) },
             },
-        );
+        )
+        .unwrap();
         assert_eq!(without_code["service"], "alarm_arm_away");
-        assert!(without_code["service_data"].get("code").is_none());
+        assert_eq!(without_code["target"]["entity_id"], "alarm_control_panel.roomguard_test_panel");
+        assert!(without_code.get("service_data").is_none());
+
+        let siren_on = service_call_payload(
+            9,
+            &ServiceCall {
+                epoch: 1,
+                entity_id: "siren.hallway_horn".into(),
+                kind: CallKind::Output { on: true },
+            },
+        )
+        .unwrap();
+        assert_eq!(siren_on["domain"], "siren");
+        assert_eq!(siren_on["service"], "turn_on");
+        assert_eq!(siren_on["target"]["entity_id"], "siren.hallway_horn");
+
+        let bool_off = service_call_payload(
+            10,
+            &ServiceCall {
+                epoch: 1,
+                entity_id: "input_boolean.siren".into(),
+                kind: CallKind::Output { on: false },
+            },
+        )
+        .unwrap();
+        assert_eq!(bool_off["domain"], "input_boolean");
+        assert_eq!(bool_off["service"], "turn_off");
+
+        assert!(
+            service_call_payload(
+                11,
+                &ServiceCall {
+                    epoch: 1,
+                    entity_id: "conversation.home_assistant".into(),
+                    kind: CallKind::Output { on: true },
+                },
+            )
+            .is_none(),
+            "non-output domains must be rejected for siren output calls"
+        );
+    }
+
+    #[test]
+    fn entity_browser_filtering_and_multiword_search_hide_ha_noise() {
+        let mk = |entity_id: &str, name: &str, dc: Option<&str>, state: &str| Entity {
+            entity_id: entity_id.into(),
+            state: state.into(),
+            attributes: Attributes {
+                friendly_name: Some(name.into()),
+                device_class: dc.map(str::to_owned),
+                ..Attributes::default()
+            },
+            last_updated: String::new(),
+            last_changed: String::new(),
+        };
+        let conv = mk("conversation.home_assistant", "Home Assistant", None, "2026-11-27T18:44:21.398665+00:00");
+        let backup = mk("event.backup_automatic_backup", "Backup Automatic backup", None, "unknown");
+        let door = mk("binary_sensor.front_door", "Front Door", Some("door"), "off");
+        let siren = mk("input_boolean.siren", "siren", None, "off");
+
+        assert!(!conv.is_sensor_candidate());
+        assert!(!backup.is_sensor_candidate());
+        assert!(door.is_sensor_candidate());
+        assert!(siren.is_sensor_candidate());
+        assert!(siren.is_output());
+        assert!(!door.is_output());
+        assert_eq!(conv.short_state(), "18:44:21");
+        assert_eq!(door.matches_search("front door"), Some(0));
+        assert_eq!(door.matches_search("door binary"), Some(2));
+        assert_eq!(door.matches_search("garage"), None);
     }
 
     #[test]
@@ -716,6 +1555,7 @@ mod tests {
             state: state.into(),
             attributes: Attributes::default(),
             last_updated: String::new(),
+            last_changed: String::new(),
         };
         assert_eq!(mk("binary_sensor.front_door", "off").default_rule_and_operand(), (Rule::Equals, "on".into()));
         assert_eq!(mk("input_boolean.roomguard_lab_door", "off").default_rule_and_operand(), (Rule::Equals, "on".into()));
@@ -796,8 +1636,7 @@ mod tests {
             .send(ServiceCall {
                 epoch: 4,
                 entity_id: "alarm_control_panel.house".into(),
-                action: AlarmAction::Disarm,
-                code: Some("1234".into()),
+                kind: CallKind::Alarm { action: AlarmAction::Disarm, code: Some("1234".into()) },
             })
             .unwrap();
         match events.recv_timeout(Duration::from_secs(8)).unwrap() {

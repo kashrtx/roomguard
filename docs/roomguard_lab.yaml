@@ -1,4 +1,4 @@
-# RoomGuard Home Assistant Test Lab Package
+# RoomGuard Home Assistant Test Lab Package (LOCAL TESTING SANDBOX ONLY)
 #
 # Save this file inside your Home Assistant folder at:
 #   /homeassistant/packages/roomguard_lab.yaml
@@ -6,7 +6,18 @@
 # IMPORTANT: Keep the underscore (_) in "roomguard_lab.yaml".
 # Home Assistant rejects hyphens (-) in package filenames.
 #
-# Test Alarm Panel Disarm PIN: 1234 (matches RoomGuard's default Master Code).
+# PIN SECURITY NOTE:
+# - With a REAL wall panel (ESPHome Keybus / ECP or Envisalink), you do NOT use
+#   this file and you do NOT put your real alarm code in plain YAML. Instead,
+#   the Home Assistant template forwards `code: '{{ code }}'` directly to your
+#   hardware panel, and in RoomGuard you leave "HA panel PIN" blank so whatever
+#   code you type on the keypad is sent straight to the panel.
+# - For this local Test Lab sandbox, you can:
+#     1) Move the PIN into /homeassistant/secrets.yaml and change `code:` below
+#        to `code: !secret roomguard_test_code`, OR
+#     2) Remove the `code:` line below completely (RoomGuard's own keypad still
+#        requires your real salted/hashed Master Code to disarm!), OR
+#     3) Keep the throwaway test code "1234" below for quick local testing.
 
 input_boolean:
   roomguard_lab_door:
@@ -15,6 +26,14 @@ input_boolean:
   roomguard_lab_motion:
     name: Lab motion detected
     initial: false
+  roomguard_lab_siren:
+    name: Lab siren output
+    initial: false
+
+input_text:
+  roomguard_test_bypasses:
+    name: Lab bypassed zones (e.g. BY:1,BY:3)
+    initial: ""
 
 input_number:
   roomguard_lab_temperature:
@@ -42,9 +61,12 @@ alarm_control_panel:
   - platform: manual
     name: RoomGuard Test Panel
     unique_id: roomguard_test_panel
-    # Disarm PIN for this virtual test panel (matches RoomGuard's default 1234).
+    # Throwaway PIN for this local test sandbox only (or use `code: !secret roomguard_test_code`,
+    # or remove `code:` altogether and let RoomGuard's keypad enforce your real hashed code).
     code: "1234"
     code_arm_required: false
+    # RoomGuard automatically measures and locks onto whatever arming_time / delay_time
+    # your Home Assistant panel uses so both countdowns finish together in sync.
     arming_time: 8
     delay_time: 8
     trigger_time: 30

@@ -321,6 +321,22 @@ impl RoomGuardApp {
                                 if !view.status_detail.is_empty() {
                                     ui.add(egui::Label::new(RichText::new(&view.status_detail).color(theme::MUTED).size(13.0)).truncate());
                                 }
+                                if let Some((false, err)) = &view.home.service_notice {
+                                    ui.add(egui::Label::new(RichText::new(format!("· {}", err)).color(theme::AMBER).size(12.5)).truncate())
+                                        .on_hover_text(err);
+                                }
+                                if view.ha_external_siren {
+                                    if ui
+                                        .add(
+                                            egui::Button::new(RichText::new("Silence").size(12.0).color(Color32::WHITE))
+                                                .fill(theme::RED.gamma_multiply(0.85)),
+                                        )
+                                        .on_hover_text("Silence RoomGuard's siren and turn OFF linked Home Assistant siren outputs")
+                                        .clicked()
+                                    {
+                                        self.engine.send(EngineMsg::SilenceHaSiren);
+                                    }
+                                }
                             });
                         });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

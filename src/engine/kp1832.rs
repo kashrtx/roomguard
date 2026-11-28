@@ -243,7 +243,7 @@ impl Panel {
         }
     }
 
-    fn toggle_bypass(&mut self, z: usize) {
+    fn toggle_bypass(&mut self, z: usize, now: Instant) {
         let c = self.cfg(z);
         if !c.bypassable || c.kind == ZoneKind::Null {
             self.error_tone();
@@ -255,6 +255,8 @@ impl Panel {
         let on = r.bypassed;
         self.key_beep();
         self.log(EvKind::Info, format!("Zone {} ({}) {}", z, self.label(z), if on { "bypassed" } else { "unbypassed" }));
+        let code = self.last_entered_code.clone();
+        self.emit_ha_bypass(HaBypassCmd::SetZone { zone: z as u8, bypassed: on, code }, now);
         self.dirty = true;
     }
 
@@ -270,7 +272,7 @@ impl Panel {
                 KpMode::Bypass { buf: String::new(), idx: (idx + 1) % n }
             }
             Key::Star => {
-                self.toggle_bypass(idx % n + 1);
+                self.toggle_bypass(idx % n + 1, now);
                 KpMode::Bypass { buf: String::new(), idx }
             }
             Key::Digit(d) => {
@@ -282,17 +284,19 @@ impl Panel {
                 let code: usize = buf.parse().unwrap_or(0);
                 match code {
                     99 => {
-                        let mut any = false;
+                        let mut recalled = Vec::new();
                         for z in self.last_bypass.clone() {
                             let zi = z as usize;
                             if zi >= 1 && zi <= self.n() && self.cfg(zi).bypassable {
                                 self.zones[zi - 1].bypassed = true;
-                                any = true;
+                                recalled.push(z);
                             }
                         }
-                        if any {
+                        if !recalled.is_empty() {
                             self.beeps(3);
                             self.log(EvKind::Info, "Last bypass group recalled");
+                            let c = self.last_entered_code.clone();
+                            self.emit_ha_bypass(HaBypassCmd::RecallGroup { code_num: 99, zones: recalled, code: c }, now);
                         } else {
                             self.error_tone();
                         }
@@ -312,18 +316,20 @@ impl Panel {
                         KpMode::Bypass { buf: String::new(), idx }
                     }
                     91 => {
-                        let mut any = false;
+                        let mut recalled = Vec::new();
                         for z in self.saved_bypass.clone() {
                             let zi = z as usize;
                             if zi >= 1 && zi <= self.n() && self.cfg(zi).bypassable {
                                 self.zones[zi - 1].bypassed = true;
-                                any = true;
+                                recalled.push(z);
                             }
                         }
-                        if any {
+                        if !recalled.is_empty() {
                             self.beeps(3);
                             self.temp_at("Bypass Group", "Recalled", 1800, now);
                             self.log(EvKind::Info, "Saved bypass group recalled ([91])");
+                            let c = self.last_entered_code.clone();
+                            self.emit_ha_bypass(HaBypassCmd::RecallGroup { code_num: 91, zones: recalled, code: c }, now);
                         } else {
                             self.error_tone();
                         }
@@ -334,12 +340,15 @@ impl Panel {
                             z.bypassed = false;
                             z.auto_bypass = false;
                         }
+                        self.ha_synced_bypasses.fill(false);
                         self.beeps(3);
                         self.log(EvKind::Info, "All bypasses removed");
+                        let c = self.last_entered_code.clone();
+                        self.emit_ha_bypass(HaBypassCmd::ClearAll { code: c }, now);
                         KpMode::Bypass { buf: String::new(), idx }
                     }
                     z if z >= 1 && z <= self.n() => {
-                        self.toggle_bypass(z);
+                        self.toggle_bypass(z, now);
                         KpMode::Bypass { buf: String::new(), idx: z - 1 }
                     }
                     _ => {
@@ -350,6 +359,7 @@ impl Panel {
             }
             Key::Hash => {
                 self.key_beep();
+                self.last_entered_code = None;
                 let list: Vec<u8> = (1..=self.n()).filter(|&z| self.zones[z - 1].bypassed).map(|z| z as u8).collect();
                 if !list.is_empty() {
                     self.last_bypass = list;
@@ -718,7 +728,7 @@ impl Panel {
                 let mut opts = self.ee.toggles(Model::Pc1832, "016");
                 opts[2] = !opts[2];
                 let on = opts[2];
-                self.ee.set_toggles("016", &opts);
+                self.ee.set_toggles("016", &opts[..8]);
                 if on {
                     self.beeps(3);
                 } else {
@@ -1122,7 +1132,7 @@ impl Panel {
             return LcdOut { lines: [l1, pad(&self.label(a.zone as usize))], cursor: None };
         }
         if let Some((top, bottom)) = self.physical_lcd() {
-            return plain(top, bottom);
+            return plain(&top, &bottom);
         }
         if self.entry.is_some() {
             if self.memory_flag {

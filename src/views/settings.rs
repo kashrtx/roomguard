@@ -104,6 +104,7 @@ impl SettingsView {
     #[allow(clippy::too_many_arguments)]
     pub fn window(&mut self, ctx: &egui::Context, cfg: &mut AppConfig, changed: &mut bool, view: &View, engine: &EngineHandle, cam: &CameraHandle, audio: &AudioHandle, updater: &Updater) {
         if !self.open {
+            self.home_ui.close_popups();
             self.lock_installer();
             return;
         }
@@ -139,7 +140,8 @@ impl SettingsView {
             .min_size([680.0, 460.0])
             .show(ctx, |ui| {
                 let avail_w = ui.available_width();
-                let body_w = (avail_w - 166.0).max(360.0);
+                let body_w = (avail_w - 158.0).max(360.0);
+                let inner_w = (body_w - 20.0).max(320.0);
                 ui.horizontal_top(|ui| {
                     ui.vertical(|ui| {
                         ui.set_width(136.0);
@@ -155,6 +157,9 @@ impl SettingsView {
                             .stroke(if selected { egui::Stroke::new(1.0f32, theme::GREEN) } else { egui::Stroke::NONE })
                             .min_size(egui::vec2(132.0, 28.0));
                             if ui.add(btn).clicked() {
+                                if self.tab != i as u8 {
+                                    self.home_ui.close_popups();
+                                }
                                 self.tab = i as u8;
                                 if self.tab != ABOUT_TAB && !installer_open {
                                     self.lock_installer();
@@ -167,10 +172,12 @@ impl SettingsView {
                         ui.set_width(body_w);
                         ui.set_max_width(body_w);
                         egui::ScrollArea::vertical().id_salt("settings-body").auto_shrink([false, false]).show(ui, |ui| {
-                            ui.set_max_width((body_w - 14.0).max(320.0));
+                            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                            ui.set_width(inner_w);
+                            ui.set_max_width(inner_w);
                             match self.tab {
                                 0 => self.general(ui, cfg, changed, view),
-                                1 => super::installer::ui(ui, &view.prog, view.armed, engine),
+                                1 => super::installer::ui(ui, cfg, changed, view, engine),
                                 2 => self.camera(ui, cfg, changed, cam),
                                 3 => self.sound(ui, cfg, changed, view, engine, audio),
                                 4 => self.monitoring(ui, cfg, changed, view, engine),
@@ -191,6 +198,7 @@ impl SettingsView {
             });
         self.open = open;
         if !open {
+            self.home_ui.close_popups();
             self.lock_installer();
         }
     }
@@ -203,7 +211,7 @@ impl SettingsView {
                 *changed = true;
             }
         });
-        ui.label(theme::muted("The operator uses it when they message or call you."));
+        ui.add(egui::Label::new(theme::muted("The operator uses it when they message or call you.")).wrap());
 
         section(ui, "Keypad");
         ui.add_enabled_ui(!view.armed, |ui| {
@@ -218,47 +226,110 @@ impl SettingsView {
             }
         });
         if view.armed {
-            ui.label(theme::muted("Disarm first to switch panels."));
+            ui.add(egui::Label::new(theme::muted("Disarm first to switch panels.")).wrap());
         }
-        ui.label(theme::muted("Each panel keeps its own codes, programming and history, so you can switch back and forth."));
+        ui.add(
+            egui::Label::new(theme::muted(
+                "Each panel keeps its own codes, programming and history, so you can switch back and forth.",
+            ))
+            .wrap(),
+        );
 
         section(ui, "Zone names");
         let model = cfg.model;
         let cam_cfg = cfg.camera.clone();
+        let ha_cfg = cfg.home_assistant.clone();
         let labels = cfg.labels_mut(model);
         let zones = super::zone_page(ui, egui::Id::new(("zone-name-page", model.file_key())), labels.len());
         egui::Grid::new("settings-zones").num_columns(3).spacing([10.0, 6.0]).show(ui, |ui| {
             for zone in zones {
                 let z = zone as u8;
                 let label = &mut labels[zone - 1];
-                ui.label(RichText::new(format!("Zone {}", z)).color(theme::MUTED));
-                if ui.add_sized([210.0, 24.0], egui::TextEdit::singleline(label).char_limit(24)).changed() {
+                ui.label(RichText::new(format!("Zone {:02}", z)).color(theme::MUTED));
+                let edit = ui.add_sized([195.0, 24.0], egui::TextEdit::singleline(label).char_limit(24));
+                if edit.changed() {
                     *changed = true;
                 }
-                let role = if z == 1 {
-                    if cam_cfg.doorway.is_some() { "Doorway (on map)" } else { "Whole camera view" }
-                } else if cam_cfg.zone_rect(z).is_some() {
-                    "Drawn on map"
-                } else if z == 2 && cam_cfg.uses_room_fallback() {
-                    "Rest of room"
-                } else if z <= 8 {
-                    "Simulated (drawable on map)"
+                if model == Model::Vista20p {
+                    let (spoken, matched) = crate::audio::voice::spoken_zone_preview(label, z);
+                    edit.on_hover_text(if matched {
+                        format!("6160V voice will speak: \"{}\"", spoken)
+                    } else {
+                        format!("Words not in 6160V voice ROM. LCD shows your name, voice falls back to: \"{}\"", spoken)
+                    });
+                }
+                let kind_null = view.zones.get(zone - 1).is_some_and(|zv| zv.kind == crate::engine::types::ZoneKind::Null);
+                let role = if ha_cfg.binding(model, z).is_some() {
+                    if ha_cfg.panel_link() != crate::home_assistant::PanelLink::Independent && !ha_cfg.ha_zones_trigger_alarm {
+                        "Home Assistant (mirror)"
+                    } else {
+                        "Home Assistant"
+                    }
+                } else if kind_null {
+                    "Not used (enable in Panel or HA)"
+                } else if cam_cfg.enabled {
+                    if z == 1 {
+                        if cam_cfg.doorway.is_some() { "Doorway (on map)" } else { "Whole camera view" }
+                    } else if cam_cfg.zone_rect(z).is_some() {
+                        "Drawn on map"
+                    } else if z == 2 && cam_cfg.uses_room_fallback() {
+                        "Rest of room"
+                    } else if z <= 8 {
+                        "Simulated (drawable on map)"
+                    } else {
+                        "Simulated"
+                    }
                 } else {
-                    "Simulated"
+                    "Simulated (webcam off)"
                 };
-                ui.label(theme::muted(role));
+                if model == Model::Vista20p {
+                    let (_, matched) = crate::audio::voice::spoken_zone_preview(label, z);
+                    if !matched && !kind_null && !label.trim().is_empty() {
+                        ui.label(RichText::new(format!("{role} · voice: Zone {z}")).size(12.0).color(theme::AMBER));
+                    } else {
+                        ui.label(theme::muted(role));
+                    }
+                } else {
+                    ui.label(theme::muted(role));
+                }
                 ui.end_row();
             }
         });
-        ui.label(theme::muted("The LCD keypad displays the first 14 characters of each zone name."));
+        ui.add(
+            egui::Label::new(theme::muted(
+                "The LCD keypad displays the first 14 characters of each zone name. You can also edit names, types, and sensors together in Panel or Home Assistant.",
+            ))
+            .wrap(),
+        );
+        if model == Model::Vista20p {
+            ui.add_space(4.0);
+            egui::CollapsingHeader::new("6160V speakable zone words (48 words)")
+                .id_salt("vista-vocab-general")
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::Label::new(theme::muted(
+                            "Just like a real 6160V voice keypad, only words stored in the onboard voice ROM can be spoken aloud (up to 3 words per zone; 'Doorway', 'First', 'Second', 'Third' also map to Door/1st/2nd/3rd). Any custom name still appears on the LCD, and voice announces 'Zone XX' if no words match:",
+                        ))
+                        .wrap(),
+                    );
+                    ui.add_space(3.0);
+                    ui.add(
+                        egui::Label::new(RichText::new(crate::audio::voice::vocab_display_list()).size(12.0).color(theme::TEXT))
+                            .wrap(),
+                    );
+                });
+        }
 
         section(ui, "Graphics");
         if ui.checkbox(&mut cfg.ui.opengl, "Use OpenGL instead of Direct3D, Vulkan or Metal").changed() {
             *changed = true;
         }
-        ui.label(theme::muted(
-            "RoomGuard draws on your graphics card. Only turn this on if the window looks wrong or won't draw. It takes effect the next time RoomGuard starts.",
-        ));
+        ui.add(
+            egui::Label::new(theme::muted(
+                "RoomGuard draws on your graphics card. Only turn this on if the window looks wrong or won't draw. It takes effect the next time RoomGuard starts.",
+            ))
+            .wrap(),
+        );
 
         section(ui, "Camera view");
         if ui.checkbox(&mut cfg.ui.show_motion, "Show motion").changed() {
@@ -278,16 +349,22 @@ impl SettingsView {
         if ui.checkbox(&mut cfg.autostart, "Open RoomGuard when I sign in to this computer").changed() {
             *changed = true;
         }
-        ui.label(theme::muted(
-            "If RoomGuard is shut down some other way while armed, it comes back armed the next time it starts and lets you know on your phone.",
-        ));
+        ui.add(
+            egui::Label::new(theme::muted(
+                "If RoomGuard is shut down some other way while armed, it comes back armed the next time it starts and lets you know on your phone.",
+            ))
+            .wrap(),
+        );
 
         section(ui, "Saved data");
         let dir = util::data_dir();
-        ui.label(theme::muted(format!(
-            "Codes, faces, the room map and history are saved in {}. Deleting or updating the app never touches this folder.",
-            dir.display()
-        )));
+        ui.add(
+            egui::Label::new(theme::muted(format!(
+                "Codes, faces, the room map and history are saved in {}. Deleting or updating the app never touches this folder.",
+                dir.display()
+            )))
+            .wrap(),
+        );
         ui.horizontal(|ui| {
             if ui.button("Open the data folder").clicked() {
                 let _ = std::fs::create_dir_all(&dir);
@@ -298,12 +375,20 @@ impl SettingsView {
                 self.open = false;
             }
         });
-        ui.label(theme::muted("Running the setup again keeps your codes, faces and history and lets you pick everything else over."));
+        ui.add(
+            egui::Label::new(theme::muted(
+                "Running the setup again keeps your codes, faces and history and lets you pick everything else over.",
+            ))
+            .wrap(),
+        );
 
         section(ui, "Start over");
-        ui.label(theme::muted(
-            "Erases everything RoomGuard saved on this computer: codes, panel programming, faces, room maps, history and settings. Then it restarts with the setup wizard, like the day you installed it.",
-        ));
+        ui.add(
+            egui::Label::new(theme::muted(
+                "Erases everything RoomGuard saved on this computer: codes, panel programming, faces, room maps, history and settings. Then it restarts with the setup wizard, like the day you installed it.",
+            ))
+            .wrap(),
+        );
         if view.armed {
             ui.label(theme::muted("Disarm first to start over."));
         } else if !self.confirm_wipe {

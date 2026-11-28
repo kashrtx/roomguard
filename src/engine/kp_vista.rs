@@ -191,10 +191,15 @@ impl Panel {
             _ => {
                 toks.push("alarm".into());
                 if zone > 0 && (zone as usize) <= self.n() {
-                    // Authentic 6160V behavior: only pronounce words in the ROM!
-                    // Words like "PANEL" or "TAMPER" are skipped completely.
+                    // Authentic 6160V behavior: pronounce words in the ROM, and if a custom
+                    // label has no ROM words, fall back to speaking "zone <number>".
                     let words = voice::filter_zone_words(&self.label(zone as usize));
-                    toks.extend(words);
+                    if words.is_empty() {
+                        toks.push("zone".into());
+                        toks.extend(voice::number_tokens(zone));
+                    } else {
+                        toks.extend(words);
+                    }
                 }
             }
         }
@@ -476,7 +481,7 @@ impl Panel {
                 if fresh && stay && key == Key::Digit(3) && !self.vista_night {
                     // [Code] + STAY + STAY: NIGHT-STAY.
                     self.key_beep();
-                    self.vista_set_night();
+                    self.vista_set_night(now);
                     VistaKp::Normal
                 } else {
                     self.kv_normal(key, now)
@@ -1019,6 +1024,8 @@ impl Panel {
                     self.vista_show_bypassed(&list, now);
                     let first = list[0] as u16;
                     self.log_cid(EvKind::Info, format!("Quick bypassed {} open zone(s)", list.len()), 570, 'E', first, false);
+                    let code = self.last_entered_code.take();
+                    self.emit_ha_bypass(HaBypassCmd::QuickBypass { zones: list, code }, now);
                 }
                 VistaKp::Normal
             }
@@ -1036,11 +1043,14 @@ impl Panel {
                         zr.bypassed = false;
                         zr.auto_bypass = false;
                     }
+                    self.ha_synced_bypasses.fill(false);
                     self.vista_confirm_beep();
                     if had {
                         self.vista_temp("BYPASS CLEARED", "", 2500, now);
                         self.log_cid(EvKind::Info, "All bypasses cleared ([Code]+6+00)", 570, 'R', 0, false);
                     }
+                    let code = self.last_entered_code.take();
+                    self.emit_ha_bypass(HaBypassCmd::ClearAll { code }, now);
                 } else if (1..=self.n()).contains(&z) && self.cfg(z).bypassable {
                     let was = self.zones[z - 1].bypassed;
                     self.zones[z - 1].bypassed = true;
@@ -1049,7 +1059,10 @@ impl Panel {
                     if !was {
                         self.log_cid(EvKind::Info, format!("Zone {:02} bypassed", z), 570, 'E', z as u16, false);
                     }
+                    let code = self.last_entered_code.take();
+                    self.emit_ha_bypass(HaBypassCmd::SetZone { zone: z as u8, bypassed: true, code }, now);
                 } else {
+                    self.last_entered_code = None;
                     self.error_tone();
                 }
                 VistaKp::Normal
@@ -2400,8 +2413,16 @@ impl Panel {
             _ => {}
         }
 
-        // Active live alarm
-        if let Some(a) = self.live_alarms(now).next() {
+        // Active live alarm: Fire alarms take priority over Burglary alarms, and multiple
+        // simultaneous zones in alarm cycle every 2.5 s just like real VISTA-20P 0xF7 frames.
+        let cycle = (now.saturating_duration_since(self.last_key_at).as_millis() / 2500) as usize;
+        let mut live: Vec<&AlarmRt> = self.live_alarms(now).filter(|a| a.kind != AlarmKind::Duress).collect();
+        if !live.is_empty() {
+            let fire_live: Vec<&AlarmRt> = live.iter().copied().filter(|a| a.kind.pulsed()).collect();
+            if !fire_live.is_empty() {
+                live = fire_live;
+            }
+            let a = live[cycle % live.len()];
             if a.kind.pulsed() {
                 if a.zone == 95 || a.zone == 0 {
                     let (l1, l2) = split_zone_lines("FIRE", 95, "FIRE PANIC");
@@ -2423,7 +2444,25 @@ impl Panel {
         }
 
         if let Some((top, bottom)) = self.physical_lcd() {
-            return plain(top, bottom);
+            // When the linked HA/physical panel is counting down exit delay with a known duration,
+            // display the authentic 6160V exit screen with live countdown if *197 > 0.
+            if self.physical_state == Some(crate::home_assistant::AlarmState::Arming)
+                && self.exit.is_none()
+                && self.armed.is_none()
+            {
+                let head = if self.ha_arming_next_stay { "ARMED ***STAY***" } else { "ARMED ***AWAY***" };
+                let iv = self.ee.entry_or(Model::Vista20p, "197", 0, 0).min(5) as u64;
+                if iv > 0 {
+                    if let Some(((st, _), dur)) = self.ha_arming_started.zip(self.ha_arming_expected) {
+                        let rem = (st + dur).saturating_duration_since(now);
+                        let left = (rem.as_millis().saturating_add(999) / 1000) as u64;
+                        let shown = if iv == 1 { left } else { ((left + iv - 1) / iv) * iv };
+                        return plain(head, &format!("May Exit Now {:02}", shown.min(99)));
+                    }
+                }
+                return plain(head, "You may exit now");
+            }
+            return plain(&top, &bottom);
         }
         // Entry delay (alternates EXIT ALARM when triggered by an exit-error fault)
         if let Some(e) = &self.entry {
@@ -2435,7 +2474,8 @@ impl Panel {
 
         // Exit delay
         if let Some(ex) = &self.exit {
-            let left = (ex.started + ex.dur).saturating_duration_since(now).as_secs();
+            let rem = (ex.started + ex.dur).saturating_duration_since(now);
+            let left = (rem.as_millis().saturating_add(999) / 1000) as u64;
             let head = match ex.how {
                 ArmHow::StayKey if self.vista_night => "ARMED NIGHT-STAY",
                 ArmHow::StayKey => "ARMED ***STAY***",
@@ -2487,11 +2527,20 @@ impl Panel {
         }
 
         // Latched Alarm Memory after 1st [Code] + 1 disarm:
-        // Authentic 0xF7 ECP display alternates ALARM XX <ZONE> and DISARMED every 2.5 s
-        // until the 2nd [Code] + 1 clears memory (phase 0 starts on ALARM XX).
-        let cycle = (now.saturating_duration_since(self.last_key_at).as_millis() / 2500) as usize;
-        if let Some((z, k)) = self.vista_alarm_mem_zone {
-            if cycle % 2 == 0 {
+        // Authentic 0xF7 ECP display cycles through all alarmed zones and DISARMED every 2.5 s
+        // until the 2nd [Code] + 1 clears memory (phase 0 starts on ALARM/FIRE XX).
+        if let Some((first_z, first_k)) = self.vista_alarm_mem_zone {
+            let mut mem_zones: Vec<(u8, AlarmKind)> = Vec::new();
+            mem_zones.push((first_z, first_k));
+            for &mz in &self.memory[0] {
+                if mz > 0 && !mem_zones.iter().any(|(z, _)| *z == mz) {
+                    let mk = if self.cfg(mz as usize).kind.is_fire() { AlarmKind::Fire } else { AlarmKind::Burglary };
+                    mem_zones.push((mz, mk));
+                }
+            }
+            let slot_idx = cycle % (mem_zones.len() + 1);
+            if slot_idx < mem_zones.len() {
+                let (z, k) = mem_zones[slot_idx];
                 let prefix = if k.pulsed() { "FIRE" } else { "ALARM" };
                 let lbl = if z == 95 {
                     "FIRE PANIC".to_string()
@@ -2541,6 +2590,16 @@ impl Panel {
                 }
             }
         }
+        // VISTA-20P Zone Type 05 (Trouble by Day / Alarm by Night) shows CHECK XX while open & disarmed.
+        for z in 1..=self.n() {
+            if self.cfg(z).kind == ZoneKind::DayZone && self.zones[z - 1].open && !self.zones[z - 1].bypassed {
+                let lbl = self.label(z).to_ascii_uppercase();
+                let screen = split_zone_lines("CHECK", z as u8, &lbl);
+                if !trouble_screens.contains(&screen) {
+                    trouble_screens.push(screen);
+                }
+            }
+        }
         if !open.is_empty() {
             if !trouble_screens.is_empty() && cycle % (trouble_screens.len() + 1) < trouble_screens.len() {
                 let (l1, l2) = &trouble_screens[cycle % (trouble_screens.len() + 1)];
@@ -2579,7 +2638,11 @@ impl Panel {
         self.vista_entry_mute_until = None;
         let is_armed = self.armed.is_some()
             || self.exit.is_some()
-            || (self.panel_link == crate::home_assistant::PanelLink::TwoWay && self.is_on());
+            || (self.panel_link == crate::home_assistant::PanelLink::TwoWay
+                && (self.is_on()
+                    || self
+                        .physical_state
+                        .is_some_and(|s| !matches!(s, crate::home_assistant::AlarmState::Disarmed))));
         let has_live_alarm = self.alarms.iter().any(|a| !a.silenced);
 
         // Enforce VISTA-20P authority levels (User Guide p.28):
@@ -2650,6 +2713,7 @@ impl Panel {
             let was_fire = self.vista_alarm_mem_zone.map_or(false, |(_, k)| k.pulsed());
             self.vista_alarm_mem_zone = None;
             self.memory_flag = false;
+            self.alarms.retain(|a| !a.silenced);
             for z in self.zones.iter_mut() {
                 z.alarm = false;
             }
@@ -2669,8 +2733,14 @@ impl Panel {
                 z.bypassed = false;
                 z.auto_bypass = false;
             }
+            self.ha_synced_bypasses.fill(false);
+            let code = self.last_entered_code.take();
             if had {
                 self.log_cid(EvKind::Info, "Bypasses removed", 570, 'R', 0, false);
+                self.emit_ha_bypass(HaBypassCmd::ClearAll { code }, now);
+            }
+            if self.ha_external_siren.is_some() {
+                self.out.push(Out::Disarmed { after_alarm: false });
             }
             self.vista_off_beep();
             self.vista_pending_status = Some(status_at);
@@ -2678,14 +2748,17 @@ impl Panel {
     }
 
     /// NIGHT-STAY arms the perimeter plus the zones in zone list 05 (field *81).
-    pub(crate) fn vista_set_night(&mut self) {
+    pub(crate) fn vista_set_night(&mut self, now: Instant) {
         self.vista_night = true;
         self.vista_unbypass_night_zones();
         self.log(EvKind::Arm, "Armed NIGHT-STAY");
         if self.panel_link == crate::home_assistant::PanelLink::TwoWay {
+            self.ha_outbound_until = Some(now + Duration::from_millis(3500));
+            self.ha_expect = Some(HaExpect::Night);
             self.out.push(Out::HaPanelCmd(HaPanelCmd::Arm {
                 mode: ArmMode::Stay,
                 night: true,
+                no_entry: false,
                 code: self.last_entered_code.take(),
             }));
         }
@@ -2748,7 +2821,7 @@ impl Panel {
     }
 
     /// Step arming's third press: from NIGHT-STAY up to AWAY.
-    pub(crate) fn vista_step_to_away(&mut self) {
+    pub(crate) fn vista_step_to_away(&mut self, now: Instant) {
         if let Some(a) = self.armed.as_mut() {
             a.mode = ArmMode::Away;
         }
@@ -2769,9 +2842,12 @@ impl Panel {
         self.beeps(2);
         self.log(EvKind::Arm, "Armed AWAY (step arming)");
         if self.panel_link == crate::home_assistant::PanelLink::TwoWay {
+            self.ha_outbound_until = Some(now + Duration::from_millis(3500));
+            self.ha_expect = Some(HaExpect::Away);
             self.out.push(Out::HaPanelCmd(HaPanelCmd::Arm {
                 mode: ArmMode::Away,
                 night: false,
+                no_entry: false,
                 code: None,
             }));
         }

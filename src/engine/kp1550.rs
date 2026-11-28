@@ -36,7 +36,7 @@ impl Panel {
             KpMode::Normal => self.k50_normal(key, now),
             KpMode::Star { .. } => self.k50_star(key, now),
             KpMode::NeedCode { purpose, buf } => self.k_need_code(purpose, buf, key, now),
-            KpMode::Bypass { .. } => self.k50_bypass(key),
+            KpMode::Bypass { .. } => self.k50_bypass(key, now),
             KpMode::Troubles { mem, .. } => self.k50_troubles(mem, key),
             KpMode::Memory { level, .. } => self.k50_memory(level, key),
             KpMode::UserCodes { slot, buf, .. } => self.k50_usercodes(slot, buf, key),
@@ -168,21 +168,23 @@ impl Panel {
         }
     }
 
-    fn k50_bypass(&mut self, key: Key) -> KpMode {
+    fn k50_bypass(&mut self, key: Key, now: Instant) -> KpMode {
         let stay = KpMode::Bypass { buf: String::new(), idx: 0 };
         match key {
             Key::Digit(9) => {
-                let mut any = false;
+                let mut recalled = Vec::new();
                 for z in self.last_bypass.clone() {
                     let zi = z as usize;
                     if zi >= 1 && zi <= self.n() && self.cfg(zi).bypassable {
                         self.zones[zi - 1].bypassed = true;
-                        any = true;
+                        recalled.push(z);
                     }
                 }
-                if any {
+                if !recalled.is_empty() {
                     self.beeps(3);
                     self.log(EvKind::Info, "Bypass group recalled");
+                    let c = self.last_entered_code.clone();
+                    self.emit_ha_bypass(HaBypassCmd::RecallGroup { code_num: 9, zones: recalled, code: c }, now);
                 } else {
                     self.error_tone();
                 }
@@ -201,11 +203,14 @@ impl Panel {
                     let on = r.bypassed;
                     self.key_beep();
                     self.log(EvKind::Info, format!("Zone {} {}", z, if on { "bypassed" } else { "unbypassed" }));
+                    let code = self.last_entered_code.clone();
+                    self.emit_ha_bypass(HaBypassCmd::SetZone { zone: z as u8, bypassed: on, code }, now);
                 }
                 stay
             }
             Key::Hash => {
                 self.key_beep();
+                self.last_entered_code = None;
                 let list: Vec<u8> = (1..=self.n()).filter(|&z| self.zones[z - 1].bypassed).map(|z| z as u8).collect();
                 if !list.is_empty() {
                     self.last_bypass = list;

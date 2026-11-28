@@ -51,6 +51,10 @@ pub enum PanelEdit {
     SetKeypadLevels { brightness: u8, contrast: u8, buzzer: u8 },
     SetVoiceLevel(u8),
     SetInstallerLockout(bool),
+    /// Sets a single zone's definition code (e.g., "01", "03", "00" on PC1832/Vista, or "00".."09" on PC1550).
+    SetZoneType { zone: u8, code: String },
+    /// Disables unused zones (setting them to Null / Not Used) so only real/configured zones appear.
+    DisableZones(Vec<u8>),
     FactoryDefault,
 }
 
@@ -73,6 +77,9 @@ pub enum EngineMsg {
     ClearEvents,
     HomeAssistant { epoch: u64, update: ha::Update },
     HomePreview(String),
+    TestHaOutput { entity_id: String, on: bool, auto_off_secs: Option<u64> },
+    SilenceHaSiren,
+    ResetLearnedHaTimers,
     Shutdown,
 }
 
@@ -84,8 +91,15 @@ pub struct HomeView {
     pub status: String,
     pub online: bool,
     pub entities: Arc<ha::Entities>,
+    pub esphome_services: Vec<String>,
+    pub detected_esphome: Option<String>,
+    pub detected_bypass_entity: Option<String>,
+    pub learned_exit_away: Option<u64>,
+    pub learned_exit_stay: Option<u64>,
+    pub learned_entry: Option<u64>,
     pub preview: Option<(String, Result<Arc<crate::vision::frame::Rgb>, String>)>,
     pub service_notice: Option<(bool, String)>,
+    pub output_notice: Option<(bool, String)>,
 }
 
 #[derive(Clone)]
@@ -104,6 +118,7 @@ pub struct View {
     pub status_detail: String,
     pub zones: Vec<ZoneView>,
     pub bell: bool,
+    pub ha_external_siren: bool,
     pub siren: SirenModel,
     pub hold: Option<(Key, f32)>,
     pub troubles: Vec<String>,
@@ -230,6 +245,7 @@ impl Default for View {
             status_detail: String::new(),
             zones: Vec::new(),
             bell: false,
+            ha_external_siren: false,
             siren: SirenModel::Wave2F,
             hold: None,
             troubles: Vec::new(),
@@ -339,6 +355,10 @@ fn load_panel(model: Model, cfg: &AppConfig, now: Instant) -> Panel {
     let mut p = Panel::new(model, save, cfg.labels(model).clone(), cfg.display_name(), link != ha::PanelLink::Independent, now);
     p.panel_link = link;
     p.following_panel = link == ha::PanelLink::FollowOnly;
+    p.ha_zone_mirror_only = link != ha::PanelLink::Independent && !cfg.home_assistant.ha_zones_trigger_alarm;
+    p.ha_learned_exit_away = cfg.home_assistant.learned_exit_away;
+    p.ha_learned_exit_stay = cfg.home_assistant.learned_exit_stay;
+    p.ha_learned_entry = cfg.home_assistant.learned_entry;
     p
 }
 
@@ -389,8 +409,15 @@ struct Engine {
     faults: u32,
     hub: ha::Handle,
     home: HomeView,
+    ha_companions: ha::PanelCompanions,
     hub_epoch: u64,
     home_pulses: std::collections::BTreeMap<String, Instant>,
+    ha_bell_active: bool,
+    ha_bell_cmd_until: Option<Instant>,
+    ha_bell_cmd_target: Option<bool>,
+    ha_output_tests: std::collections::BTreeMap<String, Instant>,
+    /// If the saved `HA panel PIN` fails with `invalid_code`, retry once with the code just typed on the keypad.
+    ha_retry_cmd: Option<(panel::HaPanelCmd, String, Instant)>,
 }
 
 impl Engine {
@@ -399,6 +426,9 @@ impl Engine {
         let panel = load_panel(cfg.model, &cfg, now);
         let op = Operator::load(cfg.display_name());
         let last_buzzer = panel.buzzer;
+        let learned_exit_away = panel.ha_learned_exit_away;
+        let learned_exit_stay = panel.ha_learned_exit_stay;
+        let learned_entry = panel.ha_learned_entry;
         let mut e = Engine {
             cfg,
             panel,
@@ -441,9 +471,20 @@ impl Engine {
             audio_bad_since: None,
             faults: 0,
             hub,
-            home: HomeView::default(),
+            home: HomeView {
+                learned_exit_away,
+                learned_exit_stay,
+                learned_entry,
+                ..HomeView::default()
+            },
+            ha_companions: ha::PanelCompanions::default(),
             hub_epoch: 0,
             home_pulses: Default::default(),
+            ha_bell_active: false,
+            ha_bell_cmd_until: None,
+            ha_bell_cmd_target: None,
+            ha_output_tests: Default::default(),
+            ha_retry_cmd: None,
         };
         e.saved_events = e.panel.events_seq;
         e.push_settings();
@@ -498,6 +539,8 @@ impl Engine {
             && self.panel.exit.is_none()
             && self.panel.entry.is_none()
             && self.panel.alarms.is_empty()
+            && self.panel.ha_external_siren.is_none()
+            && !matches!(self.panel.physical_state, Some(ha::AlarmState::Arming | ha::AlarmState::Pending))
             && !self.panel.walk_test
             && self.panel.bell_test_until.is_none()
             && self.panel.util_until.is_none()
@@ -509,6 +552,7 @@ impl Engine {
             && matches!(self.panel.vista_mode, kp_vista::VistaKp::Normal)
             && self.save_due.is_none()
             && self.zone_pend.iter().all(|p| p.is_none())
+            && self.ha_output_tests.is_empty()
             && self.op.call_view().is_none()
     }
 
@@ -706,6 +750,73 @@ impl Engine {
                     self.panel.dirty = true;
                 }
             }
+            EngineMsg::TestHaOutput { entity_id, on, auto_off_secs } => {
+                if self.home.online {
+                    let writable = self
+                        .home
+                        .entities
+                        .get(&entity_id)
+                        .map_or(true, ha::Entity::is_writable_output);
+                    if writable {
+                        self.hub.set_output(self.hub_epoch, entity_id.clone(), on);
+                    }
+                    self.ha_bell_cmd_until = Some(now + Duration::from_secs(2));
+                    self.ha_bell_cmd_target = Some(on);
+                    if on {
+                        let ent = self.home.entities.get(&entity_id);
+                        let pat = if ent.is_some_and(ha::Entity::is_fire_output) {
+                            BellPattern::Temporal3
+                        } else {
+                            BellPattern::Steady
+                        };
+                        self.panel.ha_external_siren = Some(pat);
+                        self.panel.ha_external_siren_label = Some(
+                            ent.map(|e| e.name().to_string()).unwrap_or_else(|| entity_id.clone()),
+                        );
+                        if let Some(secs) = auto_off_secs {
+                            self.ha_output_tests.insert(entity_id.clone(), now + Duration::from_secs(secs));
+                        } else {
+                            self.ha_output_tests.remove(&entity_id);
+                        }
+                    } else {
+                        self.ha_output_tests.remove(&entity_id);
+                        if self.ha_output_tests.is_empty() {
+                            self.panel.ha_external_siren = None;
+                            self.panel.ha_external_siren_label = None;
+                        }
+                    }
+                    self.panel.dirty = true;
+                }
+            }
+            EngineMsg::SilenceHaSiren => {
+                self.ha_output_tests.clear();
+                self.panel.ha_external_siren = None;
+                self.panel.ha_external_siren_label = None;
+                self.ha_bell_cmd_until = Some(now + Duration::from_secs(2));
+                self.ha_bell_cmd_target = Some(false);
+                if self.home.online {
+                    for entity_id in &self.cfg.home_assistant.siren_outputs {
+                        if self.home.entities.get(entity_id).map_or(true, ha::Entity::is_writable_output) {
+                            self.hub.set_output(self.hub_epoch, entity_id.clone(), false);
+                        }
+                    }
+                }
+                self.panel.log(EvKind::Info, "External Home Assistant siren silenced");
+                self.panel.dirty = true;
+            }
+            EngineMsg::ResetLearnedHaTimers => {
+                self.panel.ha_learned_exit_away = None;
+                self.panel.ha_learned_exit_stay = None;
+                self.panel.ha_learned_entry = None;
+                self.cfg.home_assistant.learned_exit_away = None;
+                self.cfg.home_assistant.learned_exit_stay = None;
+                self.cfg.home_assistant.learned_entry = None;
+                self.home.learned_exit_away = None;
+                self.home.learned_exit_stay = None;
+                self.home.learned_entry = None;
+                self.cfg.save();
+                self.panel.dirty = true;
+            }
             EngineMsg::ClearEvents => {
                 self.panel.events.clear();
                 self.panel.events_seq += 1;
@@ -748,7 +859,7 @@ impl Engine {
                 } else {
                     let mut t = self.panel.ee.toggles(m, "015");
                     t[3] = on;
-                    self.panel.ee.set_toggles("015", &t);
+                    self.panel.ee.set_toggles("015", &t[..8]);
                 }
                 self.panel.log(EvKind::Program, if on { "Quick arming enabled (Settings)" } else { "Quick arming disabled (Settings)" });
             }
@@ -823,7 +934,7 @@ impl Engine {
                 self.panel.log(EvKind::Program, format!("Section [{}] updated (Settings)", key));
             }
             PanelEdit::SetToggle { key, opt, on } => {
-                if busy || !(1..=8).contains(&opt) {
+                if busy || !(1..=9).contains(&opt) {
                     return;
                 }
                 let Some(sp) = eeprom::spec(m, &key) else {
@@ -864,6 +975,34 @@ impl Engine {
                 self.panel.ee.installer_lockout = on;
                 self.panel.log(EvKind::Program, if on { "Installer lockout enabled (Settings)" } else { "Installer lockout disabled (Settings)" });
             }
+            PanelEdit::SetZoneType { zone, code } => {
+                if busy || zone == 0 || usize::from(zone) > m.zone_count() {
+                    return;
+                }
+                self.set_zone_type_code(usize::from(zone), &code);
+            }
+            PanelEdit::DisableZones(zones) => {
+                if busy {
+                    return;
+                }
+                let null_code = match m {
+                    Model::Pc1550 => "09",
+                    Model::Pc1832 | Model::Vista20p => "00",
+                };
+                let mut disabled = 0usize;
+                for z in zones {
+                    let zi = usize::from(z);
+                    if zi >= 1 && zi <= m.zone_count() && self.panel.cfg(zi).kind != ZoneKind::Null {
+                        self.set_zone_type_code(zi, null_code);
+                        self.sim[zi - 1] = false;
+                        disabled += 1;
+                    }
+                }
+                if disabled > 0 {
+                    self.sync_zones(now);
+                    self.panel.log(EvKind::Program, format!("Disabled {} unused zone(s)", disabled));
+                }
+            }
             PanelEdit::FactoryDefault => {
                 if busy {
                     return;
@@ -889,6 +1028,37 @@ impl Engine {
         self.panel.dirty = true;
         self.save_due = Some(now + Duration::from_millis(400));
         self.last_publish = None;
+    }
+
+    fn set_zone_type_code(&mut self, zone: usize, code: &str) {
+        let m = self.panel.model;
+        let clean: String = code.trim().to_ascii_uppercase().chars().filter(|c| c.is_ascii_hexdigit()).take(2).collect();
+        if clean.len() != 2 {
+            return;
+        }
+        let (sec, entries, idx) = match m {
+            Model::Pc1550 => ("11", 6usize, zone - 1),
+            Model::Pc1832 => {
+                let (s, i) = eeprom::pc1832_zone_section(zone);
+                (s, 16usize, i)
+            }
+            Model::Vista20p => ("56", m.zone_count(), zone - 1),
+        };
+        let mut raw = self.panel.ee.raw(m, sec);
+        let need = entries * 2;
+        while raw.len() < need {
+            raw.push('0');
+        }
+        raw.truncate(need);
+        let start = idx * 2;
+        if start + 2 <= raw.len() {
+            raw.replace_range(start..start + 2, &clean);
+            if m == Model::Pc1832 {
+                self.panel.ee.default_changed_pc1832_zone_attrs(sec, &raw);
+            }
+            self.panel.ee.sections.insert(sec.to_string(), raw);
+            self.panel.log(EvKind::Program, format!("Zone {:02} type set to {} (Settings)", zone, clean));
+        }
     }
 
     fn vision(&mut self, ev: VisionEvent, now: Instant) {
@@ -981,22 +1151,105 @@ impl Engine {
                 self.home.state = conn;
                 if !self.home.online {
                     self.home.preview = None;
+                    self.home.esphome_services.clear();
+                    self.home.detected_esphome = None;
+                    self.home.detected_bypass_entity = None;
+                    self.ha_companions = ha::PanelCompanions::default();
                     self.home_pulses.clear();
                     self.sync_physical_panel(false, now);
+                    self.sync_ha_sirens(now);
                 }
+            }
+            ha::Update::Services(services) => {
+                self.home.esphome_services = services;
+                self.refresh_esphome_detection();
+                self.sync_physical_panel(false, now);
+                self.panel.dirty = true;
+                return;
+            }
+            ha::Update::KeypressResult { service, result } => {
+                if let Err(err) = result {
+                    let msg = format!("ESPHome keypress ({service}) failed: {err}");
+                    self.home.service_notice = Some((false, msg.clone()));
+                    self.panel.log(EvKind::Trouble, msg);
+                    self.panel.ha_bypass_outbound_until = None;
+                    self.sync_physical_panel(false, now);
+                }
+                self.panel.dirty = true;
+                return;
             }
             ha::Update::ServiceResult { action, result } => {
                 match result {
                     Ok(()) => {
+                        self.ha_retry_cmd = None;
                         self.home.service_notice = Some((true, format!("Sent {} to Home Assistant panel", action.label())));
                     }
                     Err(err) => {
-                        let msg = format!("Home Assistant panel rejected {}: {}", action.label(), err);
+                        let code_err = err.to_ascii_lowercase().contains("code");
+                        if code_err {
+                            if let Some((retry_cmd, fallback_code, at)) = self.ha_retry_cmd.take() {
+                                if now.saturating_duration_since(at) < Duration::from_secs(6) {
+                                    self.panel.log(
+                                        EvKind::Info,
+                                        "Saved HA panel PIN was rejected; retrying with the keypad code you typed",
+                                    );
+                                    self.panel.ha_outbound_until = Some(now + Duration::from_secs(3));
+                                    self.send_ha_panel_cmd_with_override(retry_cmd, Some(fallback_code));
+                                    self.panel.dirty = true;
+                                    return;
+                                }
+                            }
+                        }
+                        self.ha_retry_cmd = None;
+                        let msg = if code_err {
+                            format!(
+                                "HA rejected {} (invalid PIN). Update 'HA panel PIN' in Settings -> Home Assistant (or leave blank to use your keypad code).",
+                                action.label()
+                            )
+                        } else {
+                            format!("Home Assistant panel rejected {}: {}", action.label(), err)
+                        };
                         self.home.service_notice = Some((false, msg.clone()));
                         self.panel.log(EvKind::Trouble, msg);
-                        // Clear outbound suppression so HA's real state re-syncs immediately.
+                        if code_err {
+                            match self.panel.model {
+                                Model::Pc1832 => self.panel.temp_at("HA PIN Invalid", "Check Settings", 4000, now),
+                                Model::Vista20p => self.panel.temp_at("HA PIN INVALID", "CHECK SETTINGS", 4000, now),
+                                Model::Pc1550 => {}
+                            }
+                            self.panel.error_tone();
+                        }
+                        // Clear outbound suppression and immediately re-sync to HA's actual state.
                         self.panel.ha_outbound_until = None;
-                        self.panel.ha_expect_armed = None;
+                        self.panel.ha_expect = None;
+                        self.sync_physical_panel(false, now);
+                    }
+                }
+                self.panel.dirty = true;
+                return;
+            }
+            ha::Update::OutputResult { entity_id, on, result } => {
+                let name = self
+                    .home
+                    .entities
+                    .get(&entity_id)
+                    .map(|e| e.name().to_string())
+                    .unwrap_or(entity_id);
+                match result {
+                    Ok(()) => {
+                        self.home.output_notice = Some((
+                            true,
+                            if on {
+                                format!("Turned ON {name} in Home Assistant")
+                            } else {
+                                format!("Turned OFF {name} in Home Assistant")
+                            },
+                        ));
+                    }
+                    Err(err) => {
+                        let msg = format!("Home Assistant output {name} failed: {err}");
+                        self.home.output_notice = Some((false, msg.clone()));
+                        self.panel.log(EvKind::Trouble, msg);
                     }
                 }
                 self.panel.dirty = true;
@@ -1008,9 +1261,28 @@ impl Engine {
                 self.home.state = ha::ConnectionState::Connected;
                 self.home.status = "Connected".into();
                 self.home_pulses.clear();
+                self.refresh_esphome_detection();
                 self.sync_home_baseline(now);
                 // A changed state on reconnect is new to this running session.
                 self.sync_physical_panel(self.panel.physical_state.is_some(), now);
+                self.sync_ha_sirens(now);
+                self.panel.dirty = true;
+                return;
+            }
+            ha::Update::Refresh(entities) => {
+                self.home.entities = Arc::new(entities);
+                self.home.online = true;
+                self.home.state = ha::ConnectionState::Connected;
+                self.home.status = "Connected".into();
+                self.refresh_esphome_detection();
+                self.sync_zones(now);
+                self.sync_physical_panel(true, now);
+                self.sync_ha_sirens(now);
+                if self.home.service_notice.as_ref().is_some_and(|(ok, _)| *ok)
+                    && self.panel.ha_outbound_until.is_none()
+                {
+                    self.home.service_notice = None;
+                }
                 self.panel.dirty = true;
                 return;
             }
@@ -1018,12 +1290,20 @@ impl Engine {
                 if !self.home.online {
                     return;
                 }
-                let changed = self.home.entities.get(&id).zip(entity.as_ref()).is_some_and(|(old, new)| {
-                    old.state != new.state
-                        && (ha::Rule::Changes.active(&old.state, "").is_some()
-                            || (id.starts_with("event.") && old.state == "unknown"))
-                        && ha::Rule::Changes.active(&new.state, "").is_some()
-                });
+                let is_bound_zone = self
+                    .cfg
+                    .home_assistant
+                    .bindings
+                    .iter()
+                    .any(|b| b.model == self.panel.model && b.entity == id);
+                let is_siren_output = self.cfg.home_assistant.siren_outputs.iter().any(|s| s == &id);
+                let changed = is_bound_zone
+                    && self.home.entities.get(&id).zip(entity.as_ref()).is_some_and(|(old, new)| {
+                        old.state != new.state
+                            && (ha::Rule::Changes.active(&old.state, "").is_some()
+                                || (id.starts_with("event.") && old.state == "unknown"))
+                            && ha::Rule::Changes.active(&new.state, "").is_some()
+                    });
                 if changed {
                     let response = self.cfg.home_assistant.bindings.iter()
                         .filter(|binding| binding.model == self.panel.model && binding.entity == id && binding.rule == ha::Rule::Changes)
@@ -1033,29 +1313,242 @@ impl Engine {
                         self.home_pulses.insert(id.clone(), now + Duration::from_millis(ms + 1500));
                     }
                 }
-                let follow_changed = self.cfg.home_assistant.followed_panel() == Some(id.as_str());
+                let follow_id = self.cfg.home_assistant.followed_panel().map(str::to_owned);
+                let follow_changed = follow_id.as_deref() == Some(id.as_str());
+                let existed = self.home.entities.contains_key(&id);
                 let entities = Arc::make_mut(&mut self.home.entities);
-                match entity {
-                    Some(entity) => { entities.insert(id, entity); }
-                    None => { entities.remove(&id); }
+                let membership_changed = match entity {
+                    Some(entity) => {
+                        entities.insert(id.clone(), entity);
+                        !existed
+                    }
+                    None => {
+                        entities.remove(&id);
+                        existed
+                    }
+                };
+                if membership_changed {
+                    self.refresh_esphome_detection();
                 }
-                if follow_changed {
+                let is_companion = is_bound_zone
+                    || self.ha_companions.zone_status.as_deref() == Some(id.as_str())
+                    || self.ha_companions.lab_bypasses.as_deref() == Some(id.as_str())
+                    || self.ha_companions.bypass_flag.as_deref() == Some(id.as_str())
+                    || self.ha_companions.instant_flag.as_deref() == Some(id.as_str())
+                    || self.ha_companions.fire_flag.as_deref() == Some(id.as_str())
+                    || self.ha_companions.alarm_flag.as_deref() == Some(id.as_str());
+                if is_bound_zone {
+                    self.sync_zones(now);
+                }
+                if follow_changed || is_companion {
+                    if follow_changed && self.home.service_notice.as_ref().is_some_and(|(ok, _)| *ok) {
+                        self.home.service_notice = None;
+                    }
                     self.sync_physical_panel(true, now);
                 }
+                if is_siren_output {
+                    self.sync_ha_sirens(now);
+                }
+                if is_bound_zone || follow_changed || is_companion || is_siren_output {
+                    self.panel.dirty = true;
+                }
+                return;
             }
         }
         self.sync_zones(now);
         self.panel.dirty = true;
     }
 
+    fn refresh_esphome_detection(&mut self) {
+        let Some(fp) = self.cfg.home_assistant.followed_panel() else {
+            self.home.detected_esphome = None;
+            self.home.detected_bypass_entity = None;
+            self.ha_companions = ha::PanelCompanions::default();
+            return;
+        };
+        let pfx = ha::detect_esphome_prefix(fp, &self.home.esphome_services);
+        let comp = ha::find_panel_companions(fp, &self.home.entities, pfx.as_deref());
+        self.home.detected_esphome = pfx;
+        self.home.detected_bypass_entity = comp
+            .zone_status
+            .clone()
+            .or_else(|| comp.lab_bypasses.clone())
+            .or_else(|| comp.bypass_flag.clone());
+        self.ha_companions = comp;
+    }
+
     fn sync_physical_panel(&mut self, live: bool, now: Instant) {
         let link = self.cfg.home_assistant.panel_link();
         self.panel.set_panel_link(link, now);
-        let id = self.cfg.home_assistant.followed_panel();
-        let state = id.filter(|_| self.home.online)
-            .and_then(|id| self.home.entities.get(id))
-            .and_then(|entity| ha::AlarmState::parse(&entity.state));
-        self.panel.sync_physical_panel(state, live, now);
+        self.panel.ha_zone_mirror_only = link != ha::PanelLink::Independent && !self.cfg.home_assistant.ha_zones_trigger_alarm;
+        let id = self.cfg.home_assistant.followed_panel().map(str::to_owned);
+        let mut instant_active = false;
+        if let Some(ref panel_id) = id {
+            if self.home.online {
+                let comp = self.ha_companions.clone();
+                let max_z = self.panel.n() as u8;
+                let mut remote_bypasses: Vec<u8> = Vec::new();
+                let mut remote_alarms: Vec<u8> = Vec::new();
+                let mut has_bypass_source = false;
+                if let Some(zs_id) = &comp.zone_status {
+                    if let Some(ent) = self.home.entities.get(zs_id) {
+                        let snap = ha::parse_zone_status(&ent.state, max_z, false);
+                        has_bypass_source = true;
+                        remote_bypasses.extend(snap.bypassed);
+                        remote_alarms.extend(snap.alarmed);
+                    }
+                }
+                if let Some(lab_id) = &comp.lab_bypasses {
+                    if let Some(ent) = self.home.entities.get(lab_id) {
+                        let snap = ha::parse_zone_status(&ent.state, max_z, true);
+                        has_bypass_source = true;
+                        for z in snap.bypassed {
+                            if !remote_bypasses.contains(&z) {
+                                remote_bypasses.push(z);
+                            }
+                        }
+                    }
+                }
+                if let Some(panel_ent) = self.home.entities.get(panel_id) {
+                    let attr_byps = panel_ent.attribute_bypassed_zones(max_z);
+                    if !attr_byps.is_empty() {
+                        has_bypass_source = true;
+                        for z in attr_byps {
+                            if !remote_bypasses.contains(&z) {
+                                remote_bypasses.push(z);
+                            }
+                        }
+                    }
+                }
+                for binding in self.cfg.home_assistant.bindings.iter().filter(|b| b.model == self.panel.model) {
+                    if let Some(ent) = self.home.entities.get(&binding.entity) {
+                        if ent.is_zone_bypassed() {
+                            has_bypass_source = true;
+                            if !remote_bypasses.contains(&binding.zone) {
+                                remote_bypasses.push(binding.zone);
+                            }
+                        }
+                    }
+                }
+                if !has_bypass_source {
+                    if let Some(byp_id) = &comp.bypass_flag {
+                        if let Some(ent) = self.home.entities.get(byp_id) {
+                            if ent.state.eq_ignore_ascii_case("off") {
+                                has_bypass_source = true;
+                            }
+                        }
+                    }
+                }
+                let fire_active = comp
+                    .fire_flag
+                    .as_deref()
+                    .and_then(|fid| self.home.entities.get(fid))
+                    .is_some_and(|e| e.state.eq_ignore_ascii_case("on"));
+                instant_active = comp
+                    .instant_flag
+                    .as_deref()
+                    .and_then(|iid| self.home.entities.get(iid))
+                    .is_some_and(|e| e.state.eq_ignore_ascii_case("on"));
+                // Sync real-panel bypasses, alarmed zones, and fire flag BEFORE checking
+                // armed/ready state so bypassed open zones on the real panel are honored!
+                if self.cfg.home_assistant.sync_bypasses {
+                    self.panel.sync_ha_bypasses(&remote_bypasses, &remote_alarms, fire_active, has_bypass_source, now);
+                } else {
+                    self.panel.sync_ha_bypasses(&[], &remote_alarms, fire_active, false, now);
+                }
+            }
+        }
+        let panel_ent = id
+            .as_deref()
+            .filter(|_| self.home.online)
+            .and_then(|id| self.home.entities.get(id));
+        let mut state = panel_ent.and_then(|entity| ha::AlarmState::parse(&entity.state));
+        if state == Some(ha::AlarmState::Stay) && instant_active {
+            state = Some(ha::AlarmState::StayInstant);
+        }
+        let next_state = panel_ent.and_then(ha::Entity::alarm_next_state);
+        let delay_secs = panel_ent.and_then(ha::Entity::alarm_delay_secs);
+        let elapsed_secs = panel_ent.and_then(ha::Entity::elapsed_since_last_changed_secs);
+        self.panel.sync_physical_panel_meta(state, next_state, delay_secs, elapsed_secs, live, now);
+        if self.panel.ha_timers_dirty {
+            self.panel.ha_timers_dirty = false;
+            self.cfg.home_assistant.learned_exit_away = self.panel.ha_learned_exit_away;
+            self.cfg.home_assistant.learned_exit_stay = self.panel.ha_learned_exit_stay;
+            self.cfg.home_assistant.learned_entry = self.panel.ha_learned_entry;
+            self.home.learned_exit_away = self.panel.ha_learned_exit_away;
+            self.home.learned_exit_stay = self.panel.ha_learned_exit_stay;
+            self.home.learned_entry = self.panel.ha_learned_entry;
+            self.cfg.save();
+        }
+    }
+
+    fn sync_ha_sirens(&mut self, now: Instant) {
+        if !self.home.online {
+            if self.ha_output_tests.is_empty() && self.panel.ha_external_siren.is_some() {
+                self.panel.ha_external_siren = None;
+                self.panel.ha_external_siren_label = None;
+                self.panel.dirty = true;
+            }
+            return;
+        }
+        // Clear outbound command guard early as soon as HA echoes the expected state,
+        // so flipping the HA siren switch back ON immediately activates RoomGuard's siren!
+        if let (Some(until), Some(target)) = (self.ha_bell_cmd_until, self.ha_bell_cmd_target) {
+            if now >= until {
+                self.ha_bell_cmd_until = None;
+                self.ha_bell_cmd_target = None;
+            } else {
+                let mut any_writable = false;
+                let mut all_match = true;
+                for entity_id in &self.cfg.home_assistant.siren_outputs {
+                    if let Some(ent) = self.home.entities.get(entity_id) {
+                        if ent.is_writable_output() {
+                            any_writable = true;
+                            if ent.is_output_on() != target {
+                                all_match = false;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if any_writable && all_match {
+                    self.ha_bell_cmd_until = None;
+                    self.ha_bell_cmd_target = None;
+                }
+            }
+        }
+        if !self.ha_bell_active && self.ha_output_tests.is_empty() && self.ha_bell_cmd_until.is_none() {
+            let mut ext_pat: Option<BellPattern> = None;
+            let mut ext_label: Option<String> = None;
+            for entity_id in &self.cfg.home_assistant.siren_outputs {
+                if let Some(ent) = self.home.entities.get(entity_id) {
+                    if ent.is_output_on() {
+                        if ent.is_fire_output() {
+                            ext_pat = Some(BellPattern::Temporal3);
+                            ext_label = Some(ent.name().to_string());
+                            break;
+                        }
+                        if ext_pat.is_none() {
+                            ext_pat = Some(BellPattern::Steady);
+                            ext_label = Some(ent.name().to_string());
+                        }
+                    }
+                }
+            }
+            if self.panel.ha_external_siren != ext_pat || self.panel.ha_external_siren_label != ext_label {
+                let was_on = self.panel.ha_external_siren.is_some();
+                let now_on = ext_pat.is_some();
+                self.panel.ha_external_siren = ext_pat;
+                self.panel.ha_external_siren_label = ext_label.clone();
+                if now_on && !was_on {
+                    let who = ext_label.as_deref().unwrap_or("Home Assistant siren");
+                    self.panel.log(EvKind::Alarm, format!("Home Assistant siren active: {who}"));
+                } else if !now_on && was_on {
+                    self.panel.log(EvKind::Info, "Home Assistant siren turned off");
+                }
+                self.panel.dirty = true;
+            }
+        }
     }
 
     fn home_active(&self, binding: &ha::Binding) -> Option<bool> {
@@ -1086,9 +1579,13 @@ impl Engine {
         let mask = self.cfg.camera.camera_mask();
         let n = self.panel.n();
         self.panel.camera_zone = mask;
+        if self.panel.home_zone.len() != n {
+            self.panel.home_zone.resize(n, false);
+        }
         self.panel.home_sensor_unavailable = false;
         for i in 0..n {
             self.zone_want[i] = if let Some(binding) = self.cfg.home_assistant.binding(self.panel.model, (i + 1) as u8) {
+                self.panel.home_zone[i] = true;
                 let active = self.home_active(binding);
                 let available = active.is_some();
                 if let Some(camera) = self.panel.camera_zone.get_mut(i) {
@@ -1098,8 +1595,10 @@ impl Engine {
                 // Transport failure is a supervision fault, never a motion edge.
                 (active.unwrap_or(self.panel.zones[i].open), false, !available)
             } else if !mask.get(i).copied().unwrap_or(false) {
+                self.panel.home_zone[i] = false;
                 (self.sim[i], false, false)
             } else {
+                self.panel.home_zone[i] = false;
                 let active = self.cam_motion[i] || self.cam_contact_open[i];
                 match self.panel.model {
                     Model::Pc1832 | Model::Vista20p => (active, self.cam_covered, !self.cam_online),
@@ -1200,14 +1699,38 @@ impl Engine {
             new.model = self.panel.model;
         }
         if busy {
+            // Keep HA panel PIN, siren outputs, and sync preferences editable even while armed
+            // so a wrong PIN can never trap the user out of disarming!
+            let pin = new.home_assistant.panel_code;
+            let sirens = new.home_assistant.siren_outputs;
+            let zones_trigger = new.home_assistant.ha_zones_trigger_alarm;
+            let sync_bypasses = new.home_assistant.sync_bypasses;
             new.home_assistant = self.cfg.home_assistant.clone();
+            new.home_assistant.panel_code = pin;
+            new.home_assistant.siren_outputs = sirens;
+            new.home_assistant.ha_zones_trigger_alarm = zones_trigger;
+            new.home_assistant.sync_bypasses = sync_bypasses;
         }
         let hub_changed = new.home_assistant.enabled != self.cfg.home_assistant.enabled
             || new.home_assistant.url != self.cfg.home_assistant.url
             || new.home_assistant.token != self.cfg.home_assistant.token;
         let bindings_changed = new.home_assistant.bindings != self.cfg.home_assistant.bindings;
-        let followed_panel_changed = new.home_assistant.followed_panel() != self.cfg.home_assistant.followed_panel()
-            || new.home_assistant.panel_sync != self.cfg.home_assistant.panel_sync;
+        let followed_entity_changed = new.home_assistant.followed_panel() != self.cfg.home_assistant.followed_panel();
+        let followed_panel_changed = followed_entity_changed
+            || new.home_assistant.panel_sync != self.cfg.home_assistant.panel_sync
+            || new.home_assistant.ha_zones_trigger_alarm != self.cfg.home_assistant.ha_zones_trigger_alarm;
+        let sirens_changed = new.home_assistant.siren_outputs != self.cfg.home_assistant.siren_outputs;
+        let sync_bypasses_changed = new.home_assistant.sync_bypasses != self.cfg.home_assistant.sync_bypasses;
+        // Preserve Engine-learned panel timers unless the user switched to a different linked panel.
+        if followed_entity_changed {
+            new.home_assistant.learned_exit_away = None;
+            new.home_assistant.learned_exit_stay = None;
+            new.home_assistant.learned_entry = None;
+        } else {
+            new.home_assistant.learned_exit_away = self.panel.ha_learned_exit_away.or(new.home_assistant.learned_exit_away);
+            new.home_assistant.learned_exit_stay = self.panel.ha_learned_exit_stay.or(new.home_assistant.learned_exit_stay);
+            new.home_assistant.learned_entry = self.panel.ha_learned_entry.or(new.home_assistant.learned_entry);
+        }
         let model_changed = new.model != self.panel.model;
         let cam_changed = new.camera != self.cfg.camera;
         let webcam_toggled = new.camera.enabled != self.cfg.camera.enabled;
@@ -1221,10 +1744,37 @@ impl Engine {
         self.cfg = new;
         if model_changed {
             self.save(true);
+            if self.home.online {
+                if self.ha_bell_active {
+                    for entity_id in &self.cfg.home_assistant.siren_outputs {
+                        self.hub.set_output(self.hub_epoch, entity_id.clone(), false);
+                    }
+                }
+                for entity_id in self.ha_output_tests.keys() {
+                    self.hub.set_output(self.hub_epoch, entity_id.clone(), false);
+                }
+            }
+            self.ha_bell_active = false;
+            self.ha_output_tests.clear();
             self.audio.send(AudioCmd::Silence);
             let _ = self.memo.send(crate::audio::memo::Command::Cancel);
             self.zone_pend = [None; MAX_PANEL_ZONES];
             self.panel = load_panel(self.cfg.model, &self.cfg, now);
+            // Switching keypads is only permitted while disarmed; clear any stale saved armed
+            // state from the other keypad's save file so a previous session never resurrects Armed.
+            if self.panel.armed.is_some() || self.panel.exit.is_some() {
+                self.panel.armed = None;
+                self.panel.exit = None;
+                self.panel.entry = None;
+                self.panel.alarms.clear();
+                self.panel.vista_night = false;
+                for z in &mut self.panel.zones {
+                    z.bypassed = false;
+                    z.auto_bypass = false;
+                    z.alarm = false;
+                }
+                self.save_due = Some(now);
+            }
             self.last_buzzer = self.panel.buzzer;
             self.last_power = None;
             self.saved_events = self.panel.events_seq;
@@ -1293,7 +1843,13 @@ impl Engine {
         self.panel.dirty = true;
         if hub_changed {
             self.hub_epoch += 1;
-            self.home = HomeView::default();
+            self.home = HomeView {
+                learned_exit_away: self.panel.ha_learned_exit_away,
+                learned_exit_stay: self.panel.ha_learned_exit_stay,
+                learned_entry: self.panel.ha_learned_entry,
+                ..HomeView::default()
+            };
+            self.ha_companions = ha::PanelCompanions::default();
             if self.cfg.home_assistant.enabled {
                 self.home.state = ha::ConnectionState::Connecting;
                 self.home.status = "Connecting to Home Assistant...".into();
@@ -1311,10 +1867,24 @@ impl Engine {
             self.sync_zones(now);
         }
         if followed_panel_changed || hub_changed || model_changed {
+            if followed_entity_changed {
+                self.panel.ha_learned_exit_away = None;
+                self.panel.ha_learned_exit_stay = None;
+                self.panel.ha_learned_entry = None;
+                self.home.learned_exit_away = None;
+                self.home.learned_exit_stay = None;
+                self.home.learned_entry = None;
+            }
             if followed_panel_changed {
                 self.panel.set_following_panel(false, now);
             }
+            self.refresh_esphome_detection();
             self.sync_physical_panel(false, now);
+        } else if sync_bypasses_changed {
+            self.sync_physical_panel(false, now);
+        }
+        if sirens_changed {
+            self.sync_ha_sirens(now);
         }
     }
 
@@ -1398,16 +1968,132 @@ impl Engine {
                 Out::Snapshot(_) | Out::LearnFace => {}
                 Out::Disarmed { after_alarm } => {
                     self.entry_evidence = None;
+                    if self.home.online && (self.ha_bell_active || self.panel.ha_external_siren.is_some()) {
+                        self.ha_bell_active = false;
+                        self.ha_bell_cmd_until = Some(now + Duration::from_secs(2));
+                        self.ha_bell_cmd_target = Some(false);
+                        self.ha_output_tests.clear();
+                        self.panel.ha_external_siren = None;
+                        self.panel.ha_external_siren_label = None;
+                        for entity_id in &self.cfg.home_assistant.siren_outputs {
+                            if self.home.entities.get(entity_id).map_or(true, ha::Entity::is_writable_output) {
+                                self.hub.set_output(self.hub_epoch, entity_id.clone(), false);
+                            }
+                        }
+                    }
                     let res = self.op.disarmed(after_alarm, now, &self.cfg.operator);
                     self.handle_op(res);
                 }
                 Out::Armed(a) => self.cam.send(CamCmd::Armed(a)),
                 Out::HaPanelCmd(cmd) => self.send_ha_panel_cmd(cmd),
+                Out::HaBypassCmd(cmd) => self.send_ha_bypass_cmd(cmd),
             }
         }
     }
 
+    fn send_ha_bypass_cmd(&mut self, cmd: panel::HaBypassCmd) {
+        if self.cfg.home_assistant.panel_link() != ha::PanelLink::TwoWay
+            || !self.cfg.home_assistant.sync_bypasses
+            || !self.home.online
+        {
+            return;
+        }
+        let Some(followed) = self.cfg.home_assistant.followed_panel().map(str::to_owned) else {
+            return;
+        };
+        // 1) Home Assistant Test Lab companion input_text (two-way bypass testing without hardware).
+        if let Some(lab_id) = self.ha_companions.lab_bypasses.clone() {
+            let manual: Vec<u8> = (1..=self.panel.n())
+                .filter(|&z| self.panel.zones[z - 1].bypassed && !self.panel.zones[z - 1].auto_bypass)
+                .map(|z| z as u8)
+                .collect();
+            self.hub.set_input_text(self.hub_epoch, lab_id, ha::format_bypass_list(&manual));
+        }
+        // 2) Real ESPHome DSC Keybus / Vista ECP keypress service (auto-discovered via get_services).
+        let Some(prefix) = self.home.detected_esphome.clone() else {
+            return;
+        };
+        let part_svc = format!("{prefix}_alarm_keypress_partition");
+        let base_svc = format!("{prefix}_alarm_keypress");
+        let (svc, part) = if self.home.esphome_services.iter().any(|s| s == &part_svc) {
+            (part_svc, Some(ha::detect_partition(&followed)))
+        } else if self.home.esphome_services.iter().any(|s| s == &base_svc) {
+            (base_svc, None)
+        } else {
+            return;
+        };
+        let pick_code = |entered: &Option<String>| -> String {
+            let cfg_pin = self.cfg.home_assistant.panel_code.trim();
+            if !cfg_pin.is_empty() {
+                cfg_pin.to_string()
+            } else {
+                entered.as_deref().unwrap_or("").trim().to_string()
+            }
+        };
+        let keys = match self.panel.model {
+            Model::Pc1832 => {
+                let need_code = self.panel.ee.toggle(Model::Pc1832, "015", 5)
+                    || self.panel.ee.toggle(Model::Pc1832, "022", 1);
+                match &cmd {
+                    panel::HaBypassCmd::SetZone { zone, code, .. } => {
+                        let c = if need_code { pick_code(code) } else { String::new() };
+                        format!("*1{c}{:02}#", zone)
+                    }
+                    panel::HaBypassCmd::ClearAll { code } => {
+                        let c = if need_code { pick_code(code) } else { String::new() };
+                        format!("*1{c}00#")
+                    }
+                    panel::HaBypassCmd::RecallGroup { code_num, code, .. } => {
+                        let c = if need_code { pick_code(code) } else { String::new() };
+                        format!("*1{c}{:02}#", code_num)
+                    }
+                    panel::HaBypassCmd::QuickBypass { zones, code } => {
+                        let c = if need_code { pick_code(code) } else { String::new() };
+                        let zstr: String = zones.iter().map(|z| format!("{:02}", z)).collect();
+                        format!("*1{c}{zstr}#")
+                    }
+                }
+            }
+            Model::Pc1550 => {
+                let need_code = self.panel.ee.toggle(Model::Pc1550, "14", 1);
+                match &cmd {
+                    panel::HaBypassCmd::SetZone { zone, code, .. } if (1..=6).contains(zone) => {
+                        let c = if need_code { pick_code(code) } else { String::new() };
+                        format!("*1{c}{zone}#")
+                    }
+                    panel::HaBypassCmd::RecallGroup { code, .. } => {
+                        let c = if need_code { pick_code(code) } else { String::new() };
+                        format!("*1{c}9#")
+                    }
+                    _ => String::new(),
+                }
+            }
+            Model::Vista20p => match &cmd {
+                panel::HaBypassCmd::SetZone { zone, bypassed: true, code } => {
+                    let c = pick_code(code);
+                    if c.len() == 4 { format!("{c}6{:02}", zone) } else { String::new() }
+                }
+                panel::HaBypassCmd::QuickBypass { code, .. } => {
+                    let c = pick_code(code);
+                    if c.len() == 4 { format!("{c}6#") } else { String::new() }
+                }
+                panel::HaBypassCmd::ClearAll { code } => {
+                    let c = pick_code(code);
+                    if c.len() == 4 { format!("{c}600") } else { String::new() }
+                }
+                _ => String::new(),
+            },
+        };
+        if !keys.is_empty() {
+            self.hub.call_esphome_keypress(self.hub_epoch, svc, keys, part);
+        }
+    }
+
     fn send_ha_panel_cmd(&mut self, cmd: panel::HaPanelCmd) {
+        self.send_ha_panel_cmd_with_override(cmd, None);
+    }
+
+    fn send_ha_panel_cmd_with_override(&mut self, cmd: panel::HaPanelCmd, code_override: Option<String>) {
         if self.cfg.home_assistant.panel_link() != ha::PanelLink::TwoWay || !self.home.online {
             return;
         }
@@ -1415,10 +2101,18 @@ impl Engine {
             return;
         };
         let entity = self.home.entities.get(&entity_id);
+        if matches!(cmd, panel::HaPanelCmd::Trigger) {
+            // Only forward alarm_trigger to HA panels that explicitly advertise TRIGGER (e.g. Lab/Manual/Alarmo).
+            // Real ESPHome house panels do not advertise TRIGGER, keeping monitored house alarms safe.
+            if entity.is_some_and(ha::Entity::supports_trigger) {
+                self.hub.call_alarm(self.hub_epoch, entity_id, ha::AlarmAction::Trigger, None);
+            }
+            return;
+        }
         let configured_code = self.cfg.home_assistant.panel_code.trim();
-        let (action, entered_code) = match cmd {
-            panel::HaPanelCmd::Arm { mode, night, code } => {
-                let act = if night {
+        let (action, entered_code, esphome_state) = match &cmd {
+            panel::HaPanelCmd::Arm { mode, night, no_entry, code } => {
+                let act = if *night {
                     if entity.map_or(true, ha::Entity::supports_night) {
                         ha::AlarmAction::ArmNight
                     } else {
@@ -1430,23 +2124,66 @@ impl Engine {
                         ArmMode::Away => ha::AlarmAction::ArmAway,
                     }
                 };
-                (act, code)
+                let esp = if *night {
+                    "N"
+                } else if *no_entry && *mode == ArmMode::Stay && self.panel.model == Model::Vista20p {
+                    "I"
+                } else if *mode == ArmMode::Stay {
+                    "S"
+                } else {
+                    "A"
+                };
+                (act, code.clone(), esp)
             }
-            panel::HaPanelCmd::Disarm { code } => (ha::AlarmAction::Disarm, code),
+            panel::HaPanelCmd::Disarm { code } => (ha::AlarmAction::Disarm, code.clone(), "D"),
+            panel::HaPanelCmd::Trigger => return,
         };
-        // Pick the code to send: explicit Settings HA panel code wins; otherwise fall back
-        // to the keypad code the user just typed (only when HA indicates a code format, or on Disarm).
-        let needs_code = entity.map_or(true, |e| {
-            matches!(action, ha::AlarmAction::Disarm) && e.needs_code() || e.code_arm_required()
-        });
-        let code = if !configured_code.is_empty() {
+        // Pick the code to send: override wins (retry path); next explicit HA panel PIN;
+        // otherwise forward the code typed on RoomGuard's keypad directly to HA / ESPHome
+        // so the user never has to store their real alarm PIN in plaintext config or YAML.
+        let is_alarm_entity = entity.is_some_and(ha::Entity::supports_alarm_services);
+        let forward_typed = matches!(action, ha::AlarmAction::Disarm)
+            || !is_alarm_entity
+            || entity.map_or(true, |e| e.needs_code() || e.code_arm_required());
+        let typed = entered_code.map(|c| c.trim().to_owned()).filter(|c| !c.is_empty());
+        let code = if let Some(ov) = code_override {
+            self.ha_retry_cmd = None;
+            Some(ov)
+        } else if !configured_code.is_empty() {
+            if let Some(ref kp_code) = typed {
+                if kp_code != configured_code {
+                    self.ha_retry_cmd = Some((cmd.clone(), kp_code.clone(), Instant::now()));
+                } else {
+                    self.ha_retry_cmd = None;
+                }
+            } else {
+                self.ha_retry_cmd = None;
+            }
             Some(configured_code.to_owned())
-        } else if needs_code {
-            entered_code.filter(|c| !c.trim().is_empty())
+        } else if forward_typed {
+            self.ha_retry_cmd = None;
+            typed
         } else {
+            self.ha_retry_cmd = None;
             None
         };
-        self.hub.call_alarm(self.hub_epoch, entity_id, action, code);
+        if is_alarm_entity {
+            self.hub.call_alarm(self.hub_epoch, entity_id, action, code);
+        } else if let Some(prefix) = self.home.detected_esphome.clone() {
+            // Direct ESPHome DSC/Vista control even when linked straight to sensor.*_status_partition_1!
+            let set_svc = format!("{prefix}_set_alarm_state");
+            if self.home.esphome_services.iter().any(|s| s == &set_svc) {
+                let part = ha::detect_partition(&entity_id);
+                self.hub.call_esphome_alarm_state(
+                    self.hub_epoch,
+                    set_svc,
+                    esphome_state.to_string(),
+                    code.unwrap_or_default(),
+                    part,
+                    action,
+                );
+            }
+        }
     }
 
     fn tick(&mut self) {
@@ -1456,6 +2193,31 @@ impl Engine {
         self.home_pulses.retain(|_, until| now < *until);
         if self.home_pulses.len() != pulses {
             self.sync_zones(now);
+        }
+        // When an outbound Two-Way HA command window expires, verify HA's real state
+        // immediately so RoomGuard and Home Assistant never stay out of sync (e.g. wrong PIN).
+        if self.panel.ha_outbound_until.is_some_and(|until| now >= until) {
+            let expected = self.panel.ha_expect.take();
+            self.panel.ha_outbound_until = None;
+            let mut mismatch = false;
+            if let Some(expect) = expected {
+                if let Some(id) = self.cfg.home_assistant.followed_panel() {
+                    if let Some(st) = self.home.entities.get(id).and_then(|e| ha::AlarmState::parse(&e.state)) {
+                        if !expect.matches(st) {
+                            mismatch = true;
+                            let msg = if expect == panel::HaExpect::Disarmed {
+                                format!("Home Assistant panel is still {} (check your HA panel PIN)", st.label())
+                            } else {
+                                format!("Home Assistant panel stayed {} (check your HA panel PIN/settings)", st.label())
+                            };
+                            self.home.service_notice = Some((false, msg.clone()));
+                            self.panel.log(EvKind::Trouble, msg);
+                        }
+                    }
+                }
+            }
+            // Re-sync with live=false on mismatch so we snap to HA's actual state without looping Disarm.
+            self.sync_physical_panel(!mismatch, now);
         }
         self.pending_photos.retain(|(_, job, deadline)| {
             if now < *deadline {
@@ -1486,7 +2248,65 @@ impl Engine {
             self.check_camera(now);
         }
         self.settle_zones(now);
+        // Two-way Home Assistant siren/bell sync:
+        // 1) HA -> RoomGuard: if any linked HA siren/bell/alarm entity (including ESPHome al_1/alm_1/fa_1/fire_1
+        //    or Lab siren toggle) is turned ON from Home Assistant, sound RoomGuard's PC siren live!
+        self.sync_ha_sirens(now);
         self.panel.tick(now, wall);
+        // 2) RoomGuard -> HA: drive linked writable Home Assistant sirens/switches/lights automatically
+        //    whenever RoomGuard's OWN panel bell/siren sounds (and turn them OFF on disarm/silence).
+        let local_bell = self.panel.local_bell_active(now);
+        if local_bell != self.ha_bell_active {
+            self.ha_bell_active = local_bell;
+            self.ha_bell_cmd_until = Some(now + Duration::from_secs(2));
+            self.ha_bell_cmd_target = Some(local_bell);
+            if self.home.online {
+                for entity_id in &self.cfg.home_assistant.siren_outputs {
+                    let writable = self
+                        .home
+                        .entities
+                        .get(entity_id)
+                        .map_or(true, ha::Entity::is_writable_output);
+                    if writable {
+                        self.hub.set_output(self.hub_epoch, entity_id.clone(), local_bell);
+                    }
+                }
+            }
+            if !local_bell {
+                self.ha_output_tests.clear();
+                self.panel.ha_external_siren = None;
+                self.panel.ha_external_siren_label = None;
+            }
+        }
+        // Auto-turn-off timed HA siren test bursts (e.g. "Test (3s)").
+        if !self.ha_output_tests.is_empty() {
+            let expired: Vec<String> = self
+                .ha_output_tests
+                .iter()
+                .filter(|(_, until)| now >= **until)
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in expired {
+                self.ha_output_tests.remove(&id);
+                if self.home.online && !self.ha_bell_active {
+                    let writable = self
+                        .home
+                        .entities
+                        .get(&id)
+                        .map_or(true, ha::Entity::is_writable_output);
+                    if writable {
+                        self.hub.set_output(self.hub_epoch, id, false);
+                    }
+                }
+            }
+            if self.ha_output_tests.is_empty() {
+                self.ha_bell_cmd_until = Some(now + Duration::from_secs(2));
+                self.ha_bell_cmd_target = Some(false);
+                self.panel.ha_external_siren = None;
+                self.panel.ha_external_siren_label = None;
+                self.panel.dirty = true;
+            }
+        }
         if self.panel.buzzer != self.last_buzzer {
             self.last_buzzer = self.panel.buzzer;
             self.push_volumes();
@@ -1543,6 +2363,16 @@ impl Engine {
             if self.cfg.operator.enabled {
                 let name = self.cfg.display_name();
                 self.op.note_shutdown(&name);
+            }
+        }
+        if self.home.online {
+            if self.ha_bell_active {
+                for entity_id in &self.cfg.home_assistant.siren_outputs {
+                    self.hub.set_output(self.hub_epoch, entity_id.clone(), false);
+                }
+            }
+            for entity_id in self.ha_output_tests.keys() {
+                self.hub.set_output(self.hub_epoch, entity_id.clone(), false);
             }
         }
         self.audio.send(AudioCmd::Silence);
@@ -1616,6 +2446,7 @@ impl Engine {
                 zone
             }).collect(),
             bell: p.bell_sent != BellPattern::Off,
+            ha_external_siren: p.ha_external_siren.is_some(),
             siren: self.cfg.sound.siren_model,
             hold: p.hold_progress(now),
             troubles: p.trouble_list(),
