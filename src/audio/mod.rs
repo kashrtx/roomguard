@@ -179,6 +179,9 @@ pub struct AudioHandle {
     siren: OutputWorker,
     devices: Arc<Mutex<Endpoints>>,
     split: Arc<AtomicBool>,
+    /// Set while a separate siren output isn't working, so the keypad
+    /// output carries the siren instead of the alarm going silent.
+    covering: Arc<AtomicBool>,
 }
 
 impl AudioHandle {
@@ -226,6 +229,11 @@ impl AudioHandle {
         worker.status.lock().map(|status| status.clone()).unwrap_or_default()
     }
 
+    /// The siren's own output is down and the keypad output is playing it.
+    pub fn siren_covered(&self) -> bool {
+        self.split.load(Ordering::Relaxed) && self.covering.load(Ordering::Relaxed)
+    }
+
     pub fn keypad_ok(&self) -> bool {
         self.keypad.ok.load(Ordering::Relaxed)
     }
@@ -242,15 +250,17 @@ impl AudioHandle {
 
 pub fn start() -> AudioHandle {
     let devices = Arc::new(Mutex::new(Endpoints::default()));
+    let covering = Arc::new(AtomicBool::new(false));
     AudioHandle {
-        keypad: start_output("audio-keypad", Some(devices.clone())),
-        siren: start_output("audio-siren", None),
+        keypad: start_output("audio-keypad", Some(devices.clone()), covering.clone(), false),
+        siren: start_output("audio-siren", None, covering.clone(), true),
         devices,
         split: Arc::new(AtomicBool::new(false)),
+        covering,
     }
 }
 
-fn start_output(name: &'static str, devices: Option<Arc<Mutex<Endpoints>>>) -> OutputWorker {
+fn start_output(name: &'static str, devices: Option<Arc<Mutex<Endpoints>>>, covering: Arc<AtomicBool>, siren: bool) -> OutputWorker {
     let (tx, rx) = mpsc::channel();
     let ok = Arc::new(AtomicBool::new(false));
     let running = ok.clone();
@@ -258,7 +268,7 @@ fn start_output(name: &'static str, devices: Option<Arc<Mutex<Endpoints>>>) -> O
     let status_rx = status.clone();
     let device_id = Arc::new(Mutex::new(None));
     let active_id = device_id.clone();
-    let spawned = std::thread::Builder::new().name(name.into()).spawn(move || run(rx, running, status_rx, active_id, devices));
+    let spawned = std::thread::Builder::new().name(name.into()).spawn(move || run(rx, running, status_rx, active_id, devices, covering, siren));
     if let Err(e) = spawned {
         util::log(&format!("could not start {}: {}", name, e));
     }
@@ -314,7 +324,10 @@ impl State {
     }
 }
 
-fn run(rx: Receiver<WorkerCmd>, ok: Arc<AtomicBool>, status: Arc<Mutex<String>>, device_id: Arc<Mutex<Option<String>>>, devices: Option<Arc<Mutex<Endpoints>>>) {
+fn run(
+    rx: Receiver<WorkerCmd>, ok: Arc<AtomicBool>, status: Arc<Mutex<String>>, device_id: Arc<Mutex<Option<String>>>,
+    devices: Option<Arc<Mutex<Endpoints>>>, covering: Arc<AtomicBool>, siren_worker: bool,
+) {
     util::set_thread_priority(util::prio::PANEL);
 
     // Endpoint enumeration can block on WASAPI. Keep it off the command path.
@@ -354,6 +367,10 @@ fn run(rx: Receiver<WorkerCmd>, ok: Arc<AtomicBool>, status: Arc<Mutex<String>>,
     let mut backoff = Duration::from_millis(100);
     loop {
         let Some(current) = &output else {
+            if siren_worker {
+                // Not split: the keypad output plays the siren anyway.
+                covering.store(false, Ordering::Relaxed);
+            }
             match rx.recv() {
                 Ok(WorkerCmd::Output(next)) => output = next,
                 Ok(WorkerCmd::Audio(cmd)) => state.remember(&cmd),
@@ -409,12 +426,34 @@ fn run(rx: Receiver<WorkerCmd>, ok: Arc<AtomicBool>, status: Arc<Mutex<String>>,
         let deadline = Instant::now() + backoff;
         let mut last_callback = Instant::now();
         let mut seen_callbacks = 0;
+        // Keypad worker: whether it's carrying the siren for a dead siren output.
+        let mut carrying = false;
         let retry = loop {
             let alive = stream.is_ok() && !failed.load(Ordering::Relaxed);
             let count = callbacks.load(Ordering::Relaxed);
             if count != seen_callbacks {
                 last_callback = Instant::now();
                 seen_callbacks = count;
+            }
+            if siren_worker && current.route == Route::Siren {
+                // The siren must never go silent because its own speaker
+                // failed, so the keypad output takes over until it's back.
+                let working = alive && last_callback.elapsed() < Duration::from_millis(1500);
+                covering.store(!working, Ordering::Relaxed);
+            }
+            if !siren_worker {
+                let take = alive && current.route == Route::Keypad && covering.load(Ordering::Relaxed);
+                if take != carrying {
+                    carrying = take;
+                    if carrying {
+                        util::log("Siren audio output isn't working; playing the siren on the keypad output");
+                        for cmd in state.replay().into_iter().filter(|cmd| Route::Siren.accepts(cmd) && !Route::Keypad.accepts(cmd)) {
+                            let _ = tx.send(cmd);
+                        }
+                    } else {
+                        let _ = tx.send(AudioCmd::ClearSiren);
+                    }
+                }
             }
             if alive && last_callback.elapsed() > Duration::from_secs(3) {
                 if let Ok(mut status) = status.lock() {
@@ -457,7 +496,8 @@ fn run(rx: Receiver<WorkerCmd>, ok: Arc<AtomicBool>, status: Arc<Mutex<String>>,
                     if matches!(cmd, AudioCmd::Silence) {
                         pending.clear();
                     }
-                    if current.route.accepts(&cmd) {
+                    let route = if carrying { Route::Both } else { current.route };
+                    if route.accepts(&cmd) {
                         if alive {
                             let _ = tx.send(cmd);
                         } else if State::worth_replaying(&cmd) {
@@ -595,7 +635,9 @@ fn build_stream(
     let stream = pcm!(format, open).map_err(|e| format!("{label}: {e}"))?;
     stream.play().map_err(|e| format!("{label}: {e}"))?;
     util::log(&format!("audio output: {label}, {} Hz, {} channels, {format}", config.sample_rate, config.channels));
-    Ok((stream, id, label))
+    // The settings show the device's real format, which helps when one
+    // speaker works and another doesn't.
+    Ok((stream, id, format!("{label} · {} Hz · {} ch · {format}", config.sample_rate, config.channels)))
 }
 
 #[cfg(test)]

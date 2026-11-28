@@ -644,6 +644,9 @@ impl SettingsView {
             } else {
                 ui.label(RichText::new(if status.is_empty() { "Opening output…" } else { status.as_str() }).color(theme::AMBER));
             }
+            if siren && audio.siren_covered() {
+                ui.label(RichText::new("The siren's speaker isn't working, so the siren plays through Keypad & voice until it's back.").color(theme::AMBER));
+            }
         }
         if s.master == 0.0 || s.siren == 0.0 {
             ui.label(RichText::new("The siren volume is muted in RoomGuard.").color(theme::AMBER));

@@ -4017,7 +4017,9 @@ impl Panel {
         if self.home_sensor_unavailable {
             t |= tb::HOME_SENSOR;
         }
-        if self.physical_unavailable_since.is_some_and(|since| now.saturating_duration_since(since) >= Duration::from_secs(8)) {
+        // Same supervision window as the sensors: a Home Assistant restart
+        // isn't a trouble, an outage that outlasts it is.
+        if self.physical_unavailable_since.is_some_and(|since| now.saturating_duration_since(since) >= crate::home_assistant::SUPERVISION_GRACE) {
             t |= tb::HOME_PANEL;
         }
         if t == self.troubles {

@@ -44,6 +44,14 @@ RoomGuard 2.2.0 brings wire-level panel accuracy across all three emulated keypa
 - **Fixed Stay / Away arming & false "Zone Bypassed" display:** Stay automatic interior bypasses are kept separate from manual user bypasses so VistaGuard 20P shows `** ALL SECURE **` unless you manually bypassed a zone, and Away arming behavior matches each panel's rules reliably.
 - **Fixed unexpected instant alarms & camera races:** Tightened limb checks against lighting shifts, added Delay-first zone settling to prevent Interior zones racing ahead of doorways, separated camera fault troubles from tamper alarms, and shortened camera zone release hold to 1.0 s.
 
+### Home Assistant alerts, supervision and audio fixes
+
+- **Home Assistant always knows when an alarm goes off.** RoomGuard publishes `sensor.roomguard_alarm` in Home Assistant's own alarm states (`disarmed`, `arming`, `armed_away`, `armed_home`, `armed_night`, `pending`, `triggered`) with the alarm zones, troubles, AC power, and open and bypassed zones as attributes. It fires `roomguard_state` and `roomguard_alarm` events, shows a Home Assistant notification during an alarm (cleared on disarm), and can send phone alerts through a notify service. It republishes when the link returns, and announces an alarm that began while the link was down. Codes are never sent. Settings are under Home Assistant > Alerts in Home Assistant.
+- **A Home Assistant restart no longer sets the keypads beeping.** Sensors and the linked panel now get a 3 minute supervision window, like wireless sensors on a real panel. Zones keep their last known state meanwhile, and only an outage that outlasts the window becomes a trouble.
+- **Key beeps stay clean over a blaring siren.** The output is limited smoothly at -1 dBFS instead of hard clipped, and the siren dips about 6 dB under key beeps, confirmations and the voice when they share a speaker.
+- **The siren never goes silent because its own speaker failed.** If a separate siren output won't open or stops playing, the siren plays through the keypad output until it's back. Settings now show each output's real format.
+- The Test Lab YAML has no alarm code (a code there blocked disarming from RoomGuard's keypad), uses 15 second exit and entry delays, and includes a phone alert automation example.
+
 ## [2.1.0] - 2026-11-25
 
 RoomGuard 2.1.0 introduces the **VistaGuard 20P** voice keypad, guided empty-room calibration with lighting-invariant closed-door detection, limb-aware person tracking with an **Ignore desk** workflow, studio-matched sirens and keypad acoustics, zero-delay keystroke audio, and line-by-line manual accuracy across all three panels.

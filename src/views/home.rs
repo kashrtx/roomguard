@@ -571,6 +571,28 @@ impl HomeUi {
                 });
             });
 
+        ui.add_space(6.0);
+        egui::CollapsingHeader::new("Alerts in Home Assistant")
+            .id_salt("ha-alerts-section")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.set_max_width(content_w - 16.0);
+                let home = &mut cfg.home_assistant;
+                *changed |= ui.checkbox(&mut home.publish_status, "Publish RoomGuard's status as sensor.roomguard_alarm").changed();
+                wrapped_muted(
+                    ui,
+                    "Home Assistant sees RoomGuard as disarmed, arming, armed_away, armed_home, armed_night, pending or triggered, with the alarm zones, troubles and AC power as attributes. RoomGuard also fires roomguard_state and roomguard_alarm events for your automations. Codes are never sent.",
+                );
+                ui.add_space(4.0);
+                *changed |= ui.checkbox(&mut home.alarm_notifications, "Show a Home Assistant notification during an alarm").changed();
+                ui.add_space(4.0);
+                ui.label("Phone alerts (optional notify service)");
+                *changed |= ui
+                    .add(egui::TextEdit::singleline(&mut home.notify_service).hint_text("notify.mobile_app_your_phone").desired_width(field_w))
+                    .changed();
+                wrapped_muted(ui, "Each alarm is also sent to this notify service, such as the Home Assistant app on your phone.");
+            });
+
         ui.add_space(8.0);
         if ui.checkbox(&mut cfg.camera.enabled, "Use webcam").changed() {
             *changed = true;

@@ -190,3 +190,17 @@ Once the lab works, connecting real hardware works the exact same way:
   - **Automatic ESPHome Keybus / ECP integration:** When an ESPHome bridge exposes `sensor.*_zone_status` (`zs`), `fa_1`/`fire_1`, `armi_1`, and `esphome.<node>_alarm_keypress` / `set_alarm_state` services, RoomGuard auto-detects them to mirror real-panel bypasses, alarmed zones, Instant/Night/Away modes, and fire alarms (Temporal-3) two-way with zero extra YAML.
   - **Preventing double alarms:** When linked to a real panel whose sensors are also mapped into RoomGuard zones, check **Real panel handles alarms for Home Assistant zones (prevent double alarms)**. RoomGuard will still show live open/closed zone status, bypasses, and play Door Chime / voice chimes, while letting your real panel handle entry delays and alarms without duplicate sirens.
   - **Match your real zone list:** Open the flip-down door on your real wall keypad and copy the zone numbers, names, and types written by your installer directly into **Settings -> Panel -> Zone programming** or **Settings -> Home Assistant -> Wireless sensors -> Zones**.
+
+## Alerts in Home Assistant
+
+RoomGuard tells Home Assistant what it's doing, so your automations, dashboards and phone always know when an alarm goes off. Turn these on under Settings > Home Assistant > Alerts in Home Assistant.
+
+- **Status sensor.** `sensor.roomguard_alarm` uses Home Assistant's own alarm states: `disarmed`, `arming`, `armed_away`, `armed_home`, `armed_night`, `pending` (entry delay) and `triggered`. Its attributes include the panel, `ready`, `alarm_kind`, `alarm_zones`, `alarm_zone_names`, `troubles`, `ac_power`, `open_zones` and `bypassed_zones`. RoomGuard republishes it whenever the link comes back, so it's never stale.
+- **Events.** `roomguard_state` fires on every state change, and `roomguard_alarm` fires when an alarm starts, with the kind, zones, zone names and a ready-made `message`.
+- **Notifications.** A Home Assistant notification appears during an alarm and clears when you disarm. For phone alerts, enter your notify service (for example `notify.mobile_app_your_phone`) under Phone alerts, or use the automation example at the end of `roomguard_lab.yaml`.
+
+RoomGuard never sends your code to these, and the lab panel has no code in its YAML. RoomGuard checks your code at its own keypad.
+
+## When Home Assistant goes offline
+
+RoomGuard treats Home Assistant sensors like a wireless panel treats its sensors. If Home Assistant restarts, or a sensor or ESPHome device drops out briefly, every zone keeps its last known state and nothing beeps. Only a sensor, or the whole link, that stays gone for 3 minutes becomes a trouble, shown the way your keypad normally shows a supervision trouble. Everything clears by itself when Home Assistant is back, and an alarm that started while the link was down is still announced as soon as it returns.

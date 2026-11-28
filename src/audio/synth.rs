@@ -700,6 +700,16 @@ pub struct Synth {
     siren: Siren,
     preview: Option<(Siren, u32)>,
     vol_master: f32,
+    /// Output limiter gain, peak-hold counter, and its attack and release coefficients.
+    lim_gain: f32,
+    lim_att: f32,
+    lim_rel: f32,
+    lim_hold: u32,
+    lim_hold_max: u32,
+    /// How far the siren dips under key beeps and the voice.
+    duck: f32,
+    duck_att: f32,
+    duck_rel: f32,
     vol_siren: f32,
     vol_keypad: f32,
     vol_line: f32,
@@ -745,6 +755,14 @@ impl Synth {
             siren: Siren::new(sr, SirenModel::Wave2F, true),
             preview: None,
             vol_master: 0.8,
+            lim_gain: 1.0,
+            lim_att: (-1.0 / (0.00015 * sr)).exp(),
+            lim_rel: (-1.0 / (0.180 * sr)).exp(),
+            lim_hold: 0,
+            lim_hold_max: ms(sr, 12),
+            duck: 1.0,
+            duck_att: (-1.0 / (0.006 * sr)).exp(),
+            duck_rel: (-1.0 / (0.120 * sr)).exp(),
             vol_siren: 0.45,
             vol_keypad: 0.7,
             vol_line: 0.0,
@@ -1129,6 +1147,35 @@ impl Synth {
         interpolated * gain
     }
 
+    /// A peak limiter on everything summed into this output, so the keypad,
+    /// the voice and a siren playing together stay clean instead of clipping.
+    /// Below -1 dBFS it does nothing at all.
+    fn limit(&mut self, x: f32) -> f32 {
+        const CEILING: f32 = 0.891;
+        if !x.is_finite() {
+            self.lim_gain = 1.0;
+            return 0.0;
+        }
+        let peak = x.abs();
+        let target = if peak > CEILING { CEILING / peak } else { 1.0 };
+        if target < self.lim_gain {
+            self.lim_gain = target + (self.lim_gain - target) * self.lim_att;
+            self.lim_hold = self.lim_hold_max;
+        } else if self.lim_hold > 0 {
+            self.lim_hold -= 1;
+        } else {
+            self.lim_gain = target + (self.lim_gain - target) * self.lim_rel;
+        }
+        let y = x * self.lim_gain;
+        // Whatever the fast attack lets through is rounded off softly.
+        let a = y.abs();
+        if a <= 0.9 {
+            y
+        } else {
+            y.signum() * (0.9 + 0.0999 * ((a - 0.9) / 0.0999).tanh())
+        }
+    }
+
     pub fn next(&mut self) -> f32 {
         let (bg_on_raw, bg_freq) = self.sounder.next(self.sr);
         let key_ducked = if self.key_duck_left > 0 {
@@ -1197,7 +1244,13 @@ impl Synth {
             let line = self.line_next() * self.vol_line;
             let ring = self.ring_next();
             let click = self.click_next() * self.vol_keypad * 0.12;
-            (keypad * 0.8 + spoken + siren + preview + line + ring + click) * self.vol_master
+            // A key beep, confirmation or the voice stays clear over a siren on
+            // the same output: the siren dips about 6 dB under it, the way a
+            // keypad right in front of you cuts through a siren on the wall.
+            let target = if has_seg || speaking { 0.5 } else { 1.0 };
+            let coef = if target < self.duck { self.duck_att } else { self.duck_rel };
+            self.duck = target + (self.duck - target) * coef;
+            (keypad * 0.8 + spoken + click + (siren + preview) * self.duck + line + ring) * self.vol_master
         };
         // Keeps the output awake. Silence lets many laptop speakers and USB,
         // HDMI and Bluetooth outputs power their amplifier down, and waking it
@@ -1218,6 +1271,6 @@ impl Synth {
             5.0e-4
         };
         self.keepalive = -self.keepalive;
-        mix.clamp(-0.9999, 0.9999) + (TAU * self.ka_phase).sin() * ka_level + self.keepalive
+        self.limit(mix) + (TAU * self.ka_phase).sin() * ka_level + self.keepalive
     }
 }

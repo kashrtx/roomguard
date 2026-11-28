@@ -30,6 +30,21 @@ use panel::{Out, Panel, PanelSave};
 use types::*;
 use crate::home_assistant as ha;
 
+/// Trouble names Home Assistant sees in RoomGuard's status.
+const TROUBLE_NAMES: [(u32, &str); 11] = [
+    (panel::tb::LOW_BATT, "Low battery"),
+    (panel::tb::AC, "AC power"),
+    (panel::tb::BELL, "Siren"),
+    (panel::tb::FTC, "Failure to communicate"),
+    (panel::tb::TLM, "Phone line"),
+    (panel::tb::ZONE_FAULT, "Zone fault"),
+    (panel::tb::ZONE_TAMPER, "Zone tamper"),
+    (panel::tb::CLOCK, "Clock not set"),
+    (panel::tb::FIRE_LOOP, "Fire zone"),
+    (panel::tb::HOME_SENSOR, "Home Assistant sensor"),
+    (panel::tb::HOME_PANEL, "Home Assistant panel"),
+];
+
 pub enum OpInput {
     Answer,
     Decline,
@@ -413,6 +428,16 @@ struct Engine {
     hub_epoch: u64,
     home_pulses: std::collections::BTreeMap<String, Instant>,
     ha_bell_active: bool,
+    /// When each Home Assistant zone's sensor went missing (supervision).
+    home_lost_at: [Option<Instant>; MAX_PANEL_ZONES],
+    home_lost_check: Option<Instant>,
+    /// What RoomGuard last told Home Assistant about itself.
+    ha_status_sent: Option<String>,
+    ha_status_at: Option<Instant>,
+    ha_status_check: Option<Instant>,
+    ha_status_online: bool,
+    ha_state_name: Option<&'static str>,
+    ha_alarm_notified: bool,
     ha_bell_cmd_until: Option<Instant>,
     ha_bell_cmd_target: Option<bool>,
     ha_output_tests: std::collections::BTreeMap<String, Instant>,
@@ -481,6 +506,14 @@ impl Engine {
             hub_epoch: 0,
             home_pulses: Default::default(),
             ha_bell_active: false,
+            home_lost_at: [None; MAX_PANEL_ZONES],
+            home_lost_check: None,
+            ha_status_sent: None,
+            ha_status_at: None,
+            ha_status_check: None,
+            ha_status_online: false,
+            ha_state_name: None,
+            ha_alarm_notified: false,
             ha_bell_cmd_until: None,
             ha_bell_cmd_target: None,
             ha_output_tests: Default::default(),
@@ -1587,13 +1620,22 @@ impl Engine {
             self.zone_want[i] = if let Some(binding) = self.cfg.home_assistant.binding(self.panel.model, (i + 1) as u8) {
                 self.panel.home_zone[i] = true;
                 let active = self.home_active(binding);
-                let available = active.is_some();
+                if active.is_some() {
+                    self.home_lost_at[i] = None;
+                } else if self.home_lost_at[i].is_none() {
+                    self.home_lost_at[i] = Some(now);
+                }
+                // A sensor, or the whole link, has to stay gone for the
+                // supervision window before it's a trouble, like a wireless
+                // zone missing its check-ins. Until then the zone keeps its
+                // last known state, so a Home Assistant restart is silent.
+                let missing = self.home_lost_at[i].is_some_and(|since| now.saturating_duration_since(since) >= ha::SUPERVISION_GRACE);
                 if let Some(camera) = self.panel.camera_zone.get_mut(i) {
                     *camera = false;
                 }
-                self.panel.home_sensor_unavailable |= !available;
+                self.panel.home_sensor_unavailable |= missing;
                 // Transport failure is a supervision fault, never a motion edge.
-                (active.unwrap_or(self.panel.zones[i].open), false, !available)
+                (active.unwrap_or(self.panel.zones[i].open), false, missing)
             } else if !mask.get(i).copied().unwrap_or(false) {
                 self.panel.home_zone[i] = false;
                 (self.sim[i], false, false)
@@ -1690,6 +1732,121 @@ impl Engine {
                 self.cam_contact_open = [false; 8];
             }
             self.sync_zones(now);
+        }
+    }
+
+    /// Keeps Home Assistant told what RoomGuard is doing: the
+    /// `sensor.roomguard_alarm` status, `roomguard_state` and
+    /// `roomguard_alarm` events, and alarm notifications. Codes are never
+    /// sent. It republishes as soon as the link comes back, so Home Assistant
+    /// is never left with a stale state, and it notifies an alarm that began
+    /// while the link was down once it returns.
+    fn publish_ha_status(&mut self, now: Instant) {
+        let ha_cfg = &self.cfg.home_assistant;
+        let (publish, alerts) = (ha_cfg.publish_status, ha_cfg.alarm_notifications);
+        let notify = ha::notify_target(&ha_cfg.notify_service);
+        if !ha_cfg.enabled || !self.home.online || !(publish || alerts || notify.is_some()) {
+            self.ha_status_online = false;
+            return;
+        }
+        if self.ha_status_online && self.ha_status_check.is_some_and(|at| now.saturating_duration_since(at) < Duration::from_millis(250)) {
+            return;
+        }
+        self.ha_status_check = Some(now);
+        let reconnected = !self.ha_status_online;
+        self.ha_status_online = true;
+
+        let p = &self.panel;
+        let live: Vec<(types::AlarmKind, u8)> = p.alarms.iter().filter(|a| !a.silenced).map(|a| (a.kind, a.zone)).collect();
+        let triggered = !live.is_empty();
+        let armed = p.armed.map(|a| (matches!(a.mode, types::ArmMode::Away), p.vista_night));
+        let state = ha::alarm_state_name(triggered, p.entry.is_some(), p.exit.is_some(), armed);
+        let model = p.model.panel_name();
+        let alarm_zones: Vec<u8> = live.iter().map(|&(_, z)| z).filter(|&z| z != 0).collect();
+        let alarm_names: Vec<String> = alarm_zones
+            .iter()
+            .map(|&z| if z as usize <= p.n() { p.label(z as usize) } else { format!("Zone {z}") })
+            .collect();
+        let kind = live.first().map(|(k, _)| k.label());
+        let pick = |test: fn(&panel::ZoneRt) -> bool| -> Vec<u8> {
+            (1..=p.n()).filter(|&z| test(&p.zones[z - 1])).map(|z| z as u8).collect()
+        };
+        let troubles: Vec<&str> = TROUBLE_NAMES.iter().filter(|(bit, _)| p.troubles & bit != 0).map(|&(_, name)| name).collect();
+        let icon = if triggered {
+            "mdi:shield-alert"
+        } else if armed.is_some() || p.exit.is_some() {
+            "mdi:shield-lock"
+        } else {
+            "mdi:shield-off-outline"
+        };
+        let open_zones = pick(|z| z.open);
+        let bypassed_zones = pick(|z| z.bypassed);
+        let (ready, entry, exit, trouble, ac_power) = (p.ready(), p.entry.is_some(), p.exit.is_some(), p.troubles != 0, p.inputs.ac_ok);
+        let attributes = serde_json::json!({
+            "friendly_name": "RoomGuard",
+            "icon": icon,
+            "panel": model,
+            "ready": ready,
+            "alarm": triggered,
+            "alarm_kind": kind,
+            "alarm_zones": alarm_zones,
+            "alarm_zone_names": alarm_names,
+            "entry_delay": entry,
+            "exit_delay": exit,
+            "trouble": trouble,
+            "troubles": troubles,
+            "ac_power": ac_power,
+            "open_zones": open_zones,
+            "bypassed_zones": bypassed_zones,
+        });
+        let place = if alarm_names.is_empty() { String::new() } else { format!(": {}", alarm_names.join(", ")) };
+        let message = format!("{} alarm on the {}{}", kind.unwrap_or("Burglary"), model, place);
+
+        let snapshot = format!("{state}{attributes}");
+        let heartbeat = self.ha_status_at.map_or(true, |at| now.saturating_duration_since(at) >= Duration::from_secs(600));
+        if publish && (reconnected || heartbeat || self.ha_status_sent.as_deref() != Some(snapshot.as_str())) {
+            self.hub.publish_state(&self.cfg.home_assistant, self.hub_epoch, state.to_string(), attributes);
+            self.ha_status_at = Some(now);
+        }
+        self.ha_status_sent = Some(snapshot);
+        if publish && self.ha_state_name.is_some_and(|previous| previous != state) {
+            self.hub.fire_event(
+                self.hub_epoch,
+                "roomguard_state",
+                serde_json::json!({ "state": state, "previous": self.ha_state_name, "panel": model }),
+            );
+        }
+        self.ha_state_name = Some(state);
+        if triggered && !self.ha_alarm_notified {
+            self.ha_alarm_notified = true;
+            if publish {
+                self.hub.fire_event(
+                    self.hub_epoch,
+                    "roomguard_alarm",
+                    serde_json::json!({ "kind": kind, "zones": alarm_zones, "zone_names": alarm_names, "panel": model, "message": message }),
+                );
+            }
+            if alerts {
+                self.hub.call_service(
+                    self.hub_epoch,
+                    "persistent_notification",
+                    "create",
+                    serde_json::json!({ "notification_id": "roomguard_alarm", "title": "RoomGuard alarm", "message": message }),
+                );
+            }
+            if let Some((domain, service)) = &notify {
+                self.hub.call_service(self.hub_epoch, domain, service, serde_json::json!({ "title": "RoomGuard alarm", "message": message }));
+            }
+        } else if !triggered && self.ha_alarm_notified {
+            self.ha_alarm_notified = false;
+            if alerts {
+                self.hub.call_service(
+                    self.hub_epoch,
+                    "persistent_notification",
+                    "dismiss",
+                    serde_json::json!({ "notification_id": "roomguard_alarm" }),
+                );
+            }
         }
     }
 
@@ -2247,12 +2404,20 @@ impl Engine {
             self.last_cam_check = now;
             self.check_camera(now);
         }
+        // Supervision windows run out without any new Home Assistant message.
+        if self.home_lost_at.iter().any(Option::is_some)
+            && self.home_lost_check.map_or(true, |at| now.saturating_duration_since(at).as_millis() >= 1000)
+        {
+            self.home_lost_check = Some(now);
+            self.sync_zones(now);
+        }
         self.settle_zones(now);
         // Two-way Home Assistant siren/bell sync:
         // 1) HA -> RoomGuard: if any linked HA siren/bell/alarm entity (including ESPHome al_1/alm_1/fa_1/fire_1
         //    or Lab siren toggle) is turned ON from Home Assistant, sound RoomGuard's PC siren live!
         self.sync_ha_sirens(now);
         self.panel.tick(now, wall);
+        self.publish_ha_status(now);
         // 2) RoomGuard -> HA: drive linked writable Home Assistant sirens/switches/lights automatically
         //    whenever RoomGuard's OWN panel bell/siren sounds (and turn them OFF on disarm/silence).
         let local_bell = self.panel.local_bell_active(now);

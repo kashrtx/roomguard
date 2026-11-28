@@ -37,6 +37,15 @@ fn default_true() -> bool {
     true
 }
 
+/// How long a Home Assistant sensor, or the link itself, may be gone before
+/// RoomGuard calls it a supervision trouble. Real wireless panels wait out a
+/// missed check-in window too, so a Home Assistant restart or an ESPHome
+/// reboot never sets the keypads beeping.
+pub const SUPERVISION_GRACE: Duration = Duration::from_secs(180);
+
+/// The entity RoomGuard keeps up to date with its own status.
+pub const STATUS_ENTITY: &str = "sensor.roomguard_alarm";
+
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -68,6 +77,17 @@ pub struct Config {
     pub learned_exit_stay: Option<u64>,
     #[serde(default)]
     pub learned_entry: Option<u64>,
+    /// Publish RoomGuard's own status as `sensor.roomguard_alarm`, and fire
+    /// `roomguard_state` and `roomguard_alarm` events for automations.
+    #[serde(default = "default_true")]
+    pub publish_status: bool,
+    /// Show a Home Assistant notification while an alarm is going off.
+    #[serde(default = "default_true")]
+    pub alarm_notifications: bool,
+    /// Optional notify service for phone alerts, such as
+    /// `notify.mobile_app_pixel_8`. Empty sends none.
+    #[serde(default)]
+    pub notify_service: String,
 }
 
 impl Default for Config {
@@ -86,6 +106,9 @@ impl Default for Config {
             learned_exit_away: None,
             learned_exit_stay: None,
             learned_entry: None,
+            publish_status: true,
+            alarm_notifications: true,
+            notify_service: String::new(),
         }
     }
 }
@@ -888,6 +911,11 @@ enum CallKind {
     EspHomeKeypress { service: String, keys: String, partition: Option<u8> },
     EspHomeAlarmState { service: String, state: String, code: String, partition: u8, action: AlarmAction },
     InputText { value: String },
+    /// A Home Assistant event, such as `roomguard_alarm`.
+    Event { event_type: String, data: Value },
+    /// Any service, such as `notify.mobile_app_phone` or
+    /// `persistent_notification.create`.
+    Service { domain: String, service: String, data: Value },
 }
 
 #[derive(Clone, Debug)]
@@ -901,6 +929,7 @@ pub struct Handle {
     config: mpsc::Sender<Option<Connection>>,
     calls: mpsc::Sender<ServiceCall>,
     previews: mpsc::SyncSender<(Connection, String)>,
+    states: mpsc::Sender<(Connection, String, Value)>,
 }
 
 impl Handle {
@@ -956,6 +985,29 @@ impl Handle {
         });
     }
 
+    /// Fires a Home Assistant event for automations.
+    pub fn fire_event(&self, epoch: u64, event_type: &str, data: Value) {
+        let _ = self.calls.send(ServiceCall {
+            epoch,
+            entity_id: String::new(),
+            kind: CallKind::Event { event_type: event_type.into(), data },
+        });
+    }
+
+    /// Calls a Home Assistant service by domain and name.
+    pub fn call_service(&self, epoch: u64, domain: &str, service: &str, data: Value) {
+        let _ = self.calls.send(ServiceCall {
+            epoch,
+            entity_id: String::new(),
+            kind: CallKind::Service { domain: domain.into(), service: service.into(), data },
+        });
+    }
+
+    /// Sets RoomGuard's status entity. Only the newest status is posted.
+    pub fn publish_state(&self, cfg: &Config, epoch: u64, state: String, attributes: Value) {
+        let _ = self.states.send((connection(cfg, epoch), state, attributes));
+    }
+
     pub fn preview(&self, cfg: &Config, epoch: u64, id: String) -> bool {
         self.previews.try_send((connection(cfg, epoch), id)).is_ok()
     }
@@ -979,7 +1031,11 @@ pub fn start(engine: mpsc::Sender<EngineMsg>) -> Handle {
             emit(&engine, cfg.epoch, Update::Preview { id, result });
         }
     });
-    Handle { config, calls, previews }
+    let (states, posts) = mpsc::channel::<(Connection, String, Value)>();
+    let _ = std::thread::Builder::new()
+        .name("home-assistant-status".into())
+        .spawn(move || publish_states(posts));
+    Handle { config, calls, previews, states }
 }
 
 fn emit(engine: &mpsc::Sender<EngineMsg>, epoch: u64, update: Update) {
@@ -1187,6 +1243,29 @@ fn service_call_payload(id: u64, call: &ServiceCall) -> Option<Value> {
                 },
             }))
         }
+        CallKind::Event { event_type, data } => {
+            if !valid_name(event_type) {
+                return None;
+            }
+            Some(json!({
+                "id": id,
+                "type": "fire_event",
+                "event_type": event_type,
+                "event_data": data,
+            }))
+        }
+        CallKind::Service { domain, service, data } => {
+            if !valid_name(domain) || !valid_name(service) {
+                return None;
+            }
+            Some(json!({
+                "id": id,
+                "type": "call_service",
+                "domain": domain,
+                "service": service,
+                "service_data": data,
+            }))
+        }
         CallKind::InputText { value } => {
             if !call.entity_id.starts_with("input_text.") {
                 return None;
@@ -1378,6 +1457,16 @@ fn session(
                             }
                         }
                         CallKind::InputText { .. } => {}
+                        CallKind::Event { event_type, .. } => {
+                            if let Err(err) = result {
+                                crate::util::log(&format!("Home Assistant event {event_type} failed: {err}"));
+                            }
+                        }
+                        CallKind::Service { domain, service, .. } => {
+                            if let Err(err) = result {
+                                crate::util::log(&format!("Home Assistant service {domain}.{service} failed: {err}"));
+                            }
+                        }
                     }
                 }
             }
@@ -1646,5 +1735,142 @@ mod tests {
         client.join().unwrap();
         server.join().unwrap();
         drop(settings);
+    }
+}
+
+
+/// Home Assistant names (domains, services, events) are lowercase words
+/// joined by underscores. Anything else is refused rather than sent.
+fn valid_name(name: &str) -> bool {
+    !name.is_empty() && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
+/// The REST base for a configured URL, which may be given as `ws://` or
+/// `wss://` like the WebSocket endpoint.
+fn rest_base(url: &str) -> String {
+    if let Some(rest) = url.strip_prefix("wss://") {
+        format!("https://{rest}")
+    } else if let Some(rest) = url.strip_prefix("ws://") {
+        format!("http://{rest}")
+    } else {
+        url.to_string()
+    }
+}
+
+/// Posts RoomGuard's status entity through Home Assistant's REST API (the
+/// WebSocket API can't set states). Only the newest status matters, so
+/// anything queued behind it is skipped rather than replayed.
+fn publish_states(posts: mpsc::Receiver<(Connection, String, Value)>) {
+    let mut failing = false;
+    while let Ok(mut latest) = posts.recv() {
+        while let Ok(newer) = posts.try_recv() {
+            latest = newer;
+        }
+        let (cfg, state, attributes) = latest;
+        if cfg.url.is_empty() || cfg.token.is_empty() {
+            continue;
+        }
+        let body = json!({ "state": state, "attributes": attributes }).to_string();
+        let result = ureq::AgentBuilder::new()
+            .redirects(0)
+            .timeout(Duration::from_secs(6))
+            .build()
+            .post(&format!("{}/api/states/{}", rest_base(&cfg.url), STATUS_ENTITY))
+            .set("Authorization", &format!("Bearer {}", cfg.token))
+            .set("Content-Type", "application/json")
+            .send_string(&body);
+        match result {
+            Ok(_) => {
+                if failing {
+                    crate::util::log("Home Assistant status updates are working again");
+                }
+                failing = false;
+            }
+            Err(error) => {
+                // Log once per outage rather than on every update.
+                if !failing {
+                    let reason = match &error {
+                        ureq::Error::Status(code, _) => format!("HTTP {code}"),
+                        ureq::Error::Transport(transport) => transport.kind().to_string(),
+                    };
+                    crate::util::log(&format!("Home Assistant status update failed: {reason}"));
+                }
+                failing = true;
+            }
+        }
+    }
+}
+
+/// RoomGuard's status in Home Assistant's alarm panel vocabulary, the same
+/// states the ESPHome DSC and VISTA panels report. `armed` is
+/// `Some((away, night))` once the exit delay is over.
+pub fn alarm_state_name(triggered: bool, entry: bool, exit: bool, armed: Option<(bool, bool)>) -> &'static str {
+    if triggered {
+        "triggered"
+    } else if entry {
+        "pending"
+    } else if exit {
+        "arming"
+    } else {
+        match armed {
+            Some((true, _)) => "armed_away",
+            Some((false, true)) => "armed_night",
+            Some((false, false)) => "armed_home",
+            None => "disarmed",
+        }
+    }
+}
+
+/// Splits a notify setting such as `notify.mobile_app_phone` (or just
+/// `mobile_app_phone`) into its domain and service.
+pub fn notify_target(setting: &str) -> Option<(String, String)> {
+    let setting = setting.trim();
+    if setting.is_empty() {
+        return None;
+    }
+    let (domain, service) = setting.split_once('.').unwrap_or(("notify", setting));
+    (valid_name(domain) && valid_name(service)).then(|| (domain.to_string(), service.to_string()))
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::*;
+
+    #[test]
+    fn status_uses_home_assistant_alarm_states() {
+        assert_eq!(alarm_state_name(false, false, false, None), "disarmed");
+        assert_eq!(alarm_state_name(false, false, true, None), "arming");
+        assert_eq!(alarm_state_name(false, false, false, Some((true, false))), "armed_away");
+        assert_eq!(alarm_state_name(false, false, false, Some((false, false))), "armed_home");
+        assert_eq!(alarm_state_name(false, false, false, Some((false, true))), "armed_night");
+        assert_eq!(alarm_state_name(false, true, false, Some((true, false))), "pending");
+        assert_eq!(alarm_state_name(true, true, false, Some((true, false))), "triggered");
+    }
+
+    #[test]
+    fn events_and_services_build_valid_websocket_messages() {
+        let event = ServiceCall { epoch: 1, entity_id: String::new(), kind: CallKind::Event { event_type: "roomguard_alarm".into(), data: json!({"zone": 3}) } };
+        let payload = service_call_payload(7, &event).expect("event payload");
+        assert_eq!(payload["type"], "fire_event");
+        assert_eq!(payload["event_type"], "roomguard_alarm");
+        assert_eq!(payload["event_data"]["zone"], 3);
+        let service = ServiceCall { epoch: 1, entity_id: String::new(), kind: CallKind::Service { domain: "notify".into(), service: "mobile_app_phone".into(), data: json!({"message": "x"}) } };
+        let payload = service_call_payload(8, &service).expect("service payload");
+        assert_eq!(payload["type"], "call_service");
+        assert_eq!(payload["domain"], "notify");
+        assert_eq!(payload["service"], "mobile_app_phone");
+        // Bad names are refused instead of sent.
+        let bad = ServiceCall { epoch: 1, entity_id: String::new(), kind: CallKind::Service { domain: "notify".into(), service: "Bad Name".into(), data: json!({}) } };
+        assert!(service_call_payload(9, &bad).is_none());
+    }
+
+    #[test]
+    fn notify_setting_accepts_full_and_short_names() {
+        assert_eq!(notify_target("notify.mobile_app_pixel_8"), Some(("notify".into(), "mobile_app_pixel_8".into())));
+        assert_eq!(notify_target(" mobile_app_pixel_8 "), Some(("notify".into(), "mobile_app_pixel_8".into())));
+        assert_eq!(notify_target(""), None);
+        assert_eq!(notify_target("notify.Bad Name"), None);
+        assert_eq!(rest_base("ws://ha.local:8123"), "http://ha.local:8123");
+        assert_eq!(rest_base("https://ha.example"), "https://ha.example");
     }
 }

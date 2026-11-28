@@ -6,18 +6,18 @@
 # IMPORTANT: Keep the underscore (_) in "roomguard_lab.yaml".
 # Home Assistant rejects hyphens (-) in package filenames.
 #
-# PIN SECURITY NOTE:
-# - With a REAL wall panel (ESPHome Keybus / ECP or Envisalink), you do NOT use
-#   this file and you do NOT put your real alarm code in plain YAML. Instead,
-#   the Home Assistant template forwards `code: '{{ code }}'` directly to your
-#   hardware panel, and in RoomGuard you leave "HA panel PIN" blank so whatever
-#   code you type on the keypad is sent straight to the panel.
-# - For this local Test Lab sandbox, you can:
-#     1) Move the PIN into /homeassistant/secrets.yaml and change `code:` below
-#        to `code: !secret roomguard_test_code`, OR
-#     2) Remove the `code:` line below completely (RoomGuard's own keypad still
-#        requires your real salted/hashed Master Code to disarm!), OR
-#     3) Keep the throwaway test code "1234" below for quick local testing.
+# CODES:
+# This file has no alarm code on purpose. RoomGuard checks your code at its own
+# keypad and forwards it, so Home Assistant accepts whatever RoomGuard sends.
+# A `code:` here that differs from your RoomGuard code would refuse it, and you
+# couldn't disarm from the keypad. Never put a real code in plain YAML.
+#
+# ALERTS:
+# RoomGuard publishes its own status as sensor.roomguard_alarm (disarmed,
+# arming, armed_away, armed_home, armed_night, pending, triggered) and fires
+# roomguard_alarm when an alarm starts. To get phone alerts, either fill in
+# "Phone alerts" in RoomGuard's Home Assistant settings, or uncomment the
+# automation at the end of this file and set your phone's notify service.
 
 input_boolean:
   roomguard_lab_door:
@@ -61,14 +61,12 @@ alarm_control_panel:
   - platform: manual
     name: RoomGuard Test Panel
     unique_id: roomguard_test_panel
-    # Throwaway PIN for this local test sandbox only (or use `code: !secret roomguard_test_code`,
-    # or remove `code:` altogether and let RoomGuard's keypad enforce your real hashed code).
-    code: "1234"
+    # No `code:` (see CODES above). RoomGuard's keypad checks the code.
     code_arm_required: false
     # RoomGuard automatically measures and locks onto whatever arming_time / delay_time
     # your Home Assistant panel uses so both countdowns finish together in sync.
-    arming_time: 8
-    delay_time: 8
+    arming_time: 15
+    delay_time: 15
     trigger_time: 30
     arming_states:
       - armed_home
@@ -76,3 +74,17 @@ alarm_control_panel:
       - armed_night
     disarmed:
       trigger_time: 0
+
+# Phone alert example. Uncomment, and change notify.mobile_app_your_phone to
+# your phone's notify service (Settings > Devices & services > Mobile App).
+#
+# automation:
+#   - alias: RoomGuard alarm alert
+#     triggers:
+#       - trigger: event
+#         event_type: roomguard_alarm
+#     actions:
+#       - action: notify.mobile_app_your_phone
+#         data:
+#           title: RoomGuard alarm
+#           message: "{{ trigger.event.data.message }}"

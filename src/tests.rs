@@ -125,22 +125,22 @@ fn all_panels_follow_physical_arming_and_keep_guarding_when_the_link_drops() {
         assert_eq!(p.armed.unwrap().mode, ArmMode::Away);
         assert!(p.zones.iter().all(|z| !z.auto_bypass));
         p.sync_physical_panel(None, true, t + secs(304));
-        p.tick(t + secs(314), 0);
+        p.tick(t + secs(490), 0);
         assert_eq!(p.armed.unwrap().mode, ArmMode::Away);
         assert!(p.physical_unavailable_since.is_some());
         assert_ne!(p.troubles & crate::engine::panel::tb::HOME_PANEL, 0);
-        keys(&mut p, "12341", t + secs(315));
-        assert!(!p.face_recognized("Tester", t + secs(315)));
+        keys(&mut p, "12341", t + secs(491));
+        assert!(!p.face_recognized("Tester", t + secs(491)));
         assert_eq!(p.armed.unwrap().mode, ArmMode::Away);
 
         let mut saved = p.to_save(true);
         if model == Model::Vista20p {
             saved.ee.sections.insert("39".into(), "0".into());
         }
-        let mut p = Panel::new(model, saved, crate::config::default_labels(model), "Tester".into(), true, t + secs(316));
+        let mut p = Panel::new(model, saved, crate::config::default_labels(model), "Tester".into(), true, t + secs(492));
         assert_eq!(p.armed.unwrap().mode, ArmMode::Away);
-        p.sync_physical_panel(Some(Away), false, t + secs(317));
-        p.sync_physical_panel(Some(Disarmed), true, t + secs(318));
+        p.sync_physical_panel(Some(Away), false, t + secs(493));
+        p.sync_physical_panel(Some(Disarmed), true, t + secs(494));
         assert!(!p.is_on());
         assert!(p.out.iter().any(|out| matches!(out, Out::Armed(false))));
     }
@@ -3509,4 +3509,42 @@ fn learned_ha_timers_prevent_early_exit_skip_and_external_siren_status_works() {
         v.out.iter().any(|o| matches!(o, Out::Disarmed { .. })),
         "Vista Code+1 while disarmed must emit Out::Disarmed to silence active external HA siren"
     );
+}
+
+#[test]
+fn a_key_beep_over_a_full_volume_siren_never_clips() {
+    let mut s = crate::audio::synth::Synth::new(48_000.0);
+    s.apply(AudioCmd::Volumes { master: 1.0, siren: 1.0, keypad: 1.0, line: 0.0 });
+    s.apply(AudioCmd::Siren { model: crate::engine::types::SirenModel::Rx7c, warble: false });
+    s.apply(AudioCmd::Bell(crate::audio::BellPattern::Steady));
+    let (mut peak, mut loud, mut total) = (0.0f32, 0usize, 0usize);
+    for block in 0..20 {
+        if block % 4 == 0 {
+            s.apply(AudioCmd::KeyBeep);
+        }
+        for _ in 0..4_800 {
+            let x = s.next();
+            assert!(x.is_finite(), "every sample is a real number");
+            peak = peak.max(x.abs());
+            if block > 0 {
+                total += 1;
+                if x.abs() > 0.93 {
+                    loud += 1;
+                }
+            }
+        }
+    }
+    assert!(peak <= 1.003, "never past full scale, got {peak}");
+    assert!(loud * 1000 <= total, "settles under -1 dBFS instead of sitting at the ceiling ({loud} of {total})");
+}
+
+#[test]
+fn a_home_assistant_restart_is_not_a_trouble() {
+    let t0 = Instant::now();
+    let mut p = panel(Model::Vista20p);
+    p.physical_unavailable_since = Some(t0);
+    p.tick(t0 + secs(60), 0);
+    assert_eq!(p.troubles & crate::engine::panel::tb::HOME_PANEL, 0, "a minute offline is a restart, not a trouble");
+    p.tick(t0 + secs(181), 0);
+    assert_ne!(p.troubles & crate::engine::panel::tb::HOME_PANEL, 0, "an outage past the supervision window is a trouble");
 }
